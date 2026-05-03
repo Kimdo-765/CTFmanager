@@ -52,6 +52,14 @@ def run_in_sandbox(
     else:
         cmd = ["python3", f"{workdir}/{script_rel}", *args]
 
+    # Forward CALLBACK_URL from the worker so exploits that need an
+    # out-of-band listener can use the user's pre-configured public
+    # endpoint (ngrok, requestbin, their own VPS).
+    env: dict[str, str] = {"PYTHONUNBUFFERED": "1"}
+    cb = os.environ.get("CALLBACK_URL", "").strip()
+    if cb:
+        env["CALLBACK_URL"] = cb
+
     client = docker.from_env()
     container = client.containers.run(
         image=image,
@@ -60,6 +68,7 @@ def run_in_sandbox(
         working_dir=workdir,
         mem_limit=mem_limit,
         network_mode=network,
+        environment=env,
         stdout=True,
         stderr=True,
         detach=True,

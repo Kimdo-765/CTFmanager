@@ -66,6 +66,7 @@ async function loadSettings() {
     s.job_timeout_seconds != null ? s.job_timeout_seconds : "";
   f.querySelector("[name=worker_concurrency]").value =
     s.worker_concurrency != null ? s.worker_concurrency : "";
+  f.querySelector("[name=callback_url]").value = s.callback_url || "";
   document.getElementById("key-status").textContent = s.anthropic_api_key_set
     ? `set (${s.anthropic_api_key_masked}) — leave blank to keep, type new to replace`
     : (s.anthropic_api_key_env_set ? "using ANTHROPIC_API_KEY from env" : "not set");

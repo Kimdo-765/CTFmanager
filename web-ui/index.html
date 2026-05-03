@@ -302,6 +302,11 @@
           <input type="number" name="worker_concurrency" min="1" max="32" placeholder="3" />
           <small style="color:#8b949e">requires <code>docker compose restart worker</code> to apply</small>
         </label>
+        <label>
+          Callback URL (for XSS / SSRF / blind RCE)
+          <input type="url" name="callback_url" placeholder="https://your-listener.example.com/x" />
+          <small style="color:#8b949e">forwarded to exploits as <code>CALLBACK_URL</code> env. Use ngrok / requestbin / your own VPS for remote bots that can't reach private IPs.</small>
+        </label>
         <div style="display:flex;gap:0.5rem">
           <button type="submit">Save</button>
           <button type="button" id="settings-reload" style="background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:0.5rem 1rem;border-radius:6px;cursor:pointer">Reload</button>

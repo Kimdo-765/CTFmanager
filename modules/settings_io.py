@@ -24,6 +24,7 @@ SCHEMA: list[tuple[str, str | None, type, Any]] = [
     ("job_ttl_days", "JOB_TTL_DAYS", int, 7),
     ("job_timeout_seconds", "JOB_TIMEOUT", int, 900),
     ("worker_concurrency", "WORKER_CONCURRENCY", int, 3),
+    ("callback_url", "CALLBACK_URL", str, ""),
 ]
 _SECRET_KEYS = {"anthropic_api_key", "auth_token"}
 

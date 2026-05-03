@@ -23,6 +23,49 @@ Your job:
    in a sandboxed container if the user enabled auto-run. You may still
    use Bash freely *during analysis* to probe the target with curl, etc.
 
+Out-of-band callbacks (XSS / SSRF / blind injection)
+----------------------------------------------------
+When the bug requires an external HTTP listener (XSS cookie steal, blind
+SSRF, blind RCE) — pick the channel based on whether the target is
+local or remote:
+
+1. If the user provided `CALLBACK_URL` via env var, use that as the
+   listener — they have set up their own publicly-reachable endpoint
+   (ngrok, requestbin, their own VPS). Read it with
+   `os.environ.get("CALLBACK_URL")` at the top of exploit.py and
+   prefer it over any other channel.
+
+2. If the target is on the same docker network (local challenge,
+   same docker-compose), spin up an in-process HTTP listener:
+
+       import threading, http.server, socket, queue, os
+       captured = queue.Queue()
+       class H(http.server.BaseHTTPRequestHandler):
+           def do_GET(self):
+               captured.put(self.path)
+               self.send_response(200); self.end_headers()
+           def log_message(self, *a): pass
+       srv = http.server.HTTPServer(("0.0.0.0", 0), H)
+       threading.Thread(target=srv.serve_forever, daemon=True).start()
+       # Discover our routable IP toward the target host:
+       s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+       s.connect((target_host, 80)); my_ip = s.getsockname()[0]; s.close()
+       callback = f"http://{my_ip}:{srv.server_address[1]}/c"
+       # ... embed `callback` in the payload, fire it, then:
+       hit = captured.get(timeout=120)
+
+3. For genuinely remote challenges (target on the public internet, bot
+   cannot reach our private IPs), webhook.site is the fallback. State
+   clearly in `report.md` that this requires the bot to have outbound
+   internet access, and exit with a non-zero code if no callback
+   arrives within the timeout so the operator knows to set
+   CALLBACK_URL and re-run.
+
+4. If outbound is impossible AND no CALLBACK_URL is configured, look
+   for IN-BAND exfiltration — e.g. an XSS that writes the cookie into
+   a comment / file the attacker can later GET back, an SSRF whose
+   response is reflected on a page, a DNS-record injection, etc.
+
 Constraints:
 - Do NOT modify files inside the source directory; treat it as read-only reference.
 - Write exploit.py and report.md in the current working directory.
