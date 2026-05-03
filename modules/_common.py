@@ -63,14 +63,13 @@ def collect_outputs(work_dir: Path, names: list[str]) -> dict[str, Path]:
 
 
 def extract_flags_from_text(text: str, liberal: bool = False) -> list[str]:
-    """Return unique CTF-style flags found in `text`."""
+    """Return unique CTF-style flags found in `text` (placeholders filtered)."""
     if not text:
         return []
     found = set(FLAG_RE.findall(text))
     if liberal:
-        # Add weaker matches (e.g. PROJECT{...}) that didn't trigger the strict prefix list
         found |= set(LIBERAL_FLAG_RE.findall(text)) - found
-    return sorted(found)
+    return sorted(f for f in found if not _is_placeholder_flag(f))
 
 
 def scan_job_for_flags(job_id: str, extra_files: list[str] | None = None) -> list[str]:
@@ -106,7 +105,41 @@ def scan_job_for_flags(job_id: str, extra_files: list[str] | None = None) -> lis
         except Exception:
             continue
         flags.update(FLAG_RE.findall(text))
-    return sorted(flags)
+    return sorted(f for f in flags if not _is_placeholder_flag(f))
+
+
+_PLACEHOLDER_INNERS = {
+    "...", "…", "?", "??", "???", "????", "??????",
+    "example", "redacted", "placeholder", "sample", "test", "todo",
+    "tbd", "n/a", "na", "hidden", "secret", "truncated", "x",
+    "your_flag", "your_flag_here", "the_flag", "the_flag_here",
+    "real_flag", "real_flag_here", "flag", "flag_here",
+    "flag_goes_here", "fill_in_the_blank", "...the actual flag...",
+    "actual_flag", "captured_flag",
+}
+
+
+def _is_placeholder_flag(flag: str) -> bool:
+    """True if `flag` is an obvious placeholder like FLAG{...} / DH{xxx} /
+    CTF{your_flag_here} that just happened to match the FLAG_RE — it
+    appears in reports and prompt templates but is not a real captured flag.
+    """
+    i = flag.find("{")
+    if i < 0 or not flag.endswith("}"):
+        return False
+    inner = flag[i + 1 : -1].strip().lower()
+    if not inner:
+        return True
+    if inner in _PLACEHOLDER_INNERS:
+        return True
+    # All the same character (.... / xxxx / ____)
+    if len(inner) >= 2 and len(set(inner)) == 1 and inner[0] in "._-x?…":
+        return True
+    # Only filler characters (dots, underscores, dashes, spaces)
+    import re as _re
+    if _re.fullmatch(r"[._\-\s…]+", inner):
+        return True
+    return False
 
 
 CTF_PREAMBLE = """\
