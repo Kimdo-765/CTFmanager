@@ -14,7 +14,15 @@ from claude_agent_sdk import (
     query,
 )
 
-from modules._common import collect_outputs, extract_cost, job_dir, log_line, scan_job_for_flags, write_meta
+from modules._common import (
+    classify_agent_error,
+    collect_outputs,
+    extract_cost,
+    job_dir,
+    log_line,
+    scan_job_for_flags,
+    write_meta,
+)
 from modules._runner import attempt_sandbox_run
 from modules.pwn.prompts import SYSTEM_PROMPT, build_user_prompt
 from modules.settings_io import apply_to_env, get_setting
@@ -58,24 +66,31 @@ async def _run_agent(
     log_line(job_id, f"Launching Claude agent (model={model})")
     summary: dict = {"messages": 0, "tool_calls": 0}
 
-    async for msg in query(prompt=user_prompt, options=options):
-        if isinstance(msg, AssistantMessage):
-            summary["messages"] += 1
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    log_line(job_id, f"AGENT: {block.text[:500]}")
-                elif isinstance(block, ToolUseBlock):
-                    summary["tool_calls"] += 1
-                    args_preview = json.dumps(block.input)[:200]
-                    log_line(job_id, f"TOOL {block.name}: {args_preview}")
-        elif isinstance(msg, ResultMessage):
-            summary["result"] = {
-                "duration_ms": msg.duration_ms,
-                "num_turns": msg.num_turns,
-                "total_cost_usd": msg.total_cost_usd,
-                "is_error": msg.is_error,
-            }
-            log_line(job_id, f"DONE: {summary['result']}")
+    try:
+        async for msg in query(prompt=user_prompt, options=options):
+            if isinstance(msg, AssistantMessage):
+                summary["messages"] += 1
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        log_line(job_id, f"AGENT: {block.text[:500]}")
+                    elif isinstance(block, ToolUseBlock):
+                        summary["tool_calls"] += 1
+                        args_preview = json.dumps(block.input)[:200]
+                        log_line(job_id, f"TOOL {block.name}: {args_preview}")
+            elif isinstance(msg, ResultMessage):
+                summary["result"] = {
+                    "duration_ms": msg.duration_ms,
+                    "num_turns": msg.num_turns,
+                    "total_cost_usd": msg.total_cost_usd,
+                    "is_error": msg.is_error,
+                }
+                log_line(job_id, f"DONE: {summary['result']}")
+    except Exception as e:
+        msg_text = str(e)
+        kind = classify_agent_error(msg_text)
+        summary["agent_error"] = msg_text
+        summary["agent_error_kind"] = kind
+        log_line(job_id, f"AGENT_ERROR ({kind}): {msg_text[:400]}")
 
     found = collect_outputs(work_dir, ["exploit.py", "report.md"])
     summary["exploit_present"] = "exploit.py" in found
@@ -119,15 +134,27 @@ def run_job(
             )
 
         flags = scan_job_for_flags(job_id)
+        agent_err = agent_summary.get("agent_error")
+        agent_err_kind = agent_summary.get("agent_error_kind")
+        # If the agent ran into an error and produced no exploit, mark failed.
+        # Otherwise (partial success — exploit was written before failure) keep finished.
+        if agent_err and not agent_summary.get("exploit_present"):
+            final_status = "failed"
+        else:
+            final_status = "finished"
         result = {
             "agent": agent_summary,
             "cost_usd": cost,
             "sandbox": sandbox_result,
             "flags": flags,
+            "agent_error": agent_err,
+            "agent_error_kind": agent_err_kind,
         }
         (jd / "result.json").write_text(json.dumps(result, indent=2))
-        write_meta(job_id, status="finished", stage="done", cost_usd=cost,
+        write_meta(job_id, status=final_status, stage="done", cost_usd=cost,
                    flags=flags,
+                   error=agent_err,
+                   error_kind=agent_err_kind,
                    exploit_present=agent_summary.get("exploit_present", False),
                    decomp_used=agent_summary.get("decomp_used", False))
         return result

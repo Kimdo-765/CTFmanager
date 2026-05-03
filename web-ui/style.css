@@ -94,6 +94,21 @@ textarea, select {
 }
 .copy-btn:hover { background: #2ea043; }
 .copy-btn.copied { background: #0969da; }
+.refusal-banner {
+  background: #3b1d12;
+  border: 1px solid #b9491b;
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  margin: 0.6rem 0;
+  font-size: 0.9rem;
+}
+.refusal-banner h4 {
+  margin: 0 0 0.3rem 0; color: #ffa657; font-size: 0.85rem;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.refusal-banner code {
+  background: #0d1117; padding: 0.1rem 0.35rem; border-radius: 3px;
+}
 .flag-pill {
   display: inline-block; background: #238636; color: white;
   font-size: 0.7rem; padding: 0.05rem 0.35rem; border-radius: 3px;

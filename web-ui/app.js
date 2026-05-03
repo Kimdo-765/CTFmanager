@@ -287,6 +287,22 @@ async function renderJob(id) {
   const stage = job.stage ? ` · stage: ${job.stage}` : "";
   const timeout = job.job_timeout ? ` · timeout: ${job.job_timeout}s` : "";
 
+  let errorBlock = "";
+  if (job.error_kind === "policy_refusal") {
+    errorBlock = `<div class="refusal-banner">
+      <h4>⚠ Claude Usage Policy refusal</h4>
+      <div>The agent stopped mid-job because Claude refused to continue.
+        Try switching the model in <strong>Settings → Claude model</strong> to
+        <code>claude-sonnet-4-6</code> and re-run the job. Sonnet often
+        completes CTF tasks where Opus declines.</div>
+    </div>`;
+  } else if (job.error) {
+    errorBlock = `<div class="refusal-banner">
+      <h4>⚠ Job error (${escapeHtml(job.error_kind || "unknown")})</h4>
+      <div><code>${escapeHtml(String(job.error).slice(0, 400))}</code></div>
+    </div>`;
+  }
+
   let flagBlock = "";
   if (job.flags && job.flags.length) {
     const rows = job.flags.map((f, i) =>
@@ -305,6 +321,7 @@ async function renderJob(id) {
       <span class="status ${job.status}">${job.status}</span>
     </h3>
     <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}</small></div>
+    ${errorBlock}
     ${flagBlock}
     ${resultBlock}
     <h4>Run log <small style="color:#8b949e;font-weight:normal">(auto-follows when scrolled to bottom)</small></h4>

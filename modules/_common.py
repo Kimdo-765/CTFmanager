@@ -109,6 +109,29 @@ def scan_job_for_flags(job_id: str, extra_files: list[str] | None = None) -> lis
     return sorted(flags)
 
 
+REFUSAL_HINTS = (
+    "usage policy",
+    "unable to respond to this request",
+    "violates our usage policy",
+)
+
+
+def classify_agent_error(message: str) -> str | None:
+    """Return a short error_kind tag for known SDK / Claude failure modes."""
+    if not message:
+        return None
+    low = message.lower()
+    if any(h in low for h in REFUSAL_HINTS):
+        return "policy_refusal"
+    if "rate" in low and "limit" in low:
+        return "rate_limit"
+    if "timeout" in low or "timed out" in low:
+        return "timeout"
+    if "auth" in low or "401" in low or "credential" in low:
+        return "auth"
+    return "unknown"
+
+
 def extract_cost(claude_summary: dict | None) -> float:
     """Pull total_cost_usd out of an agent summary dict, returning 0.0 if absent."""
     if not isinstance(claude_summary, dict):
