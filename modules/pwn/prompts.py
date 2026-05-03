@@ -45,6 +45,37 @@ Suggested workflow:
 8. Do NOT execute the final `exploit.py` yourself. The orchestrator
    runs it in a sandbox after you finish if auto-run is enabled.
 
+Multi-stage / AEG (Automatic Exploit Generation) challenges
+-----------------------------------------------------------
+If the description mentions "stages", "AEG", "20 stages", "subflag",
+or you observe the remote service streaming new binaries each round
+with a per-stage timeout (e.g. 10 s):
+
+⚠ DO NOT analyze each stage with separate Claude turns — there is not
+  enough wall-clock budget. Instead, write a SELF-CONTAINED Python
+  framework in a SINGLE pass:
+
+1. Connect to the target ONCE in your local shell to grab 1–2 sample
+   stage binaries (typically delivered base64-encoded between markers
+   like `----------BINARY...----------`). Save them locally.
+2. Reverse just enough of the samples to identify the COMMON pattern:
+   - Bug class (most AEG sets reuse the same vuln across stages, e.g.
+     ret2win where only `get_shell` address shifts, or BoF with a
+     varying buffer size).
+   - How to recover the stage-specific values at runtime: `ELF()` on
+     each fresh binary to read symbols / `pwn.ROP()` / `pwn.cyclic()`
+     to compute the offset.
+3. Write `exploit.py` as a LOOP that does, for every stage:
+     a. recv the base64 binary block from remote
+     b. b64-decode → `tempfile.NamedTemporaryFile` → `ELF()`
+     c. compute offset / gadget programmatically (NOT from a
+        hard-coded constant)
+     d. send payload, recv subflag, record it
+     e. loop until the final flag (e.g. DH{...}) appears
+4. Print every captured subflag and the final flag. The framework runs
+   in real time inside the runner sandbox — Claude does NOT participate
+   per stage.
+
 Constraints:
 - Treat `./bin/` as read-only.
 - Decompiler output is best-effort; cross-check ambiguous parts with
@@ -55,6 +86,19 @@ Constraints:
 """
 
 
+_AEG_HINT_KEYWORDS = (
+    "aeg", "automatic exploit", "20 stage", "stages", "subflag",
+    "automated exploit", "per-stage", "스테이지", "자동", "자동으로",
+)
+
+
+def _looks_like_aeg(description: str | None) -> bool:
+    if not description:
+        return False
+    low = description.lower()
+    return any(k in low for k in _AEG_HINT_KEYWORDS)
+
+
 def build_user_prompt(
     binary_name: str | None,
     target: str | None,
@@ -62,6 +106,8 @@ def build_user_prompt(
     auto_run: bool,
 ) -> str:
     parts: list[str] = []
+    aeg = _looks_like_aeg(description)
+
     if binary_name:
         parts.append(f"Binary directory (read-only): ./bin/   (target: ./bin/{binary_name})")
     else:
@@ -82,6 +128,16 @@ def build_user_prompt(
         f"auto_run_after_you_finish={'true' if auto_run else 'false'} "
         "(handled by orchestrator — do not execute exploit.py yourself)."
     )
+    if aeg:
+        parts.append(
+            "AEG MODE detected from your description. Read the "
+            "'Multi-stage / AEG challenges' section in your system prompt "
+            "carefully — write ONE Python framework that loops over stages "
+            "at runtime, do not analyze each stage with separate Claude "
+            "turns. Connect to the target once to grab a sample, write the "
+            "loop, stop. Tight per-stage timeouts make a per-turn approach "
+            "impossible."
+        )
     if binary_name:
         parts.append(
             "Begin with file/checksec/strings on the binary. Decompile with "
