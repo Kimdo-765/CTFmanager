@@ -72,6 +72,14 @@ textarea, select {
 .run-now-btn:hover { background: #388bfd; }
 .run-now-btn:disabled { background: #21262d; color: #6e7681; cursor: wait; }
 
+.retry-btn {
+  background: #6e3eaa; color: white; border: 0;
+  padding: 0.35rem 0.75rem; border-radius: 6px; cursor: pointer;
+  font-size: 0.85rem; margin-right: 0.5rem;
+}
+.retry-btn:hover { background: #8957e5; }
+.retry-btn:disabled { background: #21262d; color: #6e7681; cursor: wait; }
+
 .flag-banner {
   background: #1c2f1c;
   border: 1px solid #238636;

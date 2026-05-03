@@ -350,11 +350,22 @@ async function renderJob(id) {
   // script (exploit.py / solver.py / solver.sage). Don't gate on status —
   // even 'failed' jobs sometimes have a usable partial script.
   let runBlock = "";
-  if (job.runnable_script || job.exploit_present || job.solver_present) {
+  const isExploitableModule = ["web", "pwn", "crypto", "rev"].includes(job.module);
+  const showRetry = isExploitableModule && (
+    job.status === "failed" ||
+    job.status === "no_flag" ||
+    (job.status === "finished" && (!job.flags || job.flags.length === 0))
+  );
+  if (job.runnable_script || job.exploit_present || job.solver_present || showRetry) {
     const scriptName = job.runnable_script || (job.exploit_present ? "exploit.py" : "solver.py");
+    const runHtml = (job.runnable_script || job.exploit_present || job.solver_present)
+      ? `<button class="run-now-btn" data-action="run">▶ Run ${escapeHtml(scriptName)} in sandbox</button>`
+      : "";
+    const retryHtml = showRetry
+      ? `<button class="retry-btn" data-action="retry">↻ Retry with hint (new job)</button>` : "";
     runBlock = `<div style="margin:0.5rem 0">
-      <button class="run-now-btn" data-action="run">▶ Run ${escapeHtml(scriptName)} in sandbox</button>
-      <small style="color:#8b949e">re-runs the produced script against the stored target</small>
+      ${runHtml} ${retryHtml}
+      <small style="color:#8b949e">${runHtml ? "re-runs the produced script · " : ""}retry asks the latest Claude to diagnose what went wrong, append a hint to the description, and submit a fresh job</small>
     </div>`;
   }
 
@@ -407,6 +418,31 @@ async function renderJob(id) {
     } else {
       newPre.scrollTop = prevScrollTop;
     }
+  }
+
+  const retryBtn = detail.querySelector('.retry-btn[data-action="retry"]');
+  if (retryBtn) {
+    retryBtn.addEventListener("click", async () => {
+      retryBtn.disabled = true;
+      const orig = retryBtn.textContent;
+      retryBtn.textContent = "⏳ asking reviewer…";
+      try {
+        const res = await fetch(`${API}/jobs/${id}/retry`, { method: "POST" });
+        const body = await res.json();
+        if (!res.ok) {
+          alert(`retry failed: ${res.status} ${body.detail || JSON.stringify(body)}`);
+          return;
+        }
+        alert(`New job ${body.new_job_id}\n\nHint:\n${body.hint}`);
+        await refreshJobs();
+        await selectJob(body.new_job_id);
+      } catch (e) {
+        alert(`retry error: ${e}`);
+      } finally {
+        retryBtn.disabled = false;
+        retryBtn.textContent = orig;
+      }
+    });
   }
 
   const runBtn = detail.querySelector('.run-now-btn[data-action="run"]');

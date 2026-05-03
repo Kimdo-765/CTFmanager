@@ -10,6 +10,7 @@ from api.auth import TokenAuthMiddleware
 from api.routes import jobs as jobs_routes
 from api.routes import settings as settings_routes
 from api.routes import collector as collector_routes
+from api.routes import retry as retry_routes
 from api.routes import terminal as terminal_routes
 from api.routes import (
     crypto_module,
@@ -48,6 +49,7 @@ app.include_router(rev_module.router, prefix="/api/modules/rev", tags=["rev"])
 app.include_router(settings_routes.router, prefix="/api/settings", tags=["settings"])
 app.include_router(terminal_routes.router, prefix="/api/terminal", tags=["terminal"])
 app.include_router(collector_routes.router, prefix="/api/collector", tags=["collector"])
+app.include_router(retry_routes.router, prefix="/api/jobs", tags=["jobs"])
 
 
 @app.get("/api/health")

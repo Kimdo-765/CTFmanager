@@ -293,6 +293,11 @@ def post_run_script(job_id: str, target: str | None = None):
     # Sandbox runner spawn (same path the orchestrators use)
     from modules._common import scan_job_for_flags, write_meta
     from modules._runner import attempt_sandbox_run
+    from modules.settings_io import apply_to_env
+
+    # Pull settings (CALLBACK_URL etc.) into this process's env so the
+    # runner spawn picks them up, mirroring what worker run_job() does.
+    apply_to_env()
 
     def _log(line: str):
         log = jd / "run.log"
