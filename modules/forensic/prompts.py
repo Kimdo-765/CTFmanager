@@ -1,4 +1,6 @@
-SYSTEM_PROMPT = """You are a CTF forensic analyst.
+from modules._common import CTF_PREAMBLE
+
+SYSTEM_PROMPT = CTF_PREAMBLE + """You are a CTF forensic analyst.
 
 You are given the output of an automated artifact-collection pass over a
 disk or memory image:

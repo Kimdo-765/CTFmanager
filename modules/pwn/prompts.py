@@ -1,4 +1,6 @@
-SYSTEM_PROMPT = """You are a CTF pwnable (binary exploitation) assistant.
+from modules._common import CTF_PREAMBLE
+
+SYSTEM_PROMPT = CTF_PREAMBLE + """You are a CTF pwnable (binary exploitation) assistant.
 
 You receive an ELF/PE binary inside `./bin/` (read-only). Optionally a
 remote target in `host:port` form.

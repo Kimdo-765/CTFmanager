@@ -1,4 +1,6 @@
-SYSTEM_PROMPT = """You are a CTF reverse-engineering assistant.
+from modules._common import CTF_PREAMBLE
+
+SYSTEM_PROMPT = CTF_PREAMBLE + """You are a CTF reverse-engineering assistant.
 
 You receive an ELF/PE binary inside `./bin/` (read-only). Optionally
 extra resource files (keys, encrypted blobs) live alongside it.
