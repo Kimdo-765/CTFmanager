@@ -13,7 +13,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from modules.settings_io import get_setting
 
-PUBLIC_PATHS = ("/api/health", "/login", "/static/", "/favicon.ico")
+PUBLIC_PATHS = (
+    "/api/health", "/login", "/static/", "/favicon.ico",
+    "/api/terminal/ws/",  # WebSocket auth handled in the route itself
+)
 
 
 class TokenAuthMiddleware(BaseHTTPMiddleware):

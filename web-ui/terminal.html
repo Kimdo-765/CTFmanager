@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CTFmanager — Terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #0e1117; color: #e6edf3;
+                 font-family: -apple-system, "Segoe UI", Roboto, sans-serif; }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0.4rem 0.9rem; border-bottom: 1px solid #30363d;
+    }
+    header .meta { color: #8b949e; font-size: 0.85rem; }
+    header .meta strong { color: #e6edf3; }
+    header .conn { font-size: 0.75rem; padding: 0.1rem 0.5rem; border-radius: 4px; }
+    header .conn.up { background: #238636; color: white; }
+    header .conn.down { background: #da3633; color: white; }
+    #term-container { height: calc(100vh - 38px); padding: 0.4rem 0.6rem; }
+    .xterm-viewport::-webkit-scrollbar { width: 10px; }
+    .xterm-viewport::-webkit-scrollbar-thumb { background: #30363d; border-radius: 5px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="meta">
+      <strong>Terminal</strong> · job <code id="jid">-</code>
+      <span style="color:#8b949e">· cwd <code>/work</code> · runner image</span>
+    </div>
+    <span id="conn" class="conn down">disconnected</span>
+  </header>
+  <div id="term-container"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const jobId = params.get("job_id") || "";
+    document.getElementById("jid").textContent = jobId || "(missing)";
+
+    const term = new Terminal({
+      cursorBlink: true,
+      fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+      fontSize: 13,
+      theme: {
+        background: "#0e1117",
+        foreground: "#e6edf3",
+        cursor: "#58a6ff",
+        selection: "#1f6feb50",
+      },
+    });
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(document.getElementById("term-container"));
+    fit.fit();
+
+    function setConn(state, label) {
+      const el = document.getElementById("conn");
+      el.className = "conn " + state;
+      el.textContent = label;
+    }
+
+    if (!jobId) {
+      term.write("\r\n\x1b[31mNo job_id provided. Open this page from a job's Terminal link.\x1b[0m\r\n");
+    } else {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${proto}//${location.host}/api/terminal/ws/${encodeURIComponent(jobId)}`);
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = () => {
+        setConn("up", "connected");
+        // Send initial size
+        ws.send(`\x1bRESIZE:${term.cols},${term.rows}`);
+      };
+      ws.onclose = () => {
+        setConn("down", "disconnected");
+        term.write("\r\n\x1b[33m[connection closed — container removed]\x1b[0m\r\n");
+      };
+      ws.onerror = () => setConn("down", "error");
+      ws.onmessage = (ev) => {
+        if (ev.data instanceof ArrayBuffer) {
+          term.write(new Uint8Array(ev.data));
+        } else {
+          term.write(ev.data);
+        }
+      };
+
+      term.onData((d) => {
+        if (ws.readyState === 1) ws.send(d);
+      });
+
+      window.addEventListener("resize", () => {
+        fit.fit();
+        if (ws.readyState === 1) ws.send(`\x1bRESIZE:${term.cols},${term.rows}`);
+      });
+    }
+  </script>
+</body>
+</html>

@@ -282,6 +282,7 @@ async function renderJob(id) {
       links.push(`<a href="${API}/jobs/${id}/file/findings.json" target="_blank">findings.json</a>`);
       links.push(`<a href="${API}/jobs/${id}/file/analyze.log" target="_blank">analyze.log</a>`);
     }
+    links.push(`<a href="/terminal?job_id=${encodeURIComponent(id)}" target="_blank">⌨ open terminal</a>`);
     resultBlock = `<div class="file-links">${links.join(" ")}</div>`;
   }
 
