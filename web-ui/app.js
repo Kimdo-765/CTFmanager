@@ -291,6 +291,18 @@ async function renderJob(id) {
   const timeout = job.job_timeout ? ` · timeout: ${job.job_timeout}s` : "";
   const modelInfo = job.model ? ` · model: ${escapeHtml(job.model)}` : "";
 
+  // Run-now button — only when the agent produced a runnable script
+  // (exploit.py / solver.py / solver.sage) and the job is finished/no_flag.
+  let runBlock = "";
+  const runnable = ["finished", "no_flag", "failed"].includes(job.status) &&
+    (job.exploit_present || job.solver_present);
+  if (runnable) {
+    runBlock = `<div style="margin:0.5rem 0">
+      <button class="run-now-btn" data-action="run">▶ Run script in sandbox</button>
+      <small style="color:#8b949e">re-runs the produced exploit/solver against the stored target</small>
+    </div>`;
+  }
+
   let errorBlock = "";
   if (job.error_kind === "policy_refusal") {
     errorBlock = `<div class="refusal-banner">
@@ -325,6 +337,7 @@ async function renderJob(id) {
       <span class="status ${job.status}">${job.status}</span>
     </h3>
     <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}${modelInfo}</small></div>
+    ${runBlock}
     ${errorBlock}
     ${flagBlock}
     ${resultBlock}
@@ -339,6 +352,34 @@ async function renderJob(id) {
     } else {
       newPre.scrollTop = prevScrollTop;
     }
+  }
+
+  const runBtn = detail.querySelector('.run-now-btn[data-action="run"]');
+  if (runBtn) {
+    runBtn.addEventListener("click", async () => {
+      runBtn.disabled = true;
+      const origText = runBtn.textContent;
+      runBtn.textContent = "⏳ running…";
+      try {
+        const res = await fetch(`${API}/jobs/${id}/run`, { method: "POST" });
+        const body = await res.json();
+        if (!res.ok) {
+          alert(`run failed: ${res.status} ${JSON.stringify(body)}`);
+        } else {
+          const sb = body.sandbox || {};
+          const msg = `exit=${sb.exit_code} · stdout ${sb.stdout?.length || 0}B · `
+            + `flags: ${(body.flags || []).length ? body.flags.join(", ") : "(none)"}`;
+          alert(msg);
+        }
+      } catch (e) {
+        alert(`run error: ${e}`);
+      } finally {
+        runBtn.disabled = false;
+        runBtn.textContent = origText;
+        await renderJob(id);
+        await refreshJobs();
+      }
+    });
   }
 
   for (const btn of detail.querySelectorAll(".copy-btn")) {

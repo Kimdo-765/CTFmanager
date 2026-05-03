@@ -244,3 +244,58 @@ def get_job_result(job_id: str):
     if not f.exists():
         raise HTTPException(status_code=404, detail="not yet")
     return json.loads(f.read_text())
+
+
+@router.post("/{job_id}/run")
+def post_run_script(job_id: str, target: str | None = None):
+    """Manually re-run the produced exploit/solver script in the runner
+    sandbox. Useful when the user didn't enable auto-run, when the
+    earlier auto-run failed, or when they want to retry against a
+    different target.
+
+    Request can supply `?target=...` to override the stored target.
+    Returns the sandbox result (stdout/stderr/exit_code) and updated
+    flag list. Updates meta.status accordingly.
+    """
+    safe = Path(job_id).name
+    jd = JOBS_DIR / safe
+    if not jd.exists():
+        raise HTTPException(status_code=404, detail="job not found")
+    meta = read_job_meta(safe) or {}
+
+    # Pick the script the agent produced
+    script = None
+    for name in ("exploit.py", "solver.py", "solver.sage"):
+        if (jd / name).is_file():
+            script = name
+            break
+    if not script:
+        raise HTTPException(
+            status_code=400,
+            detail="no exploit.py / solver.py / solver.sage in this job",
+        )
+    use_sage = script.endswith(".sage")
+    target = (target or meta.get("target_url") or "").strip() or None
+
+    # Sandbox runner spawn (same path the orchestrators use)
+    from modules._common import scan_job_for_flags, write_meta
+    from modules._runner import attempt_sandbox_run
+
+    def _log(line: str):
+        log = jd / "run.log"
+        ts = __import__("datetime").datetime.utcnow().strftime("%H:%M:%S")
+        with log.open("a") as fp:
+            fp.write(f"[{ts}] {line}\n")
+
+    _log(f"[manual-run] executing {script} (target={target}, sage={use_sage})")
+    try:
+        res = attempt_sandbox_run(safe, script, target, _log, use_sage=use_sage)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"sandbox spawn failed: {e}")
+    if res is None:
+        raise HTTPException(status_code=500, detail="script missing at run time")
+
+    flags = scan_job_for_flags(safe)
+    new_status = "finished" if flags else "no_flag"
+    write_meta(safe, status=new_status, flags=flags, manual_run=True)
+    return {"sandbox": res, "flags": flags, "status": new_status}

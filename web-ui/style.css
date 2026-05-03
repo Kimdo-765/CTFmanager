@@ -64,6 +64,14 @@ textarea, select {
 }
 .bulk-delete-btn:hover { background: #da3633; }
 
+.run-now-btn {
+  background: #1f6feb; color: white; border: 0;
+  padding: 0.35rem 0.75rem; border-radius: 6px; cursor: pointer;
+  font-size: 0.85rem; margin-right: 0.5rem;
+}
+.run-now-btn:hover { background: #388bfd; }
+.run-now-btn:disabled { background: #21262d; color: #6e7681; cursor: wait; }
+
 .flag-banner {
   background: #1c2f1c;
   border: 1px solid #238636;
