@@ -71,6 +71,7 @@ def list_jobs():
     for d in sorted(JOBS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
         meta = read_job_meta(d.name)
         if meta:
+            meta["runnable_script"] = _detect_runnable_script(d)
             out.append(meta)
     return {"jobs": out}
 
@@ -138,6 +139,13 @@ def get_stats():
     return {"total_cost_usd": round(total, 4), "by_module": by_module, "count": count}
 
 
+def _detect_runnable_script(job_dir: Path) -> str | None:
+    for name in ("exploit.py", "solver.py", "solver.sage"):
+        if (job_dir / name).is_file():
+            return name
+    return None
+
+
 @router.get("/{job_id}")
 def get_job(job_id: str):
     meta = read_job_meta(job_id)
@@ -153,7 +161,12 @@ def get_job(job_id: str):
     except Exception:
         pass
 
-    return {**meta, "rq_status": rq_status}
+    # Always derive a `runnable_script` field from the filesystem so the UI
+    # can show the run-now button even on jobs whose meta was written before
+    # the field existed (or whose orchestrator didn't set it).
+    runnable_script = _detect_runnable_script(JOBS_DIR / Path(job_id).name)
+
+    return {**meta, "rq_status": rq_status, "runnable_script": runnable_script}
 
 
 @router.delete("")

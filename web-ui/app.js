@@ -291,15 +291,15 @@ async function renderJob(id) {
   const timeout = job.job_timeout ? ` · timeout: ${job.job_timeout}s` : "";
   const modelInfo = job.model ? ` · model: ${escapeHtml(job.model)}` : "";
 
-  // Run-now button — only when the agent produced a runnable script
-  // (exploit.py / solver.py / solver.sage) and the job is finished/no_flag.
+  // Run-now button: show whenever the job dir actually contains a runnable
+  // script (exploit.py / solver.py / solver.sage). Don't gate on status —
+  // even 'failed' jobs sometimes have a usable partial script.
   let runBlock = "";
-  const runnable = ["finished", "no_flag", "failed"].includes(job.status) &&
-    (job.exploit_present || job.solver_present);
-  if (runnable) {
+  if (job.runnable_script || job.exploit_present || job.solver_present) {
+    const scriptName = job.runnable_script || (job.exploit_present ? "exploit.py" : "solver.py");
     runBlock = `<div style="margin:0.5rem 0">
-      <button class="run-now-btn" data-action="run">▶ Run script in sandbox</button>
-      <small style="color:#8b949e">re-runs the produced exploit/solver against the stored target</small>
+      <button class="run-now-btn" data-action="run">▶ Run ${escapeHtml(scriptName)} in sandbox</button>
+      <small style="color:#8b949e">re-runs the produced script against the stored target</small>
     </div>`;
   }
 
