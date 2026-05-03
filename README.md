@@ -256,6 +256,33 @@ docker compose build api          # rebuild after code changes in api/
 curl -X DELETE 'http://localhost:8000/api/jobs?all=true'
 ```
 
+## Out-of-band callbacks (XSS / SSRF / blind RCE)
+
+CTFs that exfiltrate via a remote bot need a publicly-reachable
+listener. CTFmanager has a built-in collector that takes any HTTP
+request, logs it, and auto-extracts flag-shaped strings.
+
+Setup once:
+
+```bash
+# 1. Expose port 8000 publicly
+ngrok http 8000     # or any tunnel: cloudflared, frp, ssh -R, …
+
+# 2. Settings tab → Callback URL = https://<your-tunnel-host>
+#    (the orchestrator appends /api/collector/<job_id> per job)
+```
+
+Then any agent-produced exploit can use `os.environ["COLLECTOR_URL"]`
+as its callback. The collector:
+
+- writes every hit to `<jobdir>/callbacks.jsonl`
+- re-scans for FLAG/CTF/DH-style patterns in the URL/query/body
+- flips meta.status to `finished` and surfaces flags the moment a
+  match arrives — even if the exploit has already exited
+
+`/api/collector/<job_id>` is intentionally exempt from the auth
+token. Treat the job_id as a secret if you care.
+
 ## Security notes
 
 - Sibling containers spawned by the worker run as root and share the Docker

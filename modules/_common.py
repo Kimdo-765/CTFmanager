@@ -76,9 +76,9 @@ def scan_job_for_flags(job_id: str, extra_files: list[str] | None = None) -> lis
     """Scan known job artifacts for flag candidates.
 
     Default scan set: report.md, exploit.py.stdout, solver.py.stdout,
-    summary.json (forensic), findings.json (misc), and the run.log.
-    `extra_files` can supply additional filenames to scan (relative to the
-    job dir).
+    summary.json (forensic), findings.json (misc), callbacks.jsonl, and
+    the run.log. `extra_files` can supply additional filenames to scan
+    (relative to the job dir).
     """
     jd = job_dir(job_id)
     candidates = [
@@ -91,6 +91,7 @@ def scan_job_for_flags(job_id: str, extra_files: list[str] | None = None) -> lis
         "findings.json",
         "result.json",
         "run.log",
+        "callbacks.jsonl",
     ]
     if extra_files:
         candidates.extend(extra_files)

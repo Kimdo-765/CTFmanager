@@ -29,11 +29,19 @@ When the bug requires an external HTTP listener (XSS cookie steal, blind
 SSRF, blind RCE) — pick the channel based on whether the target is
 local or remote:
 
-1. If the user provided `CALLBACK_URL` via env var, use that as the
-   listener — they have set up their own publicly-reachable endpoint
-   (ngrok, requestbin, their own VPS). Read it with
-   `os.environ.get("CALLBACK_URL")` at the top of exploit.py and
-   prefer it over any other channel.
+1. PREFERRED: read `COLLECTOR_URL` from env. The runner sets it to
+   `<user's tunnel>/api/collector/<job_id>` whenever Settings has a
+   Callback URL. Anything the bot fetches there is auto-logged in the
+   job dir AND auto-extracted for flag patterns — your exploit
+   doesn't need its own polling logic at all. Just embed
+   `${COLLECTOR_URL}?c=$flag` in the payload and exit; the
+   orchestrator will mark the job 'finished' as soon as the bot calls
+   in. If you want the script to wait, poll `GET ${COLLECTOR_URL}` or
+   sleep then exit (the orchestrator's flag-scan runs after sandbox
+   exit too).
+
+   Fallback if COLLECTOR_URL is empty: read `CALLBACK_URL` directly
+   (the operator may have given a webhook.site-style URL).
 
 2. If the target is on the same docker network (local challenge,
    same docker-compose), spin up an in-process HTTP listener:

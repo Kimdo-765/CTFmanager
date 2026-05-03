@@ -52,13 +52,19 @@ def run_in_sandbox(
     else:
         cmd = ["python3", f"{workdir}/{script_rel}", *args]
 
-    # Forward CALLBACK_URL from the worker so exploits that need an
-    # out-of-band listener can use the user's pre-configured public
-    # endpoint (ngrok, requestbin, their own VPS).
-    env: dict[str, str] = {"PYTHONUNBUFFERED": "1"}
+    # Forward CALLBACK_URL + COLLECTOR_BASE so exploits have a stable
+    # OOB channel. CALLBACK_URL is the operator-supplied tunnel
+    # (ngrok / VPS); the agent should append `/api/collector/<JOB_ID>`
+    # to it so the built-in collector endpoint receives the callback,
+    # auto-extracts any flag in the URL, and updates the job status.
+    env: dict[str, str] = {
+        "PYTHONUNBUFFERED": "1",
+        "JOB_ID": job_id,
+    }
     cb = os.environ.get("CALLBACK_URL", "").strip()
     if cb:
         env["CALLBACK_URL"] = cb
+        env["COLLECTOR_URL"] = f"{cb.rstrip('/')}/api/collector/{job_id}"
 
     client = docker.from_env()
     container = client.containers.run(
