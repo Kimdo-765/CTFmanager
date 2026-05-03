@@ -18,9 +18,10 @@ services:
       - ./data:/data
       - ./modules:/app/modules:ro
       - ./web-ui:/app/web-ui:ro
-      # Read-only mount so the Settings page can report whether OAuth is
-      # configured (the actual auth file is consumed by the worker).
       - ${HOST_CLAUDE_HOME:-${HOME}/.claude}:/root/.claude:ro
+      # api needs the docker socket to kill sibling containers spawned by
+      # workers when the user deletes a running job.
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - redis
     restart: unless-stopped

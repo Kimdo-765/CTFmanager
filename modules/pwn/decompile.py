@@ -42,13 +42,12 @@ def run_decompiler(job_id: str, binary_rel: str) -> tuple[Path, str]:
 
     container = client.containers.run(
         image=DECOMPILER_IMAGE,
-        # Entrypoint already contains the python script + ghidra path.
-        # Append the per-run arguments: <binary_in_container> -o <output_in_container>
         command=[f"/job/{binary_rel}", "-o", "/job/decomp.zip"],
         volumes={host_job: {"bind": "/job", "mode": "rw"}},
         mem_limit=DECOMPILER_MEM,
         network_mode="none",
         detach=True,
+        labels={"ctfmanager_job_id": job_id, "ctfmanager_role": "decompiler"},
     )
     try:
         result = container.wait(timeout=DECOMPILER_TIMEOUT_S)

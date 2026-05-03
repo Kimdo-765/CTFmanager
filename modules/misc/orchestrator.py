@@ -70,6 +70,7 @@ def _spawn_misc(job_id: str, filename: str, passphrase: Optional[str]) -> str:
         mem_limit=MISC_MEM,
         network_mode="none",
         detach=True,
+        labels={"ctfmanager_job_id": job_id, "ctfmanager_role": "misc"},
     )
     try:
         result = container.wait(timeout=MISC_TIMEOUT_S)

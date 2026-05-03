@@ -63,6 +63,7 @@ def run_in_sandbox(
         stdout=True,
         stderr=True,
         detach=True,
+        labels={"ctfmanager_job_id": job_id, "ctfmanager_role": "runner"},
     )
     exit_code = -1
     out = b""

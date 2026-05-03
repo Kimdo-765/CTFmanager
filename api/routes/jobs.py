@@ -11,6 +11,58 @@ from api.storage import JOBS_DIR, read_job_meta
 router = APIRouter()
 
 
+def _hard_stop_job(job_id: str) -> dict:
+    """Try to actually halt work on a running job:
+    1. Send STOP_JOB command to whichever worker is running it (RQ pub-sub).
+    2. Find sibling docker containers labelled ctfmanager_job_id=<id> and
+       force-remove them (decompiler / forensic / misc / runner).
+    Errors are swallowed — best-effort.
+    """
+    info: dict = {"sent_stop": False, "containers_killed": 0, "rq_cancelled": False}
+    conn = get_redis()
+    # 1) Tell RQ to interrupt the running job. send_stop_job_command works only
+    #    on running jobs; for queued ones, plain cancel() is enough.
+    try:
+        from rq.command import send_stop_job_command
+        send_stop_job_command(conn, job_id)
+        info["sent_stop"] = True
+    except Exception:
+        pass
+    try:
+        from rq.job import Job
+        rq_job = Job.fetch(job_id, connection=conn)
+        try:
+            rq_job.cancel()
+            info["rq_cancelled"] = True
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # 2) Kill any sibling containers spawned for this job
+    try:
+        import docker as _docker
+        client = _docker.from_env()
+        containers = client.containers.list(
+            all=True,
+            filters={"label": f"ctfmanager_job_id={job_id}"},
+        )
+        for c in containers:
+            try:
+                c.kill()
+            except Exception:
+                pass
+            try:
+                c.remove(force=True)
+                info["containers_killed"] += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return info
+
+
 @router.get("")
 def list_jobs():
     if not JOBS_DIR.exists():
@@ -143,14 +195,9 @@ def bulk_delete_jobs(
         if not status and not all and st not in safe_default_statuses:
             skipped += 1
             continue
-        # Cancel queued/running in RQ if we're deleting them
+        # Halt running/queued jobs: stop the worker + kill sibling containers
         if st in ("queued", "running"):
-            try:
-                from rq.job import Job
-                rq_job = Job.fetch(d.name, connection=get_redis())
-                rq_job.cancel()
-            except Exception:
-                pass
+            _hard_stop_job(d.name)
         try:
             shutil.rmtree(d)
             deleted_ids.append(d.name)
@@ -167,15 +214,11 @@ def delete_job(job_id: str):
     if not d.exists():
         raise HTTPException(status_code=404, detail="job not found")
     meta = read_job_meta(safe)
+    halt_info = None
     if meta and meta.get("status") in ("queued", "running"):
-        try:
-            from rq.job import Job
-            rq_job = Job.fetch(safe, connection=get_redis())
-            rq_job.cancel()
-        except Exception:
-            pass
+        halt_info = _hard_stop_job(safe)
     shutil.rmtree(d)
-    return {"deleted": safe}
+    return {"deleted": safe, "halt": halt_info}
 
 
 @router.get("/{job_id}/log", response_class=PlainTextResponse)

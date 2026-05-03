@@ -79,6 +79,7 @@ def _spawn_collector(
         # network=bridge by default — needed so volatility3 can fetch PDB
         # symbols from microsoft for unknown windows builds.
         detach=True,
+        labels={"ctfmanager_job_id": job_id, "ctfmanager_role": "forensic"},
     )
     try:
         result = container.wait(timeout=FORENSIC_TIMEOUT_S)
