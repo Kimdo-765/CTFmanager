@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libgmp-dev libmpfr-dev libmpc-dev \
     binutils file curl \
+    bash less vim-tiny nano \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
@@ -17,4 +18,7 @@ RUN pip install --no-cache-dir \
     httpx==0.27.2
 
 WORKDIR /work
-ENTRYPOINT ["python3"]
+# Default to bash so the web terminal works; orchestrators set their
+# own command (`python3 /work/exploit.py ...` or `sage ...`) via
+# `command=[...]` and that takes precedence.
+CMD ["bash"]
