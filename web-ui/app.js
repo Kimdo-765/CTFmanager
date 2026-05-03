@@ -18,6 +18,10 @@ async function submitJob(form, endpoint) {
   for (const cb of form.querySelectorAll('input[type="checkbox"]')) {
     fd.set(cb.name, cb.checked ? "true" : "false");
   }
+  // Drop empty optional numeric fields so backend uses its default.
+  const to = fd.get("job_timeout");
+  if (to === "" || to == null) fd.delete("job_timeout");
+
   const res = await fetch(`${API}${endpoint}`, { method: "POST", body: fd });
   if (!res.ok) {
     alert(`error: ${res.status} ${await res.text()}`);
@@ -281,6 +285,7 @@ async function renderJob(id) {
 
   const cost = job.cost_usd ? ` · cost: $${Number(job.cost_usd).toFixed(4)}` : "";
   const stage = job.stage ? ` · stage: ${job.stage}` : "";
+  const timeout = job.job_timeout ? ` · timeout: ${job.job_timeout}s` : "";
 
   let flagBlock = "";
   if (job.flags && job.flags.length) {
@@ -299,7 +304,7 @@ async function renderJob(id) {
     <h3>Job ${job.id}
       <span class="status ${job.status}">${job.status}</span>
     </h3>
-    <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}</small></div>
+    <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}</small></div>
     ${flagBlock}
     ${resultBlock}
     <h4>Run log <small style="color:#8b949e;font-weight:normal">(auto-follows when scrolled to bottom)</small></h4>

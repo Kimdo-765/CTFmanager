@@ -3,7 +3,7 @@ from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from api.queue import get_queue
+from api.queue import get_queue, resolve_timeout
 from api.storage import job_dir, new_job_id, write_job_meta
 
 router = APIRouter()
@@ -12,9 +12,10 @@ router = APIRouter()
 @router.post("/analyze")
 async def analyze_pwn(
     file: UploadFile = File(...),
-    target: Optional[str] = Form(None),  # "host:port"
+    target: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     auto_run: bool = Form(False),
+    job_timeout: Optional[int] = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="file required")
@@ -32,14 +33,16 @@ async def analyze_pwn(
     target_path.write_bytes(content)
     target_path.chmod(0o755)
 
+    timeout = resolve_timeout(job_timeout)
     meta = {
         "id": job_id,
         "module": "pwn",
         "status": "queued",
         "filename": binary_name,
-        "target_url": target,  # reuse the field for UI consistency
+        "target_url": target,
         "description": description,
         "auto_run": auto_run,
+        "job_timeout": timeout,
     }
     write_job_meta(job_id, meta)
 
@@ -52,6 +55,7 @@ async def analyze_pwn(
         description,
         auto_run,
         job_id=job_id,
+        job_timeout=timeout,
     )
 
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id, "status": "queued", "job_timeout": timeout}

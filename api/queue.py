@@ -19,6 +19,13 @@ def _job_timeout() -> int:
         return 900
 
 
+def resolve_timeout(per_job: int | None) -> int:
+    """Per-job override > global setting > 900s default."""
+    if per_job and per_job > 0:
+        return int(per_job)
+    return _job_timeout()
+
+
 def get_queue() -> Queue:
     return Queue("ctfmanager", connection=_redis, default_timeout=_job_timeout())
 

@@ -3,7 +3,7 @@ from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from api.queue import get_queue
+from api.queue import get_queue, resolve_timeout
 from api.storage import job_dir, new_job_id, write_job_meta
 
 router = APIRouter()
@@ -32,6 +32,7 @@ async def collect_forensic(
     description: Optional[str] = Form(None),
     bulk_extractor: bool = Form(False),
     skip_claude: bool = Form(False),
+    job_timeout: Optional[int] = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="file required")
@@ -43,6 +44,7 @@ async def collect_forensic(
     if size == 0:
         raise HTTPException(status_code=400, detail="empty file")
 
+    timeout = resolve_timeout(job_timeout)
     meta = {
         "id": job_id,
         "module": "forensic",
@@ -54,6 +56,7 @@ async def collect_forensic(
         "bulk_extractor": bulk_extractor,
         "skip_claude": skip_claude,
         "size_bytes": size,
+        "job_timeout": timeout,
     }
     write_job_meta(job_id, meta)
 
@@ -68,6 +71,7 @@ async def collect_forensic(
         bulk_extractor,
         skip_claude,
         job_id=job_id,
+        job_timeout=timeout,
     )
 
-    return {"job_id": job_id, "status": "queued", "size_bytes": size}
+    return {"job_id": job_id, "status": "queued", "size_bytes": size, "job_timeout": timeout}

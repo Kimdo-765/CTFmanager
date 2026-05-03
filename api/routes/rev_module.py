@@ -3,7 +3,7 @@ from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from api.queue import get_queue
+from api.queue import get_queue, resolve_timeout
 from api.storage import job_dir, new_job_id, write_job_meta
 
 router = APIRouter()
@@ -14,6 +14,7 @@ async def analyze_rev(
     file: UploadFile = File(...),
     description: Optional[str] = Form(None),
     auto_run: bool = Form(False),
+    job_timeout: Optional[int] = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="file required")
@@ -31,6 +32,7 @@ async def analyze_rev(
     target_path.write_bytes(content)
     target_path.chmod(0o755)
 
+    timeout = resolve_timeout(job_timeout)
     meta = {
         "id": job_id,
         "module": "rev",
@@ -38,6 +40,7 @@ async def analyze_rev(
         "filename": binary_name,
         "description": description,
         "auto_run": auto_run,
+        "job_timeout": timeout,
     }
     write_job_meta(job_id, meta)
 
@@ -49,6 +52,7 @@ async def analyze_rev(
         description,
         auto_run,
         job_id=job_id,
+        job_timeout=timeout,
     )
 
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id, "status": "queued", "job_timeout": timeout}

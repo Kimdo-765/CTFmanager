@@ -2,7 +2,7 @@ from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from api.queue import get_queue
+from api.queue import get_queue, resolve_timeout
 from api.storage import (
     extract_if_archive,
     job_dir,
@@ -20,6 +20,7 @@ async def analyze_web(
     target_url: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     auto_run: bool = Form(False),
+    job_timeout: Optional[int] = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="file required")
@@ -32,6 +33,7 @@ async def analyze_web(
     saved = save_upload(job_id, file.filename, content)
     src_root = extract_if_archive(saved)
 
+    timeout = resolve_timeout(job_timeout)
     meta = {
         "id": job_id,
         "module": "web",
@@ -40,6 +42,7 @@ async def analyze_web(
         "target_url": target_url,
         "description": description,
         "auto_run": auto_run,
+        "job_timeout": timeout,
         "src_root": str(src_root),
     }
     write_job_meta(job_id, meta)
@@ -53,6 +56,7 @@ async def analyze_web(
         description,
         auto_run,
         job_id=job_id,
+        job_timeout=timeout,
     )
 
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id, "status": "queued", "job_timeout": timeout}

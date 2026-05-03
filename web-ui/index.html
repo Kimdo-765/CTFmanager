@@ -47,6 +47,10 @@
           <input type="checkbox" name="auto_run" />
           Auto-run generated exploit (requires target URL)
         </label>
+        <label>
+          Job timeout (seconds, blank = global setting)
+          <input type="number" name="job_timeout" min="60" placeholder="900" />
+        </label>
         <button type="submit">Analyze</button>
       </form>
     </section>
@@ -69,6 +73,10 @@
         <label class="checkbox">
           <input type="checkbox" name="auto_run" />
           Auto-run generated exploit (requires remote target)
+        </label>
+        <label>
+          Job timeout (seconds, blank = global setting)
+          <input type="number" name="job_timeout" min="60" placeholder="900" />
         </label>
         <button type="submit">Decompile + Analyze</button>
         <small style="color:#8b949e">First run requires the decompiler image: <code>docker compose --profile tools build decompiler</code></small>
@@ -111,6 +119,10 @@
           <input type="checkbox" name="skip_claude" />
           Skip Claude summary (collection only)
         </label>
+        <label>
+          Job timeout (seconds, blank = global setting)
+          <input type="number" name="job_timeout" min="60" placeholder="1800" />
+        </label>
         <button type="submit">Collect Artifacts</button>
         <small style="color:#8b949e">First run requires the forensic image: <code>docker compose --profile tools build forensic</code></small>
       </form>
@@ -134,6 +146,10 @@
         <label class="checkbox">
           <input type="checkbox" name="skip_claude" />
           Skip Claude summary (raw findings only)
+        </label>
+        <label>
+          Job timeout (seconds, blank = global setting)
+          <input type="number" name="job_timeout" min="60" placeholder="600" />
         </label>
         <button type="submit">Analyze</button>
         <small style="color:#8b949e">First run requires the misc image: <code>docker compose --profile tools build misc</code></small>
@@ -163,6 +179,10 @@
           <input type="checkbox" name="use_sage" />
           Use SageMath sandbox (slower, supports lattice/Coppersmith)
         </label>
+        <label>
+          Job timeout (seconds, blank = global setting)
+          <input type="number" name="job_timeout" min="60" placeholder="900" />
+        </label>
         <button type="submit">Analyze + Solve</button>
         <small style="color:#8b949e">Worker has pycryptodome, gmpy2, sympy, z3-solver, ecdsa, pwntools. Sage requires <code>docker compose --profile tools-sage pull sage</code>.</small>
       </form>
@@ -182,6 +202,10 @@
         <label class="checkbox">
           <input type="checkbox" name="auto_run" />
           Auto-run generated solver
+        </label>
+        <label>
+          Job timeout (seconds, blank = global setting)
+          <input type="number" name="job_timeout" min="60" placeholder="900" />
         </label>
         <button type="submit">Decompile + Solve</button>
         <small style="color:#8b949e">Reuses decompiler image. Solver runs with crypto libs (pycryptodome, gmpy2, sympy, z3, pwntools).</small>

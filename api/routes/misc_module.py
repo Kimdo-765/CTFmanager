@@ -3,7 +3,7 @@ from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from api.queue import get_queue
+from api.queue import get_queue, resolve_timeout
 from api.storage import job_dir, new_job_id, write_job_meta
 
 router = APIRouter()
@@ -30,6 +30,7 @@ async def analyze_misc(
     passphrase: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     skip_claude: bool = Form(False),
+    job_timeout: Optional[int] = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="file required")
@@ -41,6 +42,7 @@ async def analyze_misc(
     if size == 0:
         raise HTTPException(status_code=400, detail="empty file")
 
+    timeout = resolve_timeout(job_timeout)
     meta = {
         "id": job_id,
         "module": "misc",
@@ -49,6 +51,7 @@ async def analyze_misc(
         "description": description,
         "skip_claude": skip_claude,
         "size_bytes": size,
+        "job_timeout": timeout,
     }
     write_job_meta(job_id, meta)
 
@@ -61,6 +64,7 @@ async def analyze_misc(
         description,
         skip_claude,
         job_id=job_id,
+        job_timeout=timeout,
     )
 
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id, "status": "queued", "job_timeout": timeout}
