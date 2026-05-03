@@ -14,7 +14,7 @@ from claude_agent_sdk import (
     query,
 )
 
-from modules._common import extract_cost, job_dir, log_line, write_meta
+from modules._common import collect_outputs, extract_cost, job_dir, log_line, write_meta
 from modules._runner import attempt_sandbox_run
 from modules.pwn.prompts import SYSTEM_PROMPT, build_user_prompt
 from modules.settings_io import apply_to_env, get_setting
@@ -77,10 +77,9 @@ async def _run_agent(
             }
             log_line(job_id, f"DONE: {summary['result']}")
 
-    exploit = work_dir / "exploit.py"
-    report = work_dir / "report.md"
-    summary["exploit_present"] = exploit.exists()
-    summary["report_present"] = report.exists()
+    found = collect_outputs(work_dir, ["exploit.py", "report.md"])
+    summary["exploit_present"] = "exploit.py" in found
+    summary["report_present"] = "report.md" in found
     summary["decomp_used"] = (work_dir / "decomp").exists()
     if summary["decomp_used"]:
         try:
@@ -88,10 +87,8 @@ async def _run_agent(
         except Exception:
             pass
     jd = job_dir(job_id)
-    if exploit.exists():
-        (jd / "exploit.py").write_bytes(exploit.read_bytes())
-    if report.exists():
-        (jd / "report.md").write_bytes(report.read_bytes())
+    for name, src in found.items():
+        (jd / name).write_bytes(src.read_bytes())
     return summary
 
 

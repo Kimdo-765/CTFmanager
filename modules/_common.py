@@ -5,7 +5,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Dict  # noqa: F401
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 JOBS_DIR = DATA_DIR / "jobs"
@@ -32,6 +32,24 @@ def write_meta(job_id: str, **updates: Any) -> None:
     meta.update(updates)
     meta["updated_at"] = datetime.now(timezone.utc).isoformat()
     f.write_text(json.dumps(meta, indent=2))
+
+
+def collect_outputs(work_dir: Path, names: list[str]) -> dict[str, Path]:
+    """Find each requested filename. Looks in work_dir first, then falls
+    back to /root/ (the agent's HOME — sometimes the agent ignores cwd
+    and uses an absolute path under home).
+
+    Returns a dict {name: actual_path} for files that were located.
+    """
+    found: dict[str, Path] = {}
+    candidates_dirs = [work_dir, Path("/root")]
+    for name in names:
+        for d in candidates_dirs:
+            p = d / name
+            if p.is_file():
+                found[name] = p
+                break
+    return found
 
 
 def extract_cost(claude_summary: dict | None) -> float:

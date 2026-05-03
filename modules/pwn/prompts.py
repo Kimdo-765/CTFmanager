@@ -28,12 +28,14 @@ Suggested workflow:
 4. Pinpoint the bug class (BoF, fmt-string, UAF, integer overflow, …)
    with concrete file:line references.
 5. Compute offsets and gadgets you need.
-6. Write `exploit.py` in the current working directory:
+6. Write `exploit.py` to your CURRENT WORKING DIRECTORY using a
+   RELATIVE path (e.g. `./exploit.py`, NOT `/root/exploit.py`). The
+   orchestrator only collects files from your cwd.
    - Accept the target as `sys.argv[1]` in `host:port` form;
      fall back to `./bin/<name>` for local mode (use `process()`).
    - Use `remote(host, port)` when a target is provided.
    - Print the captured flag (or final response if pattern unknown).
-7. Write `report.md` with:
+7. Write `./report.md` (relative path, same dir as exploit.py) with:
    - Binary mitigations summary
    - Vulnerability analysis (bug class, file:line, why it's reachable)
    - Exploit strategy step by step (with offsets/gadgets)
