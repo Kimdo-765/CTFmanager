@@ -123,7 +123,7 @@ def bulk_delete_jobs(
     if not JOBS_DIR.exists():
         return {"deleted": 0, "skipped": 0, "ids": []}
 
-    safe_default_statuses = {"finished", "failed"}
+    safe_default_statuses = {"finished", "failed", "no_flag"}
     deleted_ids: list[str] = []
     skipped = 0
 

@@ -156,8 +156,9 @@ def run_job(
         cost = extract_cost(result.get("claude"))
         result["cost_usd"] = cost
 
+        final_status = "finished" if flags else "no_flag"
         (_job_dir(job_id) / "result.json").write_text(json.dumps(result, indent=2, default=str))
-        _write_meta(job_id, status="finished", stage="done", cost_usd=cost,
+        _write_meta(job_id, status=final_status, stage="done", cost_usd=cost,
                     flags=flags)
         return result
     except Exception as e:

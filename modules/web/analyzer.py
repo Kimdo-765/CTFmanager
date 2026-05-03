@@ -123,6 +123,8 @@ def run_job(
         agent_err_kind = agent_summary.get("agent_error_kind")
         if agent_err and not agent_summary.get("exploit_present"):
             final_status = "failed"
+        elif not flags:
+            final_status = "no_flag"
         else:
             final_status = "finished"
         result = {

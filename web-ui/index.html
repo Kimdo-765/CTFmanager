@@ -314,8 +314,9 @@
       <div class="jobs-toolbar">
         <button id="refresh-jobs">Refresh</button>
         <select id="bulk-filter">
-          <option value="">finished + failed (safe)</option>
-          <option value="finished">only finished</option>
+          <option value="">finished + failed + no_flag (safe)</option>
+          <option value="finished">only finished (flag found)</option>
+          <option value="no_flag">only no_flag</option>
           <option value="failed">only failed</option>
           <option value="queued">only queued</option>
           <option value="running">only running</option>

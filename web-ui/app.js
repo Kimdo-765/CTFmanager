@@ -227,7 +227,7 @@ async function selectJob(id) {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
     const job = await renderJob(id);
-    if (job && (job.status === "finished" || job.status === "failed")) {
+    if (job && ["finished", "failed", "no_flag"].includes(job.status)) {
       clearInterval(pollTimer);
       pollTimer = null;
       await refreshJobs();
@@ -259,7 +259,7 @@ async function renderJob(id) {
   const isSameJob = prevPre && prevPre.dataset.jobId === id;
 
   let resultBlock = "";
-  if (job.status === "finished" || job.status === "running") {
+  if (["finished", "running", "no_flag"].includes(job.status)) {
     const links = [
       `<a href="${API}/jobs/${id}/result" target="_blank">result.json</a>`,
       `<a href="${API}/jobs/${id}/file/report.md" target="_blank">report.md</a>`,

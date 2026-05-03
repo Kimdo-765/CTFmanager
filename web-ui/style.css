@@ -136,6 +136,7 @@ button[type="submit"], #refresh-jobs {
 .status.queued { background: #6e7681; }
 .status.running { background: #d29922; }
 .status.finished { background: #238636; }
+.status.no_flag { background: #b08800; color: #1c1500; }
 .status.failed { background: #da3633; }
 #job-detail pre {
   background: #161b22;

@@ -137,10 +137,10 @@ def run_job(
         flags = scan_job_for_flags(job_id)
         agent_err = agent_summary.get("agent_error")
         agent_err_kind = agent_summary.get("agent_error_kind")
-        # If the agent ran into an error and produced no exploit, mark failed.
-        # Otherwise (partial success — exploit was written before failure) keep finished.
         if agent_err and not agent_summary.get("exploit_present"):
             final_status = "failed"
+        elif not flags:
+            final_status = "no_flag"
         else:
             final_status = "finished"
         result = {
