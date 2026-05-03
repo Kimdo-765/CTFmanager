@@ -30,6 +30,11 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY worker /app/worker
 
+# Expose ghiant as a Bash command so the agent can invoke decompilation
+# on demand instead of forcing it as a pre-step.
+RUN ln -sf /app/worker/ghiant_cli.py /usr/local/bin/ghiant \
+ && chmod +x /app/worker/ghiant_cli.py
+
 ENV PYTHONPATH=/app
 
 CMD ["python", "-m", "worker.runner"]

@@ -1,5 +1,4 @@
 import json
-import os
 import shutil
 import traceback
 from pathlib import Path
@@ -17,7 +16,6 @@ from claude_agent_sdk import (
 
 from modules._common import extract_cost, job_dir, log_line, write_meta
 from modules._runner import attempt_sandbox_run
-from modules.pwn.decompile import run_decompiler
 from modules.pwn.prompts import SYSTEM_PROMPT, build_user_prompt
 from modules.settings_io import apply_to_env, get_setting
 
@@ -26,7 +24,6 @@ async def _run_agent(
     job_id: str,
     binary_name: str,
     bin_dir: Path,
-    decomp_dir: Path,
     target: Optional[str],
     description: Optional[str],
     auto_run: bool,
@@ -34,14 +31,16 @@ async def _run_agent(
     work_dir = job_dir(job_id) / "work"
     work_dir.mkdir(exist_ok=True)
 
-    staged_decomp = work_dir / "decomp"
     staged_bin = work_dir / "bin"
-    if staged_decomp.exists():
-        shutil.rmtree(staged_decomp)
     if staged_bin.exists():
         shutil.rmtree(staged_bin)
-    shutil.copytree(decomp_dir, staged_decomp)
     shutil.copytree(bin_dir, staged_bin)
+    # Make sure the binary inside the staged dir is executable
+    for f in staged_bin.iterdir():
+        try:
+            f.chmod(0o755)
+        except Exception:
+            pass
 
     model = str(get_setting("claude_model") or "claude-opus-4-7")
     options = ClaudeAgentOptions(
@@ -50,6 +49,9 @@ async def _run_agent(
         cwd=str(work_dir),
         allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
         permission_mode="bypassPermissions",
+        # JOB_ID lets the `ghiant` Bash wrapper find the job dir for the
+        # decompiler bind-mount.
+        env={"JOB_ID": job_id},
     )
     user_prompt = build_user_prompt(binary_name, target, description, auto_run)
 
@@ -79,6 +81,12 @@ async def _run_agent(
     report = work_dir / "report.md"
     summary["exploit_present"] = exploit.exists()
     summary["report_present"] = report.exists()
+    summary["decomp_used"] = (work_dir / "decomp").exists()
+    if summary["decomp_used"]:
+        try:
+            summary["decomp_function_count"] = len(list((work_dir / "decomp").glob("*.c")))
+        except Exception:
+            pass
     jd = job_dir(job_id)
     if exploit.exists():
         (jd / "exploit.py").write_bytes(exploit.read_bytes())
@@ -99,19 +107,10 @@ def run_job(
     binary_name = Path(binary_rel).name
 
     apply_to_env()
-    write_meta(job_id, status="running", stage="decompile")
+    write_meta(job_id, status="running", stage="analyze")
     try:
-        log_line(job_id, f"Running decompiler on bin/{binary_name}")
-        decomp_dir, decomp_logs = run_decompiler(job_id, f"bin/{binary_name}")
-        decomp_count = len(list(decomp_dir.glob("*.c")))
-        log_line(job_id, f"Decompile produced {decomp_count} .c files")
-        if decomp_logs:
-            (jd / "decompile.log").write_text(decomp_logs)
-
-        write_meta(job_id, stage="analyze")
         agent_summary = anyio.run(
-            _run_agent, job_id, binary_name, bin_dir, decomp_dir, target,
-            description, auto_run,
+            _run_agent, job_id, binary_name, bin_dir, target, description, auto_run,
         )
         cost = extract_cost(agent_summary)
 
@@ -124,13 +123,13 @@ def run_job(
 
         result = {
             "agent": agent_summary,
-            "decomp_function_count": decomp_count,
             "cost_usd": cost,
             "sandbox": sandbox_result,
         }
         (jd / "result.json").write_text(json.dumps(result, indent=2))
         write_meta(job_id, status="finished", stage="done", cost_usd=cost,
-                   exploit_present=agent_summary.get("exploit_present", False))
+                   exploit_present=agent_summary.get("exploit_present", False),
+                   decomp_used=agent_summary.get("decomp_used", False))
         return result
     except Exception as e:
         log_line(job_id, f"ERROR: {e}\n{traceback.format_exc()}")
