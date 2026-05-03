@@ -108,7 +108,7 @@ async def _run_agent(
 
 def run_job(
     job_id: str,
-    binary_rel: str,
+    binary_rel: Optional[str],
     target: Optional[str],
     description: Optional[str],
     auto_run: bool,
@@ -116,7 +116,7 @@ def run_job(
 ) -> dict:
     jd = job_dir(job_id)
     bin_dir = jd / "bin"
-    binary_name = Path(binary_rel).name
+    binary_name = Path(binary_rel).name if binary_rel else None
 
     apply_to_env()
     write_meta(job_id, status="running", stage="analyze")

@@ -29,7 +29,7 @@ from modules.settings_io import apply_to_env, get_setting
 
 async def _run_agent(
     job_id: str,
-    src_root: str,
+    src_root: Optional[str],
     target: Optional[str],
     description: Optional[str],
     auto_run: bool,
@@ -39,13 +39,14 @@ async def _run_agent(
     work_dir.mkdir(exist_ok=True)
 
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
+    add_dirs = [src_root] if src_root else []
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         model=model,
         cwd=str(work_dir),
         allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
         permission_mode="bypassPermissions",
-        add_dirs=[src_root],
+        add_dirs=add_dirs,
     )
     user_prompt = build_user_prompt(src_root, target, description, auto_run)
 
@@ -96,7 +97,7 @@ async def _run_agent(
 
 def run_job(
     job_id: str,
-    src_root: str,
+    src_root: Optional[str],
     target: Optional[str],
     description: Optional[str],
     auto_run: bool,

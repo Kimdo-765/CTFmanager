@@ -32,11 +32,11 @@
       <h2>Web — Source Vulnerability Analysis + Exploit</h2>
       <form id="web-form">
         <label>
-          Source code (zip preferred, single file ok)
-          <input type="file" name="file" required />
+          Source code (zip preferred, single file ok) — <em>or skip if remote-only</em>
+          <input type="file" name="file" />
         </label>
         <label>
-          Target URL (optional)
+          Target URL (required if no source)
           <input type="url" name="target_url" placeholder="http://challenge.example.com:8080" />
         </label>
         <label>
@@ -68,11 +68,11 @@
       <h2>Pwn — Ghidra Decompile + Exploit (pwntools)</h2>
       <form id="pwn-form">
         <label>
-          Binary (ELF/PE)
-          <input type="file" name="file" required />
+          Binary (ELF/PE) — <em>or skip if remote-only</em>
+          <input type="file" name="file" />
         </label>
         <label>
-          Remote target (optional, host:port)
+          Remote target (required if no binary, host:port)
           <input type="text" name="target" placeholder="ctf.example.com:1337" />
         </label>
         <label>
@@ -196,11 +196,11 @@
       <h2>Crypto — Source Analysis + Solver Generation</h2>
       <form id="crypto-form">
         <label>
-          Challenge files (zip preferred — source + ciphertext + keys)
-          <input type="file" name="file" required />
+          Challenge files (zip preferred — source + ciphertext + keys) — <em>or skip for remote oracle</em>
+          <input type="file" name="file" />
         </label>
         <label>
-          Remote target (optional, host:port)
+          Remote target (required if no files, host:port)
           <input type="text" name="target" placeholder="ctf.example.com:31337" />
         </label>
         <label>

@@ -11,28 +11,34 @@ router = APIRouter()
 
 @router.post("/analyze")
 async def analyze_pwn(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
     target: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     auto_run: bool = Form(False),
     job_timeout: Optional[int] = Form(None),
     model: Optional[str] = Form(None),
 ):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="file required")
-
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="empty file")
+    target = (target or "").strip() or None
+    has_file = bool(file and file.filename)
+    if not has_file and not target:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either a binary or a remote target (host:port).",
+        )
 
     job_id = new_job_id()
     bin_dir = job_dir(job_id) / "bin"
     bin_dir.mkdir(exist_ok=True)
 
-    binary_name = Path(file.filename).name
-    target_path = bin_dir / binary_name
-    target_path.write_bytes(content)
-    target_path.chmod(0o755)
+    binary_name = None
+    if has_file:
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="empty file")
+        binary_name = Path(file.filename).name
+        target_path = bin_dir / binary_name
+        target_path.write_bytes(content)
+        target_path.chmod(0o755)
 
     timeout = resolve_timeout(job_timeout)
     chosen_model = (model or "").strip() or None
@@ -46,6 +52,7 @@ async def analyze_pwn(
         "auto_run": auto_run,
         "job_timeout": timeout,
         "model": chosen_model,
+        "remote_only": not has_file,
     }
     write_job_meta(job_id, meta)
 

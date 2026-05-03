@@ -32,12 +32,21 @@ Constraints:
 
 
 def build_user_prompt(
-    src_root: str,
+    src_root: str | None,
     target_url: str | None,
     description: str | None,
     auto_run: bool,
 ) -> str:
-    parts = [f"Source code directory (read-only): {src_root}"]
+    parts: list[str] = []
+    if src_root:
+        parts.append(f"Source code directory (read-only): {src_root}")
+    else:
+        parts.append(
+            "Source code: NOT PROVIDED. This is a black-box challenge — you "
+            "only have the live target. Probe it via Bash (curl, requests) "
+            "to fingerprint the stack, enumerate routes, and craft the "
+            "exploit from observed behavior."
+        )
     if target_url:
         parts.append(f"Target URL: {target_url}")
     else:
@@ -49,7 +58,12 @@ def build_user_prompt(
         "(handled by the orchestrator outside your context — do not run "
         "exploit.py yourself)."
     )
-    parts.append(
-        "Begin by listing the source tree, then read the entry-point files first."
-    )
+    if src_root:
+        parts.append("Begin by listing the source tree, then read the entry-point files first.")
+    else:
+        parts.append(
+            "Begin by probing the target — `curl -i <url>`, look at headers, "
+            "error pages, common paths (/robots.txt, /admin, /api). Then form "
+            "a hypothesis and craft the exploit."
+        )
     return "\n\n".join(parts)

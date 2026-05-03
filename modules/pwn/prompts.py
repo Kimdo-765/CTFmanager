@@ -56,14 +56,22 @@ Constraints:
 
 
 def build_user_prompt(
-    binary_name: str,
+    binary_name: str | None,
     target: str | None,
     description: str | None,
     auto_run: bool,
 ) -> str:
-    parts = [
-        f"Binary directory (read-only): ./bin/   (target: ./bin/{binary_name})",
-    ]
+    parts: list[str] = []
+    if binary_name:
+        parts.append(f"Binary directory (read-only): ./bin/   (target: ./bin/{binary_name})")
+    else:
+        parts.append(
+            "Binary: NOT PROVIDED. This is a remote-only pwn challenge — you "
+            "have only the network endpoint. Probe with `nc` / pwntools "
+            "remote() to fingerprint the protocol, look for format-string "
+            "leaks, command-injection prompts, or other observable behavior, "
+            "then craft the exploit blindly from response patterns."
+        )
     if target:
         parts.append(f"Remote target: {target}")
     else:
@@ -74,8 +82,15 @@ def build_user_prompt(
         f"auto_run_after_you_finish={'true' if auto_run else 'false'} "
         "(handled by orchestrator — do not execute exploit.py yourself)."
     )
-    parts.append(
-        "Begin with file/checksec/strings on the binary. Decompile with "
-        "`ghiant ./bin/" + binary_name + "` ONLY if the disasm is too dense to follow."
-    )
+    if binary_name:
+        parts.append(
+            "Begin with file/checksec/strings on the binary. Decompile with "
+            f"`ghiant ./bin/{binary_name}` ONLY if the disasm is too dense to follow."
+        )
+    else:
+        parts.append(
+            "Begin by connecting to the target and observing the protocol. "
+            "Try sending various probes (long strings, `%p %p %p`, format "
+            "specifiers, common menu inputs) and study responses."
+        )
     return "\n\n".join(parts)

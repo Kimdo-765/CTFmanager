@@ -16,23 +16,29 @@ router = APIRouter()
 
 @router.post("/analyze")
 async def analyze_web(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
     target_url: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     auto_run: bool = Form(False),
     job_timeout: Optional[int] = Form(None),
     model: Optional[str] = Form(None),
 ):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="file required")
-
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="empty file")
+    target_url = (target_url or "").strip() or None
+    has_file = bool(file and file.filename)
+    if not has_file and not target_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either a source file/zip or a target URL (or both).",
+        )
 
     job_id = new_job_id()
-    saved = save_upload(job_id, file.filename, content)
-    src_root = extract_if_archive(saved)
+    src_root = None
+    if has_file:
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="empty file")
+        saved = save_upload(job_id, file.filename, content)
+        src_root = str(extract_if_archive(saved))
 
     timeout = resolve_timeout(job_timeout)
     chosen_model = (model or "").strip() or None
@@ -40,13 +46,14 @@ async def analyze_web(
         "id": job_id,
         "module": "web",
         "status": "queued",
-        "filename": file.filename,
+        "filename": file.filename if has_file else None,
         "target_url": target_url,
         "description": description,
         "auto_run": auto_run,
         "job_timeout": timeout,
         "model": chosen_model,
-        "src_root": str(src_root),
+        "src_root": src_root,
+        "remote_only": not has_file,
     }
     write_job_meta(job_id, meta)
 
@@ -54,7 +61,7 @@ async def analyze_web(
     q.enqueue(
         "modules.web.analyzer.run_job",
         job_id,
-        str(src_root),
+        src_root,
         target_url,
         description,
         auto_run,

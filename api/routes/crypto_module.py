@@ -15,7 +15,7 @@ router = APIRouter()
 
 @router.post("/analyze")
 async def analyze_crypto(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
     target: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     auto_run: bool = Form(False),
@@ -23,16 +23,22 @@ async def analyze_crypto(
     job_timeout: Optional[int] = Form(None),
     model: Optional[str] = Form(None),
 ):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="file required")
-
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="empty file")
+    target = (target or "").strip() or None
+    has_file = bool(file and file.filename)
+    if not has_file and not target:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either a challenge file/zip or a remote target (host:port).",
+        )
 
     job_id = new_job_id()
-    saved = save_upload(job_id, file.filename, content)
-    src_root = extract_if_archive(saved)
+    src_root = None
+    if has_file:
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="empty file")
+        saved = save_upload(job_id, file.filename, content)
+        src_root = str(extract_if_archive(saved))
 
     timeout = resolve_timeout(job_timeout)
     chosen_model = (model or "").strip() or None
@@ -40,14 +46,15 @@ async def analyze_crypto(
         "id": job_id,
         "module": "crypto",
         "status": "queued",
-        "filename": file.filename,
+        "filename": file.filename if has_file else None,
         "target_url": target,
         "description": description,
         "auto_run": auto_run,
         "use_sage": use_sage,
         "job_timeout": timeout,
         "model": chosen_model,
-        "src_root": str(src_root),
+        "src_root": src_root,
+        "remote_only": not has_file,
     }
     write_job_meta(job_id, meta)
 
@@ -55,7 +62,7 @@ async def analyze_crypto(
     q.enqueue(
         "modules.crypto.analyzer.run_job",
         job_id,
-        str(src_root),
+        src_root,
         target,
         description,
         auto_run,

@@ -46,12 +46,22 @@ Constraints:
 
 
 def build_user_prompt(
-    src_root: str,
+    src_root: str | None,
     target: str | None,
     description: str | None,
     auto_run: bool,
 ) -> str:
-    parts = [f"Source/ciphertext directory (read-only): {src_root}"]
+    parts: list[str] = []
+    if src_root:
+        parts.append(f"Source/ciphertext directory (read-only): {src_root}")
+    else:
+        parts.append(
+            "Source / ciphertext: NOT PROVIDED. This is a remote-oracle "
+            "challenge — you can only interact with the live service. "
+            "Connect via pwntools.remote() to learn the protocol, identify "
+            "what kind of oracle (encryption / decryption / signing) it "
+            "exposes, and design queries that recover the secret."
+        )
     if target:
         parts.append(f"Remote target: {target}")
     else:
@@ -62,5 +72,12 @@ def build_user_prompt(
         f"auto_run_after_you_finish={'true' if auto_run else 'false'} "
         "(handled by the orchestrator — do not run solver.py yourself)."
     )
-    parts.append("Begin by listing the source tree and reading every .py / .txt / .pem file.")
+    if src_root:
+        parts.append("Begin by listing the source tree and reading every .py / .txt / .pem file.")
+    else:
+        parts.append(
+            "Begin by connecting to the target. Send neutral test inputs "
+            "(short / long, all-zero, ASCII, hex) and study responses to "
+            "identify the cryptosystem."
+        )
     return "\n\n".join(parts)
