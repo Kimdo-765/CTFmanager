@@ -85,9 +85,12 @@ def _spawn_misc(job_id: str, filename: str, passphrase: Optional[str]) -> str:
     return logs
 
 
-async def _claude_summary(job_id: str, filename: str, description: Optional[str]) -> dict:
+async def _claude_summary(
+    job_id: str, filename: str, description: Optional[str],
+    model_override: Optional[str] = None,
+) -> dict:
     work_dir = _job_dir(job_id)
-    model = str(get_setting("claude_model") or "claude-opus-4-7")
+    model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         model=model,
@@ -123,6 +126,7 @@ def run_job(
     passphrase: Optional[str],
     description: Optional[str],
     skip_claude: bool = False,
+    model_override: Optional[str] = None,
 ) -> dict:
     apply_to_env()
     _write_meta(job_id, status="running", stage="analyze")
@@ -140,7 +144,7 @@ def run_job(
             _log(job_id, "Skipping Claude summary (no API key or skip flag).")
         else:
             _write_meta(job_id, stage="summarize")
-            result["claude"] = anyio.run(_claude_summary, job_id, filename, description)
+            result["claude"] = anyio.run(_claude_summary, job_id, filename, description, model_override)
 
         # Combine flags from misc tool sweep + general scan of report.md etc.
         candidates = (findings.get("strings") or {}).get("flag_candidates", [])

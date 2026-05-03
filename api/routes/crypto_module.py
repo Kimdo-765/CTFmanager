@@ -21,6 +21,7 @@ async def analyze_crypto(
     auto_run: bool = Form(False),
     use_sage: bool = Form(False),
     job_timeout: Optional[int] = Form(None),
+    model: Optional[str] = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="file required")
@@ -34,6 +35,7 @@ async def analyze_crypto(
     src_root = extract_if_archive(saved)
 
     timeout = resolve_timeout(job_timeout)
+    chosen_model = (model or "").strip() or None
     meta = {
         "id": job_id,
         "module": "crypto",
@@ -44,6 +46,7 @@ async def analyze_crypto(
         "auto_run": auto_run,
         "use_sage": use_sage,
         "job_timeout": timeout,
+        "model": chosen_model,
         "src_root": str(src_root),
     }
     write_job_meta(job_id, meta)
@@ -57,8 +60,9 @@ async def analyze_crypto(
         description,
         auto_run,
         use_sage,
+        chosen_model,
         job_id=job_id,
         job_timeout=timeout,
     )
 
-    return {"job_id": job_id, "status": "queued", "job_timeout": timeout}
+    return {"job_id": job_id, "status": "queued", "job_timeout": timeout, "model": chosen_model}

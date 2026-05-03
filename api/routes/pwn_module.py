@@ -16,6 +16,7 @@ async def analyze_pwn(
     description: Optional[str] = Form(None),
     auto_run: bool = Form(False),
     job_timeout: Optional[int] = Form(None),
+    model: Optional[str] = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="file required")
@@ -34,6 +35,7 @@ async def analyze_pwn(
     target_path.chmod(0o755)
 
     timeout = resolve_timeout(job_timeout)
+    chosen_model = (model or "").strip() or None
     meta = {
         "id": job_id,
         "module": "pwn",
@@ -43,6 +45,7 @@ async def analyze_pwn(
         "description": description,
         "auto_run": auto_run,
         "job_timeout": timeout,
+        "model": chosen_model,
     }
     write_job_meta(job_id, meta)
 
@@ -54,8 +57,9 @@ async def analyze_pwn(
         target,
         description,
         auto_run,
+        chosen_model,
         job_id=job_id,
         job_timeout=timeout,
     )
 
-    return {"job_id": job_id, "status": "queued", "job_timeout": timeout}
+    return {"job_id": job_id, "status": "queued", "job_timeout": timeout, "model": chosen_model}

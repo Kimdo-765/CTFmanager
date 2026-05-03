@@ -31,6 +31,7 @@ async def analyze_misc(
     description: Optional[str] = Form(None),
     skip_claude: bool = Form(False),
     job_timeout: Optional[int] = Form(None),
+    model: Optional[str] = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="file required")
@@ -43,6 +44,7 @@ async def analyze_misc(
         raise HTTPException(status_code=400, detail="empty file")
 
     timeout = resolve_timeout(job_timeout)
+    chosen_model = (model or "").strip() or None
     meta = {
         "id": job_id,
         "module": "misc",
@@ -52,6 +54,7 @@ async def analyze_misc(
         "skip_claude": skip_claude,
         "size_bytes": size,
         "job_timeout": timeout,
+        "model": chosen_model,
     }
     write_job_meta(job_id, meta)
 
@@ -63,8 +66,9 @@ async def analyze_misc(
         passphrase,
         description,
         skip_claude,
+        chosen_model,
         job_id=job_id,
         job_timeout=timeout,
     )
 
-    return {"job_id": job_id, "status": "queued", "job_timeout": timeout}
+    return {"job_id": job_id, "status": "queued", "job_timeout": timeout, "model": chosen_model}

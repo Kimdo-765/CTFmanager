@@ -99,9 +99,10 @@ async def _claude_summary(
     target_os: str,
     kind: str,
     description: Optional[str],
+    model_override: Optional[str] = None,
 ) -> dict:
     work_dir = _job_dir(job_id)
-    model = str(get_setting("claude_model") or "claude-opus-4-7")
+    model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         model=model,
@@ -140,6 +141,7 @@ def run_job(
     description: Optional[str],
     bulk_extractor: bool,
     skip_claude: bool = False,
+    model_override: Optional[str] = None,
 ) -> dict:
     """RQ entrypoint."""
     apply_to_env()
@@ -161,7 +163,8 @@ def run_job(
         else:
             _write_meta(job_id, stage="summarize")
             claude_result = anyio.run(
-                _claude_summary, job_id, target_os, kind, description
+                _claude_summary, job_id, target_os, kind, description,
+                model_override,
             )
             result["claude"] = claude_result
 

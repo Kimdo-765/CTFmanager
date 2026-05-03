@@ -34,6 +34,7 @@ async def _run_agent(
     bin_dir: Path,
     description: Optional[str],
     auto_run: bool,
+    model_override: Optional[str] = None,
 ) -> dict:
     work_dir = job_dir(job_id) / "work"
     work_dir.mkdir(exist_ok=True)
@@ -48,7 +49,7 @@ async def _run_agent(
         except Exception:
             pass
 
-    model = str(get_setting("claude_model") or "claude-opus-4-7")
+    model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         model=model,
@@ -62,7 +63,7 @@ async def _run_agent(
     user_prompt = build_user_prompt(binary_name, description, auto_run)
 
     log_line(job_id, f"Launching Claude agent (model={model})")
-    summary: dict = {"messages": 0, "tool_calls": 0}
+    summary: dict = {"messages": 0, "tool_calls": 0, "model": model}
 
     try:
         async for msg in query(prompt=user_prompt, options=options):
@@ -110,6 +111,7 @@ def run_job(
     binary_rel: str,
     description: Optional[str],
     auto_run: bool,
+    model_override: Optional[str] = None,
 ) -> dict:
     jd = job_dir(job_id)
     bin_dir = jd / "bin"
@@ -120,6 +122,7 @@ def run_job(
     try:
         agent_summary = anyio.run(
             _run_agent, job_id, binary_name, bin_dir, description, auto_run,
+            model_override,
         )
         cost = extract_cost(agent_summary)
 
@@ -147,6 +150,7 @@ def run_job(
         }
         (jd / "result.json").write_text(json.dumps(result, indent=2))
         write_meta(job_id, status=final_status, stage="done", cost_usd=cost,
+                   model=agent_summary.get("model"),
                    flags=flags,
                    error=agent_err,
                    error_kind=agent_err_kind,

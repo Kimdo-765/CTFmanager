@@ -33,6 +33,7 @@ async def collect_forensic(
     bulk_extractor: bool = Form(False),
     skip_claude: bool = Form(False),
     job_timeout: Optional[int] = Form(None),
+    model: Optional[str] = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="file required")
@@ -45,6 +46,7 @@ async def collect_forensic(
         raise HTTPException(status_code=400, detail="empty file")
 
     timeout = resolve_timeout(job_timeout)
+    chosen_model = (model or "").strip() or None
     meta = {
         "id": job_id,
         "module": "forensic",
@@ -57,6 +59,7 @@ async def collect_forensic(
         "skip_claude": skip_claude,
         "size_bytes": size,
         "job_timeout": timeout,
+        "model": chosen_model,
     }
     write_job_meta(job_id, meta)
 
@@ -70,8 +73,9 @@ async def collect_forensic(
         description,
         bulk_extractor,
         skip_claude,
+        chosen_model,
         job_id=job_id,
         job_timeout=timeout,
     )
 
-    return {"job_id": job_id, "status": "queued", "size_bytes": size, "job_timeout": timeout}
+    return {"job_id": job_id, "status": "queued", "size_bytes": size, "job_timeout": timeout, "model": chosen_model}
