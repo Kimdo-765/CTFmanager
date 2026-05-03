@@ -199,8 +199,10 @@ async function refreshJobs() {
     const li = document.createElement("li");
     li.dataset.id = job.id;
     const cost = job.cost_usd ? `· $${Number(job.cost_usd).toFixed(3)}` : "";
+    const flagPill = (job.flags && job.flags.length)
+      ? `<span class="flag-pill" title="${escapeHtml(job.flags.join('\n'))}">🚩 ${job.flags.length}</span>` : "";
     li.innerHTML = `<strong>${job.module}</strong> · ${escapeHtml(job.filename || "")}
-      <span class="status ${job.status}">${job.status}</span>
+      <span class="status ${job.status}">${job.status}</span>${flagPill}
       <button class="delete-btn">×</button>
       <div style="font-size:0.75rem;color:#8b949e;">${job.id} ${cost}</div>`;
     li.addEventListener("click", () => selectJob(job.id));
@@ -269,15 +271,46 @@ async function renderJob(id) {
 
   const cost = job.cost_usd ? ` · cost: $${Number(job.cost_usd).toFixed(4)}` : "";
   const stage = job.stage ? ` · stage: ${job.stage}` : "";
+
+  let flagBlock = "";
+  if (job.flags && job.flags.length) {
+    const rows = job.flags.map((f, i) =>
+      `<div class="flag-row">
+         <code id="flag-${id}-${i}">${escapeHtml(f)}</code>
+         <button class="copy-btn" data-flag="${escapeHtml(f)}">Copy</button>
+       </div>`).join("");
+    flagBlock = `<div class="flag-banner">
+        <h4>🚩 Flag${job.flags.length > 1 ? "s" : ""} found</h4>
+        ${rows}
+      </div>`;
+  }
+
   detail.innerHTML = `
     <h3>Job ${job.id}
       <span class="status ${job.status}">${job.status}</span>
     </h3>
     <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}</small></div>
+    ${flagBlock}
     ${resultBlock}
     <h4>Run log</h4>
     <pre>${escapeHtml(log) || "(empty)"}</pre>
   `;
+  for (const btn of detail.querySelectorAll(".copy-btn")) {
+    btn.addEventListener("click", async () => {
+      const flag = btn.dataset.flag;
+      try {
+        await navigator.clipboard.writeText(flag);
+      } catch (_) {
+        // Fallback: select + execCommand
+        const tmp = document.createElement("textarea");
+        tmp.value = flag; document.body.appendChild(tmp);
+        tmp.select(); document.execCommand("copy"); tmp.remove();
+      }
+      const orig = btn.textContent;
+      btn.textContent = "✓ Copied"; btn.classList.add("copied");
+      setTimeout(() => { btn.textContent = orig; btn.classList.remove("copied"); }, 1500);
+    });
+  }
   return job;
 }
 

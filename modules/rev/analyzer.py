@@ -14,7 +14,7 @@ from claude_agent_sdk import (
     query,
 )
 
-from modules._common import collect_outputs, extract_cost, job_dir, log_line, write_meta
+from modules._common import collect_outputs, extract_cost, job_dir, log_line, scan_job_for_flags, write_meta
 from modules._runner import attempt_sandbox_run
 from modules.rev.prompts import SYSTEM_PROMPT, build_user_prompt
 from modules.settings_io import apply_to_env, get_setting
@@ -115,13 +115,16 @@ def run_job(
                 job_id, "solver.py", None, lambda s: log_line(job_id, s)
             )
 
+        flags = scan_job_for_flags(job_id)
         result = {
             "agent": agent_summary,
             "cost_usd": cost,
             "sandbox": sandbox_result,
+            "flags": flags,
         }
         (jd / "result.json").write_text(json.dumps(result, indent=2))
         write_meta(job_id, status="finished", stage="done", cost_usd=cost,
+                   flags=flags,
                    solver_present=agent_summary.get("solver_present", False),
                    decomp_used=agent_summary.get("decomp_used", False))
         return result

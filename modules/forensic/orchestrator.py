@@ -17,7 +17,7 @@ from claude_agent_sdk import (
     query,
 )
 
-from modules._common import extract_cost
+from modules._common import extract_cost, scan_job_for_flags
 from modules.forensic.prompts import SYSTEM_PROMPT, build_user_prompt
 from modules.settings_io import apply_to_env, get_setting, has_claude_auth
 
@@ -167,9 +167,12 @@ def run_job(
 
         cost = extract_cost(result.get("claude"))
         result["cost_usd"] = cost
+        flags = scan_job_for_flags(job_id)
+        result["flags"] = flags
 
         (_job_dir(job_id) / "result.json").write_text(json.dumps(result, indent=2, default=str))
         _write_meta(job_id, status="finished", stage="done", cost_usd=cost,
+                    flags=flags,
                     result={"kind": kind, "had_claude": bool(result.get("claude"))})
         return result
     except Exception as e:

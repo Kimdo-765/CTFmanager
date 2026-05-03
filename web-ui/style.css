@@ -63,6 +63,42 @@ textarea, select {
   font-size: 0.85rem;
 }
 .bulk-delete-btn:hover { background: #da3633; }
+
+.flag-banner {
+  background: #1c2f1c;
+  border: 1px solid #238636;
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  margin: 0.6rem 0;
+}
+.flag-banner h4 {
+  margin: 0 0 0.4rem 0;
+  font-size: 0.85rem;
+  color: #56d364;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.flag-row {
+  display: flex; align-items: center; gap: 0.5rem;
+  margin: 0.25rem 0;
+}
+.flag-row code {
+  background: #0d1117; padding: 0.3rem 0.5rem;
+  border-radius: 4px; flex: 1; font-size: 0.95rem;
+  color: #ffa657; user-select: all; word-break: break-all;
+}
+.copy-btn {
+  background: #238636; color: white; border: 0;
+  padding: 0.3rem 0.7rem; border-radius: 4px; cursor: pointer;
+  font-size: 0.8rem; min-width: 60px;
+}
+.copy-btn:hover { background: #2ea043; }
+.copy-btn.copied { background: #0969da; }
+.flag-pill {
+  display: inline-block; background: #238636; color: white;
+  font-size: 0.7rem; padding: 0.05rem 0.35rem; border-radius: 3px;
+  margin-left: 0.4rem; vertical-align: middle;
+}
 button[type="submit"], #refresh-jobs {
   background: #238636;
   color: white;

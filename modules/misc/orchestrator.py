@@ -16,7 +16,7 @@ from claude_agent_sdk import (
     query,
 )
 
-from modules._common import extract_cost
+from modules._common import extract_cost, scan_job_for_flags
 from modules.misc.prompts import SYSTEM_PROMPT, build_user_prompt
 from modules.settings_io import apply_to_env, get_setting, has_claude_auth
 
@@ -142,17 +142,19 @@ def run_job(
             _write_meta(job_id, stage="summarize")
             result["claude"] = anyio.run(_claude_summary, job_id, filename, description)
 
-        # Surface obvious flag candidates at the top level for UI display
+        # Combine flags from misc tool sweep + general scan of report.md etc.
         candidates = (findings.get("strings") or {}).get("flag_candidates", [])
         embedded = [h.get("flag") for h in (findings.get("embedded_flag_hits") or [])]
-        result["flag_candidates"] = sorted(set(candidates + embedded))
+        scanned = scan_job_for_flags(job_id)
+        flags = sorted(set([f for f in candidates + embedded + scanned if f]))
+        result["flags"] = flags
 
         cost = extract_cost(result.get("claude"))
         result["cost_usd"] = cost
 
         (_job_dir(job_id) / "result.json").write_text(json.dumps(result, indent=2, default=str))
         _write_meta(job_id, status="finished", stage="done", cost_usd=cost,
-                    result={"flags": result["flag_candidates"]})
+                    flags=flags)
         return result
     except Exception as e:
         _log(job_id, f"ERROR: {e}\n{traceback.format_exc()}")
