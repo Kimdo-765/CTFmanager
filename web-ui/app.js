@@ -242,6 +242,16 @@ async function renderJob(id) {
   const logRes = await fetch(`${API}/jobs/${id}/log`);
   const log = await logRes.text();
 
+  // Preserve log scroll position across re-renders. If the user was already
+  // at (or near) the bottom, snap to bottom after re-render so new entries
+  // are visible (tail behavior). Otherwise keep their scroll position.
+  const prevPre = detail.querySelector("pre.run-log");
+  const prevAtBottom = prevPre
+    ? (prevPre.scrollTop + prevPre.clientHeight >= prevPre.scrollHeight - 12)
+    : true;
+  const prevScrollTop = prevPre ? prevPre.scrollTop : 0;
+  const isSameJob = prevPre && prevPre.dataset.jobId === id;
+
   let resultBlock = "";
   if (job.status === "finished" || job.status === "running") {
     const links = [
@@ -292,9 +302,19 @@ async function renderJob(id) {
     <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}</small></div>
     ${flagBlock}
     ${resultBlock}
-    <h4>Run log</h4>
-    <pre>${escapeHtml(log) || "(empty)"}</pre>
+    <h4>Run log <small style="color:#8b949e;font-weight:normal">(auto-follows when scrolled to bottom)</small></h4>
+    <pre class="run-log" data-job-id="${id}">${escapeHtml(log) || "(empty)"}</pre>
   `;
+
+  const newPre = detail.querySelector("pre.run-log");
+  if (newPre) {
+    if (!isSameJob || prevAtBottom) {
+      newPre.scrollTop = newPre.scrollHeight;
+    } else {
+      newPre.scrollTop = prevScrollTop;
+    }
+  }
+
   for (const btn of detail.querySelectorAll(".copy-btn")) {
     btn.addEventListener("click", async () => {
       const flag = btn.dataset.flag;
