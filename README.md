@@ -1,0 +1,288 @@
+# CTFmanager
+
+Docker-based web UI toolset for CTF problem solving. Six modules covering Web, Pwn,
+Forensic, Misc, Crypto, and Reversing — each combines automated tooling with a
+Claude Code agent that reads the challenge, identifies the vulnerability or
+flag, and generates a runnable exploit/solver script.
+
+## Modules
+
+| Module | Pipeline | Output |
+|---|---|---|
+| **Web** | Claude reads source zip → identifies vuln → writes `exploit.py` (requests/pwntools) | exploit.py + report.md |
+| **Pwn** | ghiant (Ghidra headless) decompile → Claude analysis → `exploit.py` (pwntools) | exploit.py + report.md |
+| **Forensic** | sleuthkit + qemu-img + Volatility 3 artifact sweep → optional Claude summary | summary.json + artifacts/ + report.md |
+| **Misc** | binwalk + foremost + exiftool + steghide + zsteg + pngcheck + qpdf → Claude triage | findings.json + extracted/ + report.md |
+| **Crypto** | Claude analyzes source → writes `solver.py` using gmpy2/sympy/z3/pycryptodome (or `solver.sage` with optional SageMath sandbox) | solver.py + report.md |
+| **Reversing** | ghiant decompile → Claude reverses logic → `solver.py` | solver.py + report.md |
+
+For Web/Pwn/Crypto/Rev, an optional `auto_run` checkbox executes the produced
+script in a sandboxed `runner` container (network-isolated unless a remote
+target is given).
+
+## Architecture
+
+```
+                      ┌────────── docker-compose ──────────┐
+                      │                                     │
+   browser ──:8000──► │  api (FastAPI)  ─────► redis       │
+                      │      │                  │           │
+                      │      │              RQ queue       │
+                      │      │                  │           │
+                      │      ▼                  ▼           │
+                      │   /data ◄──────► worker (N procs)  │
+                      │      ▲              │ │ │           │
+                      │      │              ▼ ▼ ▼           │
+                      │      │     ┌────── docker.sock ────┴─────┐
+                      │      │     ▼                              ▼
+                      │      │   sibling sandboxes (per-job, transient):
+                      │      │     decompiler  forensic  misc  runner  sage
+                      │      │
+                      │      └── settings.json (live edits via UI)
+                      └─────────────────────────────────────┘
+```
+
+- **api**: FastAPI app on port 8000, serves the web UI and JSON endpoints.
+- **worker**: spawns N (default 3) RQ worker processes that pull jobs from Redis.
+  Each running job can launch sibling tool/sandbox containers via the mounted
+  Docker socket.
+- **redis**: job queue.
+- **decompiler / forensic / misc / runner / sage**: built but not started.
+  The worker `docker run`s them per job, then removes them.
+
+## Prerequisites
+
+- Docker Engine 24+ or Docker Desktop with WSL Integration enabled
+- 6+ GB free disk for tool images (Ghidra alone is ~1.4 GB)
+- Either:
+  - **Claude Code OAuth** (recommended): Pro/Max claude.ai subscription, run
+    `claude login` once on the host so `~/.claude/.credentials.json` exists, OR
+  - **Anthropic API key**: set in `.env` or via the Settings tab
+
+## Quick start
+
+```bash
+git clone <this-repo> CTFmanager && cd CTFmanager
+cp .env.example .env
+
+# Edit .env: set HOST_DATA_DIR to absolute path of <repo>/data
+# (Auth: leave ANTHROPIC_API_KEY empty to use Claude Code OAuth instead.)
+
+# Core services
+docker compose up -d --build
+
+# Tool images (one-time, pulled lazily)
+docker compose --profile tools build decompiler forensic misc runner
+
+# (Optional) SageMath solver sandbox for crypto module
+docker compose --profile tools-sage pull sage
+```
+
+Open <http://localhost:8000>.
+
+## Configuration
+
+All knobs live in two places:
+
+1. **`.env`** — read at container startup, applied to compose substitution:
+
+   | Variable | Default | Purpose |
+   |---|---|---|
+   | `HOST_DATA_DIR` | `./data` | absolute host path for sibling-container bind mounts |
+   | `WORKER_CONCURRENCY` | `3` | parallel job slots |
+   | `JOB_TTL_DAYS` | `7` | auto-delete jobs older than N days (`0`=keep) |
+   | `JOB_TIMEOUT` | `900` | RQ job timeout in seconds |
+   | `WEB_PORT` | `8000` | host port |
+   | `GHIDRA_VERSION` / `GHIDRA_BUILD_DATE` | `12.0.4` / `20260303` | Ghidra release used by decompiler image |
+   | `ANTHROPIC_API_KEY` | empty | leave empty for OAuth |
+   | `AUTH_TOKEN` | empty | shared token; empty = no auth (dev) |
+   | `HOST_CLAUDE_HOME` | `${HOME}/.claude` | host path of Claude Code config |
+
+2. **Settings tab** in the UI — writes to `/data/settings.json`, overrides `.env`
+   without restart for: Anthropic API key, Claude model, Auth token, Job TTL,
+   Job timeout, Worker concurrency. (Concurrency change requires
+   `docker compose restart worker`.)
+
+Precedence: `settings.json` > `.env` > defaults.
+
+## Authentication options
+
+- **Claude Code OAuth** (default): host's `~/.claude/` is bind-mounted into the
+  worker (rw) and api (ro). The bundled `claude` CLI uses the existing OAuth
+  token from `claude login`. Settings tab shows `✓ Claude Code OAuth detected`.
+- **Anthropic API key**: paste into Settings → Anthropic API Key (or set
+  `ANTHROPIC_API_KEY` in `.env`). Overrides OAuth when present.
+
+UI access can additionally be gated by a shared **Auth Token** (`/login`,
+cookie-based). Empty = no auth (dev mode).
+
+## Concurrency
+
+The worker container forks `WORKER_CONCURRENCY` independent RQ worker
+processes, all subscribed to the same Redis queue. Jobs distribute
+automatically. Each job can launch its own sibling sandbox container, so the
+practical upper bound is host RAM/CPU (5–8 is usually fine).
+
+The UI header shows `<busy>/<total> workers · <queued>` in real time.
+
+## Job lifecycle
+
+```
+upload ──► /data/jobs/<id>/         ─► RQ enqueue
+                 │
+                 ▼
+       worker process picks up
+                 │
+                 ▼
+       (per module pipeline)
+       e.g. Pwn:
+        decompiler container ──► decomp.zip
+                 │
+                 ▼
+       Claude Agent SDK (in worker)
+       reads source, writes exploit.py + report.md
+                 │
+                 ▼
+       (if auto_run) runner container
+       executes exploit.py with the target as argv,
+       captures stdout/stderr to <id>/exploit.py.std{out,err}
+                 │
+                 ▼
+       result.json + meta.json updated
+       UI polls /api/jobs/<id> every 2s
+```
+
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/health` | health probe |
+| GET | `/api/modules` | module catalog |
+| GET | `/api/jobs` | list all jobs |
+| GET | `/api/jobs/{id}` | job meta |
+| GET | `/api/jobs/{id}/log` | run log (text) |
+| GET | `/api/jobs/{id}/result` | result JSON |
+| GET | `/api/jobs/{id}/file/{name}` | any artifact under the job dir |
+| DELETE | `/api/jobs/{id}` | delete one job (cancels queued/running) |
+| DELETE | `/api/jobs?status=…&module=…&all=…` | bulk delete (default: finished+failed only) |
+| GET | `/api/jobs/queue` | live worker + queue snapshot |
+| GET | `/api/jobs/stats` | aggregate cost + counts |
+| GET / PUT | `/api/settings` | settings view + patch |
+| POST | `/api/modules/web/analyze` | upload source zip → enqueue |
+| POST | `/api/modules/pwn/analyze` | upload binary → enqueue |
+| POST | `/api/modules/forensic/collect` | upload disk/memory image → enqueue |
+| POST | `/api/modules/misc/analyze` | upload file → enqueue |
+| POST | `/api/modules/crypto/analyze` | upload zip → enqueue |
+| POST | `/api/modules/rev/analyze` | upload binary → enqueue |
+
+## File layout
+
+```
+CTFmanager/
+├── docker-compose.yml
+├── .env  /  .env.example
+├── api/                 # FastAPI app
+│   ├── auth.py          # Token middleware
+│   ├── main.py
+│   ├── queue.py         # RQ helpers
+│   ├── routes/          # one router per module + jobs + settings
+│   └── storage.py
+├── worker/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── runner.py        # multi-process RQ worker + cleanup loop
+├── modules/             # mounted into both api & worker (live-edit)
+│   ├── _common.py       # shared helpers (cost, paths, meta)
+│   ├── _runner.py       # sandbox container helper
+│   ├── settings_io.py   # /data/settings.json read/write + OAuth detection
+│   ├── web/             # SYSTEM_PROMPT + analyzer.run_job
+│   ├── pwn/             # SYSTEM_PROMPT + decompile + analyzer
+│   ├── crypto/
+│   ├── rev/
+│   ├── forensic/
+│   └── misc/
+├── decompiler/          # Ghidra image (ghiant scripts vendored)
+├── forensic/            # sleuthkit + qemu-utils + Volatility 3
+├── misc/                # binwalk + foremost + steghide + zsteg + ...
+├── runner/              # Python + crypto libs + pwntools (sandbox)
+├── web-ui/              # static HTML/CSS/JS
+└── data/                # job uploads + outputs (gitignored)
+```
+
+## Module-specific notes
+
+### Web
+- Accepts a zip of source code or a single file.
+- Optionally a `target_url` to test against.
+- Auto-run runs the produced `exploit.py <url>` in a sandboxed runner.
+
+### Pwn
+- Requires the `decompiler` image (Ghidra 12.0.4 by default; override
+  `GHIDRA_VERSION`/`GHIDRA_BUILD_DATE` in `.env`).
+- Per-job timeline: ~2–3 min decompile + Claude analysis time.
+
+### Forensic
+- Auto-detects qcow2 / vmdk / vhd / vhdx / e01 / raw / memory.
+- E01 is converted to raw via `ewfexport`; vmdk/qcow2/vhd via `qemu-img`.
+- Memory dumps run a curated Volatility 3 plugin set per detected OS.
+
+### Misc
+- Unifies binwalk extraction, exiftool, zsteg LSB, steghide, pngcheck, pdf
+  parsing. Common flag patterns are auto-extracted.
+- bulk_extractor is **not** included (Ubuntu 22.04 dropped the package).
+
+### Crypto
+- Solver runs in the worker by default; check **Use SageMath sandbox** to
+  execute via the `sagemath/sagemath` image (supports lattice/Coppersmith).
+- Available libs in the runner sandbox: pycryptodome, gmpy2, sympy, z3-solver,
+  ecdsa, pwntools.
+
+### Reversing
+- Reuses the `decompiler` image.
+- Solver auto-runs in the runner container if requested.
+
+## Operational commands
+
+```bash
+docker compose up -d              # start core services
+docker compose down               # stop
+docker compose logs -f worker     # tail worker logs
+docker compose ps                 # status
+
+docker compose restart worker     # apply WORKER_CONCURRENCY changes
+docker compose build api          # rebuild after code changes in api/
+
+# Wipe all jobs (UI also has a Bulk Delete button)
+curl -X DELETE 'http://localhost:8000/api/jobs?all=true'
+```
+
+## Security notes
+
+- Sibling containers spawned by the worker run as root and share the Docker
+  socket — treat the worker host as part of the trust boundary.
+- `runner` (the sandbox for produced exploit/solver scripts) runs with a
+  bridge network by default. For local-only crypto challenges the network
+  could be disabled with `network_mode="none"` in `modules/_runner.py`.
+- The worker bind-mounts the host's `~/.claude` (rw, so OAuth tokens can
+  refresh). Don't run untrusted code as the worker.
+- Only the `/api/health` route bypasses auth when an Auth Token is set.
+
+## Troubleshooting
+
+- **`ERR_EMPTY_RESPONSE` from browser**: WSL2 + Docker Desktop port forwarding
+  glitch. Try `http://127.0.0.1:8000` or the WSL distro's IP.
+- **`docker-credential-desktop.exe: exec format error`** during build: WSL
+  interop disabled. Either enable interop, or write `~/.docker/config.json`
+  to `{}` to drop the Windows credential helper.
+- **`Unable to locate package` (forensic build)**: `bulk-extractor` is no
+  longer in Ubuntu 22.04. The Dockerfile already excludes it; if you
+  re-add tools, install from a third-party repo.
+- **Claude returns 401**: Check Settings tab. `claude_oauth_detected` should
+  be `true`, OR a real `ANTHROPIC_API_KEY` should be set. The placeholder
+  `sk-ant-...` is automatically ignored.
+- **Long-running job stuck**: `GET /api/jobs/queue` shows worker state. If a
+  worker is in `busy` for too long, `docker compose restart worker` to recycle.
+
+## License
+
+MIT.

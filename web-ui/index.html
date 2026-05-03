@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CTFmanager</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div class="hbar">
+      <h1>CTFmanager</h1>
+      <div id="cost-banner" class="cost-banner" title="Cumulative Claude API spend">
+        <span id="queue-info" title="busy/total workers · queued jobs">0/0 · 0 queued</span>
+        <span id="cost-total">$0.00</span>
+        <button id="logout-btn" type="button" class="logout">logout</button>
+      </div>
+    </div>
+    <nav>
+      <button class="tab active" data-tab="web">Web</button>
+      <button class="tab" data-tab="pwn">Pwn</button>
+      <button class="tab" data-tab="forensic">Forensic</button>
+      <button class="tab" data-tab="misc">Misc</button>
+      <button class="tab" data-tab="crypto">Crypto</button>
+      <button class="tab" data-tab="rev">Rev</button>
+      <button class="tab" data-tab="settings" style="margin-left:auto">⚙ Settings</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="panel-web" class="panel active">
+      <h2>Web — Source Vulnerability Analysis + Exploit</h2>
+      <form id="web-form">
+        <label>
+          Source code (zip preferred, single file ok)
+          <input type="file" name="file" required />
+        </label>
+        <label>
+          Target URL (optional)
+          <input type="url" name="target_url" placeholder="http://challenge.example.com:8080" />
+        </label>
+        <label>
+          Description / hints (optional)
+          <textarea name="description" rows="3" placeholder="e.g. login bypass, flag at /flag.txt"></textarea>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="auto_run" />
+          Auto-run generated exploit (requires target URL)
+        </label>
+        <button type="submit">Analyze</button>
+      </form>
+    </section>
+
+    <section id="panel-pwn" class="panel">
+      <h2>Pwn — Ghidra Decompile + Exploit (pwntools)</h2>
+      <form id="pwn-form">
+        <label>
+          Binary (ELF/PE)
+          <input type="file" name="file" required />
+        </label>
+        <label>
+          Remote target (optional, host:port)
+          <input type="text" name="target" placeholder="ctf.example.com:1337" />
+        </label>
+        <label>
+          Description / hints (optional)
+          <textarea name="description" rows="3" placeholder="e.g. 32-bit, no canary, libc provided"></textarea>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="auto_run" />
+          Auto-run generated exploit (requires remote target)
+        </label>
+        <button type="submit">Decompile + Analyze</button>
+        <small style="color:#8b949e">First run requires the decompiler image: <code>docker compose --profile tools build decompiler</code></small>
+      </form>
+    </section>
+
+    <section id="panel-forensic" class="panel">
+      <h2>Forensic — Disk / Memory Image Triage</h2>
+      <form id="forensic-form">
+        <label>
+          Image file (raw / qcow2 / vmdk for disk · raw for memory)
+          <input type="file" name="file" required />
+        </label>
+        <label>
+          Image type
+          <select name="image_type">
+            <option value="auto">auto-detect</option>
+            <option value="raw">raw disk</option>
+            <option value="qcow2">qcow2</option>
+            <option value="vmdk">vmdk</option>
+            <option value="vhd">vhd</option>
+            <option value="vhdx">vhdx</option>
+            <option value="e01">e01 (encase)</option>
+            <option value="memory">memory dump</option>
+          </select>
+        </label>
+        <label>
+          Target OS
+          <select name="target_os">
+            <option value="auto">auto-detect</option>
+            <option value="linux">linux</option>
+            <option value="windows">windows</option>
+          </select>
+        </label>
+        <label>
+          Description / hints (optional)
+          <textarea name="description" rows="3" placeholder="e.g. suspect lateral movement, look for SSH keys"></textarea>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="skip_claude" />
+          Skip Claude summary (collection only)
+        </label>
+        <button type="submit">Collect Artifacts</button>
+        <small style="color:#8b949e">First run requires the forensic image: <code>docker compose --profile tools build forensic</code></small>
+      </form>
+    </section>
+
+    <section id="panel-misc" class="panel">
+      <h2>Misc — File Format / Steganography Triage</h2>
+      <form id="misc-form">
+        <label>
+          File (image / audio / pdf / archive / unknown blob)
+          <input type="file" name="file" required />
+        </label>
+        <label>
+          Steghide passphrase (optional)
+          <input type="text" name="passphrase" placeholder="leave empty to also try blank passphrase" />
+        </label>
+        <label>
+          Description / hints (optional)
+          <textarea name="description" rows="3" placeholder="e.g. PNG with strange dimensions, suspect LSB"></textarea>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="skip_claude" />
+          Skip Claude summary (raw findings only)
+        </label>
+        <button type="submit">Analyze</button>
+        <small style="color:#8b949e">First run requires the misc image: <code>docker compose --profile tools build misc</code></small>
+      </form>
+    </section>
+
+    <section id="panel-crypto" class="panel">
+      <h2>Crypto — Source Analysis + Solver Generation</h2>
+      <form id="crypto-form">
+        <label>
+          Challenge files (zip preferred — source + ciphertext + keys)
+          <input type="file" name="file" required />
+        </label>
+        <label>
+          Remote target (optional, host:port)
+          <input type="text" name="target" placeholder="ctf.example.com:31337" />
+        </label>
+        <label>
+          Description / hints (optional)
+          <textarea name="description" rows="3" placeholder="e.g. RSA with small e, IV reuse on AES-CTR"></textarea>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="auto_run" />
+          Auto-run generated solver
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="use_sage" />
+          Use SageMath sandbox (slower, supports lattice/Coppersmith)
+        </label>
+        <button type="submit">Analyze + Solve</button>
+        <small style="color:#8b949e">Worker has pycryptodome, gmpy2, sympy, z3-solver, ecdsa, pwntools. Sage requires <code>docker compose --profile tools-sage pull sage</code>.</small>
+      </form>
+    </section>
+
+    <section id="panel-rev" class="panel">
+      <h2>Reversing — Ghidra Decompile + Solver</h2>
+      <form id="rev-form">
+        <label>
+          Binary (ELF/PE)
+          <input type="file" name="file" required />
+        </label>
+        <label>
+          Description / hints (optional)
+          <textarea name="description" rows="3" placeholder="e.g. crackme — wants a valid serial; XOR'd flag with key in .data"></textarea>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="auto_run" />
+          Auto-run generated solver
+        </label>
+        <button type="submit">Decompile + Solve</button>
+        <small style="color:#8b949e">Reuses decompiler image. Solver runs with crypto libs (pycryptodome, gmpy2, sympy, z3, pwntools).</small>
+      </form>
+    </section>
+
+    <section id="panel-settings" class="panel">
+      <h2>Settings</h2>
+      <p style="color:#8b949e;font-size:0.85rem">
+        Stored in <code>/data/settings.json</code>. Settings override env vars
+        and apply to the next job (no restart). Leave a field blank to revert
+        to its env/default.
+      </p>
+      <form id="settings-form">
+        <label>
+          Anthropic API Key (optional if Claude Code OAuth is mounted)
+          <input type="password" name="anthropic_api_key" placeholder="sk-ant-... (leave empty to use OAuth)" autocomplete="new-password" />
+          <small id="key-status" style="color:#8b949e"></small>
+          <small id="oauth-status" style="color:#8b949e"></small>
+        </label>
+        <label>
+          Claude model
+          <input type="text" name="claude_model" placeholder="claude-opus-4-7" />
+        </label>
+        <label>
+          Auth token (UI/API access)
+          <input type="password" name="auth_token" placeholder="leave empty to disable auth" autocomplete="new-password" />
+          <small id="auth-status" style="color:#8b949e"></small>
+        </label>
+        <label>
+          Job retention (days, 0=keep forever)
+          <input type="number" name="job_ttl_days" min="0" placeholder="7" />
+        </label>
+        <label>
+          Job timeout (seconds)
+          <input type="number" name="job_timeout_seconds" min="60" placeholder="900" />
+        </label>
+        <label>
+          Worker concurrency (parallel jobs)
+          <input type="number" name="worker_concurrency" min="1" max="32" placeholder="3" />
+          <small style="color:#8b949e">requires <code>docker compose restart worker</code> to apply</small>
+        </label>
+        <div style="display:flex;gap:0.5rem">
+          <button type="submit">Save</button>
+          <button type="button" id="settings-reload" style="background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:0.5rem 1rem;border-radius:6px;cursor:pointer">Reload</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="jobs">
+      <h2>Jobs</h2>
+      <div class="jobs-toolbar">
+        <button id="refresh-jobs">Refresh</button>
+        <select id="bulk-filter">
+          <option value="">finished + failed (safe)</option>
+          <option value="finished">only finished</option>
+          <option value="failed">only failed</option>
+          <option value="queued">only queued</option>
+          <option value="running">only running</option>
+          <option value="__all__">ALL (cancel running)</option>
+        </select>
+        <button id="bulk-delete" class="bulk-delete-btn">Delete matching</button>
+      </div>
+      <ul id="jobs-list"></ul>
+      <div id="job-detail"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

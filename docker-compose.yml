@@ -1,0 +1,86 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data:/data
+      - ./modules:/app/modules:ro
+      - ./web-ui:/app/web-ui:ro
+      # Read-only mount so the Settings page can report whether OAuth is
+      # configured (the actual auth file is consumed by the worker).
+      - ${HOST_CLAUDE_HOME:-${HOME}/.claude}:/root/.claude:ro
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      HOST_DATA_DIR: ${HOST_DATA_DIR:-./data}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-3}
+    volumes:
+      - ./data:/data
+      - ./modules:/app/modules:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount the host's Claude Code config so the bundled `claude` CLI in the
+      # worker uses your existing claude.ai OAuth token (no API key needed).
+      # Run `claude login` once on the host to populate ~/.claude/.
+      - ${HOST_CLAUDE_HOME:-${HOME}/.claude}:/root/.claude
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  # Built but not started by default. Worker spawns transient instances per job.
+  decompiler:
+    image: ctfmanager-decompiler
+    build:
+      context: .
+      dockerfile: decompiler/Dockerfile
+      args:
+        GHIDRA_VERSION: ${GHIDRA_VERSION:-12.0.4}
+        GHIDRA_BUILD_DATE: ${GHIDRA_BUILD_DATE:-20260303}
+    profiles: ["tools"]
+
+  forensic:
+    image: ctfmanager-forensic
+    build:
+      context: .
+      dockerfile: forensic/Dockerfile
+    profiles: ["tools"]
+
+  misc:
+    image: ctfmanager-misc
+    build:
+      context: .
+      dockerfile: misc/Dockerfile
+    profiles: ["tools"]
+
+  runner:
+    image: ctfmanager-runner
+    build:
+      context: .
+      dockerfile: runner/Dockerfile
+    profiles: ["tools"]
+
+  sage:
+    image: sagemath/sagemath:latest
+    profiles: ["tools-sage"]
+
+volumes:
+  redis-data:

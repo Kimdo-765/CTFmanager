@@ -1,0 +1,66 @@
+from pathlib import Path
+from typing import Optional
+
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+
+from api.queue import get_queue
+from api.storage import job_dir, new_job_id, write_job_meta
+
+router = APIRouter()
+
+CHUNK = 4 * 1024 * 1024
+
+
+def _stream_to(path: Path, upload: UploadFile) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with path.open("wb") as out:
+        while True:
+            chunk = upload.file.read(CHUNK)
+            if not chunk:
+                break
+            out.write(chunk)
+            total += len(chunk)
+    return total
+
+
+@router.post("/analyze")
+async def analyze_misc(
+    file: UploadFile = File(...),
+    passphrase: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    skip_claude: bool = Form(False),
+):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="file required")
+
+    job_id = new_job_id()
+    fname = Path(file.filename).name
+    target = job_dir(job_id) / fname
+    size = _stream_to(target, file)
+    if size == 0:
+        raise HTTPException(status_code=400, detail="empty file")
+
+    meta = {
+        "id": job_id,
+        "module": "misc",
+        "status": "queued",
+        "filename": fname,
+        "description": description,
+        "skip_claude": skip_claude,
+        "size_bytes": size,
+    }
+    write_job_meta(job_id, meta)
+
+    q = get_queue()
+    q.enqueue(
+        "modules.misc.orchestrator.run_job",
+        job_id,
+        fname,
+        passphrase,
+        description,
+        skip_claude,
+        job_id=job_id,
+    )
+
+    return {"job_id": job_id, "status": "queued"}

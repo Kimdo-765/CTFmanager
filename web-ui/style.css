@@ -1,0 +1,98 @@
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  margin: 0;
+  background: #0e1117;
+  color: #e6edf3;
+}
+header {
+  padding: 1rem 2rem;
+  border-bottom: 1px solid #30363d;
+}
+header h1 { margin: 0 0 0.5rem 0; font-size: 1.25rem; }
+nav { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.tab {
+  background: #21262d;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  padding: 0.4rem 0.8rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.tab.active { background: #1f6feb; border-color: #1f6feb; }
+.tab[disabled] { opacity: 0.4; cursor: not-allowed; }
+main { padding: 1.5rem 2rem; display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+.panel { display: none; }
+.panel.active { display: block; }
+form { display: flex; flex-direction: column; gap: 0.75rem; }
+label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; }
+label.checkbox { flex-direction: row; align-items: center; gap: 0.5rem; }
+input[type="file"], input[type="url"], input[type="text"], input[type="password"],
+textarea, select {
+  background: #161b22;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 0.5rem;
+  font-family: inherit;
+}
+.hbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.cost-banner {
+  display: flex; align-items: center; gap: 0.75rem;
+  font-size: 0.85rem; color: #8b949e;
+}
+#cost-total { color: #58a6ff; font-weight: 600; }
+.logout {
+  background: transparent; color: #8b949e; border: 1px solid #30363d;
+  padding: 0.2rem 0.6rem; border-radius: 4px; cursor: pointer; font-size: 0.75rem;
+}
+.logout:hover { color: #e6edf3; border-color: #58a6ff; }
+.delete-btn {
+  background: #da3633; color: white; border: 0;
+  padding: 0.15rem 0.5rem; border-radius: 4px; cursor: pointer;
+  font-size: 0.75rem; margin-left: 0.5rem;
+}
+.jobs-toolbar {
+  display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+.bulk-delete-btn {
+  background: #b62324; color: white; border: 0;
+  padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer;
+  font-size: 0.85rem;
+}
+.bulk-delete-btn:hover { background: #da3633; }
+button[type="submit"], #refresh-jobs {
+  background: #238636;
+  color: white;
+  border: 0;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  cursor: pointer;
+  align-self: flex-start;
+}
+#jobs-list { list-style: none; padding: 0; margin: 1rem 0; }
+#jobs-list li {
+  padding: 0.5rem;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  margin-bottom: 0.5rem;
+  cursor: pointer;
+}
+#jobs-list li.selected { border-color: #1f6feb; }
+.status { font-size: 0.8rem; padding: 0.1rem 0.4rem; border-radius: 4px; margin-left: 0.5rem; }
+.status.queued { background: #6e7681; }
+.status.running { background: #d29922; }
+.status.finished { background: #238636; }
+.status.failed { background: #da3633; }
+#job-detail pre {
+  background: #161b22;
+  padding: 0.75rem;
+  border-radius: 6px;
+  max-height: 400px;
+  overflow: auto;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+}
+.file-links a { color: #58a6ff; margin-right: 1rem; }

@@ -1,0 +1,160 @@
+import json
+import os
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import anyio
+import docker
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+    query,
+)
+
+from modules._common import extract_cost
+from modules.misc.prompts import SYSTEM_PROMPT, build_user_prompt
+from modules.settings_io import apply_to_env, get_setting, has_claude_auth
+
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+JOBS_DIR = DATA_DIR / "jobs"
+
+MISC_IMAGE = "ctfmanager-misc"
+MISC_TIMEOUT_S = 600
+MISC_MEM = "2g"
+
+
+def _job_dir(job_id: str) -> Path:
+    p = JOBS_DIR / job_id
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _log(job_id: str, line: str) -> None:
+    f = _job_dir(job_id) / "run.log"
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    with f.open("a") as fp:
+        fp.write(f"[{ts}] {line}\n")
+
+
+def _write_meta(job_id: str, **updates) -> None:
+    f = _job_dir(job_id) / "meta.json"
+    meta = {}
+    if f.exists():
+        meta = json.loads(f.read_text())
+    meta.update(updates)
+    meta["updated_at"] = datetime.now(timezone.utc).isoformat()
+    f.write_text(json.dumps(meta, indent=2))
+
+
+def _host_path(job_id: str) -> str:
+    host_root = os.environ.get("HOST_DATA_DIR")
+    if not host_root:
+        raise RuntimeError("HOST_DATA_DIR not set on worker")
+    return f"{host_root.rstrip('/')}/jobs/{job_id}"
+
+
+def _spawn_misc(job_id: str, filename: str, passphrase: Optional[str]) -> str:
+    client = docker.from_env()
+    cmd = [f"/job/{filename}", "--out", "/job"]
+    if passphrase:
+        cmd += ["--passphrase", passphrase]
+    container = client.containers.run(
+        image=MISC_IMAGE,
+        command=cmd,
+        volumes={_host_path(job_id): {"bind": "/job", "mode": "rw"}},
+        mem_limit=MISC_MEM,
+        network_mode="none",
+        detach=True,
+    )
+    try:
+        result = container.wait(timeout=MISC_TIMEOUT_S)
+        logs = container.logs().decode("utf-8", errors="replace")
+        sc = result.get("StatusCode", 1)
+        if sc != 0:
+            raise RuntimeError(f"misc analyzer exited with code {sc}\n{logs[-4000:]}")
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
+    return logs
+
+
+async def _claude_summary(job_id: str, filename: str, description: Optional[str]) -> dict:
+    work_dir = _job_dir(job_id)
+    model = str(get_setting("claude_model") or "claude-opus-4-7")
+    options = ClaudeAgentOptions(
+        system_prompt=SYSTEM_PROMPT,
+        model=model,
+        cwd=str(work_dir),
+        allowed_tools=["Read", "Bash", "Glob", "Grep", "Write"],
+        permission_mode="bypassPermissions",
+    )
+    prompt = build_user_prompt(filename, description)
+    summary: dict = {"messages": 0, "tool_calls": 0}
+    async for msg in query(prompt=prompt, options=options):
+        if isinstance(msg, AssistantMessage):
+            summary["messages"] += 1
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    _log(job_id, f"AGENT: {block.text[:500]}")
+                elif isinstance(block, ToolUseBlock):
+                    summary["tool_calls"] += 1
+                    args_preview = json.dumps(block.input)[:200]
+                    _log(job_id, f"TOOL {block.name}: {args_preview}")
+        elif isinstance(msg, ResultMessage):
+            summary["result"] = {
+                "duration_ms": msg.duration_ms,
+                "num_turns": msg.num_turns,
+                "total_cost_usd": msg.total_cost_usd,
+                "is_error": msg.is_error,
+            }
+    return summary
+
+
+def run_job(
+    job_id: str,
+    filename: str,
+    passphrase: Optional[str],
+    description: Optional[str],
+    skip_claude: bool = False,
+) -> dict:
+    apply_to_env()
+    _write_meta(job_id, status="running", stage="analyze")
+    try:
+        _log(job_id, f"Spawning misc analyzer (file={filename})")
+        logs = _spawn_misc(job_id, filename, passphrase)
+        (_job_dir(job_id) / "analyzer.log").write_text(logs)
+
+        findings_path = _job_dir(job_id) / "findings.json"
+        findings = json.loads(findings_path.read_text()) if findings_path.exists() else {}
+
+        result: dict = {"findings": findings}
+
+        if skip_claude or not has_claude_auth():
+            _log(job_id, "Skipping Claude summary (no API key or skip flag).")
+        else:
+            _write_meta(job_id, stage="summarize")
+            result["claude"] = anyio.run(_claude_summary, job_id, filename, description)
+
+        # Surface obvious flag candidates at the top level for UI display
+        candidates = (findings.get("strings") or {}).get("flag_candidates", [])
+        embedded = [h.get("flag") for h in (findings.get("embedded_flag_hits") or [])]
+        result["flag_candidates"] = sorted(set(candidates + embedded))
+
+        cost = extract_cost(result.get("claude"))
+        result["cost_usd"] = cost
+
+        (_job_dir(job_id) / "result.json").write_text(json.dumps(result, indent=2, default=str))
+        _write_meta(job_id, status="finished", stage="done", cost_usd=cost,
+                    result={"flags": result["flag_candidates"]})
+        return result
+    except Exception as e:
+        _log(job_id, f"ERROR: {e}\n{traceback.format_exc()}")
+        _write_meta(job_id, status="failed", error=str(e))
+        raise

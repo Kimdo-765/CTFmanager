@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>CTFmanager — Login</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    .login-card {
+      max-width: 320px; margin: 6rem auto; padding: 1.5rem;
+      background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    }
+    .login-card h2 { margin-top: 0; }
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <h2>CTFmanager</h2>
+    <p style="color:#8b949e;font-size:0.85rem">Token required to access this instance.</p>
+    <form method="post" action="/login">
+      <label>
+        Token
+        <input type="password" name="token" autofocus required />
+      </label>
+      <button type="submit" style="margin-top:1rem">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>
