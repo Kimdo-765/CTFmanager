@@ -16,6 +16,7 @@ from claude_agent_sdk import (
 
 from modules._common import (
     classify_agent_error,
+    collect_outputs,
     extract_cost,
     job_dir,
     log_line,
@@ -79,19 +80,18 @@ async def _run_agent(
         summary["agent_error_kind"] = kind
         log_line(job_id, f"AGENT_ERROR ({kind}): {msg_text[:400]}")
 
-    solver = work_dir / "solver.py"
-    sage_solver = work_dir / "solver.sage"
-    report = work_dir / "report.md"
-    summary["solver_present"] = solver.exists() or sage_solver.exists()
-    summary["sage_solver"] = sage_solver.exists() and not solver.exists()
-    summary["report_present"] = report.exists()
     jd = job_dir(job_id)
-    if solver.exists():
-        (jd / "solver.py").write_bytes(solver.read_bytes())
-    if sage_solver.exists():
-        (jd / "solver.sage").write_bytes(sage_solver.read_bytes())
-    if report.exists():
-        (jd / "report.md").write_bytes(report.read_bytes())
+    found = collect_outputs(work_dir, ["solver.py", "solver.sage", "report.md"])
+    for name in ("solver.py", "solver.sage", "report.md"):
+        if name not in found and (jd / name).is_file():
+            found[name] = jd / name
+    summary["solver_present"] = ("solver.py" in found) or ("solver.sage" in found)
+    summary["sage_solver"] = ("solver.sage" in found) and ("solver.py" not in found)
+    summary["report_present"] = "report.md" in found
+    for name, src in found.items():
+        target = jd / name
+        if src.resolve() != target.resolve():
+            target.write_bytes(src.read_bytes())
     return summary
 
 

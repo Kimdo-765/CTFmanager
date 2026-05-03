@@ -16,6 +16,7 @@ from claude_agent_sdk import (
 
 from modules._common import (
     classify_agent_error,
+    collect_outputs,
     extract_cost,
     job_dir,
     log_line,
@@ -80,17 +81,22 @@ async def _run_agent(
         summary["agent_error_kind"] = kind
         log_line(job_id, f"AGENT_ERROR ({kind}): {msg_text[:400]}")
 
-    exploit_path = work_dir / "exploit.py"
-    report_path = work_dir / "report.md"
-    summary["exploit_present"] = exploit_path.exists()
-    summary["report_present"] = report_path.exists()
-
     jd = job_dir(job_id)
-    if exploit_path.exists():
-        (jd / "exploit.py").write_bytes(exploit_path.read_bytes())
-    if report_path.exists():
-        (jd / "report.md").write_bytes(report_path.read_bytes())
-
+    # Prefer the agent's cwd, but also check /root/ AND the job root in case
+    # the agent wrote with an absolute path. collect_outputs handles cwd +
+    # /root, then we additionally consider files already at the job root.
+    found = collect_outputs(work_dir, ["exploit.py", "report.md"])
+    if "exploit.py" not in found and (jd / "exploit.py").is_file():
+        found["exploit.py"] = jd / "exploit.py"
+    if "report.md" not in found and (jd / "report.md").is_file():
+        found["report.md"] = jd / "report.md"
+    summary["exploit_present"] = "exploit.py" in found
+    summary["report_present"] = "report.md" in found
+    for name, src in found.items():
+        # Only copy if the file isn't already at the job root
+        target = jd / name
+        if src.resolve() != target.resolve():
+            target.write_bytes(src.read_bytes())
     return summary
 
 
