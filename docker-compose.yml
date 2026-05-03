@@ -34,6 +34,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       HOST_DATA_DIR: ${HOST_DATA_DIR:-./data}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-3}
+      # Tell the bundled `claude` CLI it is running in a sandbox so it allows
+      # --dangerously-skip-permissions even though the container runs as root.
+      IS_SANDBOX: "1"
     volumes:
       - ./data:/data
       - ./modules:/app/modules:ro
