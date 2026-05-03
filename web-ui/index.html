@@ -49,12 +49,7 @@
         </label>
         <label>
           Claude model (blank = global Settings value)
-          <select name="model">
-            <option value="">(default — Settings value)</option>
-            <option value="claude-opus-4-7">claude-opus-4-7</option>
-            <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-            <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-          </select>
+          <select name="model" data-role="model-select"></select>
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
@@ -85,12 +80,7 @@
         </label>
         <label>
           Claude model (blank = global Settings value)
-          <select name="model">
-            <option value="">(default — Settings value)</option>
-            <option value="claude-opus-4-7">claude-opus-4-7</option>
-            <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-            <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-          </select>
+          <select name="model" data-role="model-select"></select>
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
@@ -139,12 +129,7 @@
         </label>
         <label>
           Claude model (blank = global Settings value)
-          <select name="model">
-            <option value="">(default — Settings value)</option>
-            <option value="claude-opus-4-7">claude-opus-4-7</option>
-            <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-            <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-          </select>
+          <select name="model" data-role="model-select"></select>
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
@@ -176,12 +161,7 @@
         </label>
         <label>
           Claude model (blank = global Settings value)
-          <select name="model">
-            <option value="">(default — Settings value)</option>
-            <option value="claude-opus-4-7">claude-opus-4-7</option>
-            <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-            <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-          </select>
+          <select name="model" data-role="model-select"></select>
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
@@ -217,12 +197,7 @@
         </label>
         <label>
           Claude model (blank = global Settings value)
-          <select name="model">
-            <option value="">(default — Settings value)</option>
-            <option value="claude-opus-4-7">claude-opus-4-7</option>
-            <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-            <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-          </select>
+          <select name="model" data-role="model-select"></select>
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
@@ -250,12 +225,7 @@
         </label>
         <label>
           Claude model (blank = global Settings value)
-          <select name="model">
-            <option value="">(default — Settings value)</option>
-            <option value="claude-opus-4-7">claude-opus-4-7</option>
-            <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-            <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-          </select>
+          <select name="model" data-role="model-select"></select>
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
@@ -281,8 +251,13 @@
           <small id="oauth-status" style="color:#8b949e"></small>
         </label>
         <label>
-          Claude model
-          <input type="text" name="claude_model" placeholder="claude-opus-4-7" />
+          Claude model (global default)
+          <select name="claude_model" data-role="model-select-settings"></select>
+          <small style="color:#8b949e">add a custom model with the field below if it's missing</small>
+        </label>
+        <label>
+          ...or type a custom model id
+          <input type="text" name="claude_model_custom" placeholder="claude-sonnet-4-20250514 / claude-opus-4-1 / …" />
         </label>
         <label>
           Auth token (UI/API access)

@@ -1,5 +1,46 @@
 const API = "/api";
 
+// Catalog of Claude models offered in every Analyze form. Add new
+// snapshot/alias names here to expose them. Empty value = "use the
+// global Settings model".
+const CLAUDE_MODELS = [
+  // Aliases (Anthropic recommends pinning to dated snapshots in production)
+  "claude-opus-4-7",
+  "claude-opus-4-1",
+  "claude-opus-4",
+  "claude-sonnet-4-6",
+  "claude-sonnet-4-5",
+  "claude-sonnet-4",
+  "claude-haiku-4-5",
+  "claude-haiku-4",
+  // Dated snapshots (most stable for reproducible runs)
+  "claude-opus-4-7-20251205",
+  "claude-opus-4-1-20250805",
+  "claude-sonnet-4-6-20251119",
+  "claude-sonnet-4-5-20250929",
+  "claude-sonnet-4-20250514",
+  "claude-haiku-4-5-20251001",
+  "claude-3-7-sonnet-latest",
+  "claude-3-5-sonnet-20241022",
+  "claude-3-5-haiku-20241022",
+];
+
+function fillModelSelects() {
+  // Per-job selects: empty = "default from Settings"
+  document.querySelectorAll('[data-role="model-select"]').forEach((sel) => {
+    sel.innerHTML = "";
+    sel.appendChild(new Option("(default — Settings value)", ""));
+    for (const m of CLAUDE_MODELS) sel.appendChild(new Option(m, m));
+  });
+  // Global Settings select: no empty entry, but a leading blank means
+  // "no override saved". Actual current value populated by loadSettings().
+  document.querySelectorAll('[data-role="model-select-settings"]').forEach((sel) => {
+    sel.innerHTML = "";
+    sel.appendChild(new Option("(use env / default)", ""));
+    for (const m of CLAUDE_MODELS) sel.appendChild(new Option(m, m));
+  });
+}
+
 let selectedJob = null;
 let pollTimer = null;
 
@@ -58,8 +99,16 @@ async function loadSettings() {
   if (!res.ok) return;
   const s = await res.json();
   const f = document.getElementById("settings-form");
-  // Don't populate password fields with stored values — leave blank, show status only
-  f.querySelector("[name=claude_model]").value = s.claude_model || "";
+  const modelSel = f.querySelector("[name=claude_model]");
+  const modelCustom = f.querySelector("[name=claude_model_custom]");
+  const cur = s.claude_model || "";
+  // If the saved value is one we know, select it; otherwise stash it
+  // in the custom-text input so the user can see/edit it.
+  if (CLAUDE_MODELS.includes(cur)) {
+    modelSel.value = cur; modelCustom.value = "";
+  } else {
+    modelSel.value = ""; modelCustom.value = cur;
+  }
   f.querySelector("[name=job_ttl_days]").value =
     s.job_ttl_days != null ? s.job_ttl_days : "";
   f.querySelector("[name=job_timeout_seconds]").value =
@@ -82,6 +131,11 @@ async function loadSettings() {
 document.getElementById("settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
+  // Custom-text overrides the dropdown for claude_model.
+  const custom = (fd.get("claude_model_custom") || "").toString().trim();
+  if (custom) fd.set("claude_model", custom);
+  fd.delete("claude_model_custom");
+
   const payload = {};
   for (const [k, v] of fd.entries()) {
     if (v === "" && (k === "anthropic_api_key" || k === "auth_token")) {
@@ -409,5 +463,6 @@ function escapeHtml(s) {
     .replace(/>/g, "&gt;");
 }
 
+fillModelSelects();
 refreshJobs();
 refreshStats();
