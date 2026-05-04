@@ -1,4 +1,4 @@
-from modules._common import CTF_PREAMBLE, TOOLS_FORENSIC
+from modules._common import CTF_PREAMBLE, TOOLS_FORENSIC, split_retry_hint
 
 SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_FORENSIC + "\n" + """You are a CTF forensic analyst.
 
@@ -55,11 +55,16 @@ Constraints:
 
 
 def build_user_prompt(target_os: str, kind: str, description: str | None) -> str:
-    parts = [
-        "Working directory contains: summary.json, log_findings.json, artifacts/, volatility/ (if memory dump).",
-        f"Image kind: {kind}",
-        f"Target OS hint: {target_os}",
-    ]
+    base_desc, retry_hint = split_retry_hint(description)
+    parts: list[str] = []
+    if retry_hint:
+        parts.append(
+            "⚠ PRIORITY GUIDANCE (from prior-attempt review — read first):\n"
+            + retry_hint
+        )
+    parts.append("Working directory contains: summary.json, log_findings.json, artifacts/, volatility/ (if memory dump).")
+    parts.append(f"Image kind: {kind}")
+    parts.append(f"Target OS hint: {target_os}")
     if kind == "log":
         parts.append(
             "This is a LOG-ONLY job. The user uploaded raw logs (not a disk "
@@ -67,8 +72,8 @@ def build_user_prompt(target_os: str, kind: str, description: str | None) -> str
             "on log_findings.json + artifacts/logs/. Reconstruct attacker "
             "timelines and pull out any captured credentials or flags."
         )
-    if description:
-        parts.append(f"User-provided context:\n{description}")
+    if base_desc:
+        parts.append(f"User-provided context:\n{base_desc}")
     parts.append(
         "Begin by reading summary.json, then log_findings.json (cheap, "
         "pre-mined), then list artifacts/."

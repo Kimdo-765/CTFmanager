@@ -1,4 +1,4 @@
-from modules._common import CTF_PREAMBLE, TOOLS_WEB
+from modules._common import CTF_PREAMBLE, TOOLS_WEB, split_retry_hint
 
 SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_WEB + "\n" + """You are a CTF web-exploitation assistant.
 
@@ -89,6 +89,14 @@ def build_user_prompt(
     auto_run: bool,
 ) -> str:
     parts: list[str] = []
+    base_desc, retry_hint = split_retry_hint(description)
+    if retry_hint:
+        # Surface the freshest retry/resume hint AT THE TOP so the agent
+        # processes the latest review before re-reading the challenge.
+        parts.append(
+            "⚠ PRIORITY GUIDANCE (from prior-attempt review — read first):\n"
+            + retry_hint
+        )
     if src_root:
         parts.append(f"Source code directory (read-only): {src_root}")
     else:
@@ -102,8 +110,8 @@ def build_user_prompt(
         parts.append(f"Target URL: {target_url}")
     else:
         parts.append("Target URL: (not provided — write exploit.py against a parameterized URL)")
-    if description:
-        parts.append(f"Challenge description / hints from user:\n{description}")
+    if base_desc:
+        parts.append(f"Challenge description / hints from user:\n{base_desc}")
     parts.append(
         f"auto_run_after_you_finish={'true' if auto_run else 'false'} "
         "(handled by the orchestrator outside your context — do not run "

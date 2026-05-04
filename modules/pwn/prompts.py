@@ -1,4 +1,4 @@
-from modules._common import CTF_PREAMBLE, TOOLS_PWN
+from modules._common import CTF_PREAMBLE, TOOLS_PWN, split_retry_hint
 
 SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_PWN + "\n" + """You are a CTF pwnable (binary exploitation) assistant.
 
@@ -106,7 +106,13 @@ def build_user_prompt(
     auto_run: bool,
 ) -> str:
     parts: list[str] = []
-    aeg = _looks_like_aeg(description)
+    base_desc, retry_hint = split_retry_hint(description)
+    aeg = _looks_like_aeg(base_desc or description)
+    if retry_hint:
+        parts.append(
+            "⚠ PRIORITY GUIDANCE (from prior-attempt review — read first):\n"
+            + retry_hint
+        )
 
     if binary_name:
         parts.append(f"Binary directory (read-only): ./bin/   (target: ./bin/{binary_name})")
@@ -122,8 +128,8 @@ def build_user_prompt(
         parts.append(f"Remote target: {target}")
     else:
         parts.append("Remote target: (not provided — local-mode exploit only)")
-    if description:
-        parts.append(f"Challenge description / hints from user:\n{description}")
+    if base_desc:
+        parts.append(f"Challenge description / hints from user:\n{base_desc}")
     parts.append(
         f"auto_run_after_you_finish={'true' if auto_run else 'false'} "
         "(handled by orchestrator — do not execute exploit.py yourself)."

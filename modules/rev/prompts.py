@@ -1,4 +1,4 @@
-from modules._common import CTF_PREAMBLE, TOOLS_REV
+from modules._common import CTF_PREAMBLE, TOOLS_REV, split_retry_hint
 
 SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_REV + "\n" + """You are a CTF reverse-engineering assistant.
 
@@ -62,11 +62,16 @@ def build_user_prompt(
     description: str | None,
     auto_run: bool,
 ) -> str:
-    parts = [
-        f"Binary directory (read-only): ./bin/   (target: ./bin/{binary_name})",
-    ]
-    if description:
-        parts.append(f"Challenge description / hints from user:\n{description}")
+    base_desc, retry_hint = split_retry_hint(description)
+    parts: list[str] = []
+    if retry_hint:
+        parts.append(
+            "⚠ PRIORITY GUIDANCE (from prior-attempt review — read first):\n"
+            + retry_hint
+        )
+    parts.append(f"Binary directory (read-only): ./bin/   (target: ./bin/{binary_name})")
+    if base_desc:
+        parts.append(f"Challenge description / hints from user:\n{base_desc}")
     parts.append(
         f"auto_run_after_you_finish={'true' if auto_run else 'false'} "
         "(handled by orchestrator — do not run solver.py yourself)."

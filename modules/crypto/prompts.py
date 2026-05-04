@@ -1,4 +1,4 @@
-from modules._common import CTF_PREAMBLE, TOOLS_CRYPTO
+from modules._common import CTF_PREAMBLE, TOOLS_CRYPTO, split_retry_hint
 
 SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_CRYPTO + "\n" + """You are a CTF crypto-challenge solver.
 
@@ -52,6 +52,12 @@ def build_user_prompt(
     auto_run: bool,
 ) -> str:
     parts: list[str] = []
+    base_desc, retry_hint = split_retry_hint(description)
+    if retry_hint:
+        parts.append(
+            "⚠ PRIORITY GUIDANCE (from prior-attempt review — read first):\n"
+            + retry_hint
+        )
     if src_root:
         parts.append(f"Source/ciphertext directory (read-only): {src_root}")
     else:
@@ -66,8 +72,8 @@ def build_user_prompt(
         parts.append(f"Remote target: {target}")
     else:
         parts.append("Remote target: (not provided — local-only solve)")
-    if description:
-        parts.append(f"Challenge description / hints from user:\n{description}")
+    if base_desc:
+        parts.append(f"Challenge description / hints from user:\n{base_desc}")
     parts.append(
         f"auto_run_after_you_finish={'true' if auto_run else 'false'} "
         "(handled by the orchestrator — do not run solver.py yourself)."

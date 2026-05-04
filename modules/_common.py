@@ -266,6 +266,32 @@ REFUSAL_HINTS = (
 )
 
 
+_RETRY_HINT_MARKER = "[retry-hint]"
+
+
+def split_retry_hint(description: str | None) -> tuple[str, str]:
+    """Split a job description into (base, retry_hint).
+
+    /retry, /retry/stream, /resume, /resume/stream all stitch the next
+    attempt's guidance onto the previous description as
+    `<original>\\n\\n[retry-hint]\\n<hint>`. We split on the LAST
+    occurrence so chained retries always surface the freshest hint;
+    everything before that marker is treated as base context.
+
+    Both halves are stripped. Either may be empty (e.g. fresh job has
+    no marker → all base, no hint; pure retry of an empty description
+    → no base, only hint).
+    """
+    if not description:
+        return "", ""
+    idx = description.rfind(_RETRY_HINT_MARKER)
+    if idx == -1:
+        return description.strip(), ""
+    base = description[:idx].strip()
+    hint = description[idx + len(_RETRY_HINT_MARKER):].strip()
+    return base, hint
+
+
 def classify_agent_error(message: str) -> str | None:
     """Return a short error_kind tag for known SDK / Claude failure modes."""
     if not message:

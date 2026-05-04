@@ -1,4 +1,4 @@
-from modules._common import CTF_PREAMBLE, TOOLS_MISC
+from modules._common import CTF_PREAMBLE, TOOLS_MISC, split_retry_hint
 
 SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_MISC + "\n" + """You are a CTF misc/stego triage assistant.
 
@@ -28,11 +28,16 @@ Your job:
 
 
 def build_user_prompt(filename: str, description: str | None) -> str:
-    parts = [
-        f"Input filename: {filename}",
-        "Working directory contents: findings.json, extracted/, analyze.log",
-    ]
-    if description:
-        parts.append(f"User-provided context:\n{description}")
+    base_desc, retry_hint = split_retry_hint(description)
+    parts: list[str] = []
+    if retry_hint:
+        parts.append(
+            "⚠ PRIORITY GUIDANCE (from prior-attempt review — read first):\n"
+            + retry_hint
+        )
+    parts.append(f"Input filename: {filename}")
+    parts.append("Working directory contents: findings.json, extracted/, analyze.log")
+    if base_desc:
+        parts.append(f"User-provided context:\n{base_desc}")
     parts.append("Begin by reading findings.json.")
     return "\n\n".join(parts)

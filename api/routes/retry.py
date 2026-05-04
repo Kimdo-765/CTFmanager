@@ -300,7 +300,19 @@ def _resubmit(
             shutil.copytree(prev_work, new_jd / "work", dirs_exist_ok=False)
 
     target = (prev_meta.get("target_url") or "").strip() or None
+    # Strip any prior [retry-hint] section so chained retries don't
+    # accumulate stale hint paragraphs in the description blob — the
+    # newest hint is always the only one attached.
     description = (prev_meta.get("description") or "").strip()
+    marker = "\n\n[retry-hint]\n"
+    cut = description.find(marker)
+    if cut == -1:
+        # Also handle the no-leading-blank-lines variant just in case.
+        cut = description.find("[retry-hint]")
+        if cut != -1:
+            description = description[:cut].rstrip()
+    else:
+        description = description[:cut].rstrip()
     description = (description + "\n\n[retry-hint]\n" + hint).strip()
     auto_run = bool(prev_meta.get("auto_run"))
     job_timeout = resolve_timeout(prev_meta.get("job_timeout"))
