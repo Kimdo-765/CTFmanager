@@ -1,4 +1,4 @@
-# CTFmanager
+# HextTech_CTF_TOOL
 
 Docker-based web UI toolset for CTF problem solving. Six modules covering Web, Pwn,
 Forensic, Misc, Crypto, and Reversing — each combines automated tooling with a
@@ -62,7 +62,7 @@ target is given).
 ## Quick start
 
 ```bash
-git clone <this-repo> CTFmanager && cd CTFmanager
+git clone <this-repo> HextTech_CTF_TOOL && cd HextTech_CTF_TOOL
 cp .env.example .env
 
 # Edit .env: set HOST_DATA_DIR to absolute path of <repo>/data
@@ -185,7 +185,7 @@ upload ──► /data/jobs/<id>/         ─► RQ enqueue
 ## File layout
 
 ```
-CTFmanager/
+HextTech_CTF_TOOL/
 ├── docker-compose.yml
 ├── .env  /  .env.example
 ├── api/                 # FastAPI app
@@ -338,7 +338,7 @@ again.
 ## Out-of-band callbacks (XSS / SSRF / blind RCE)
 
 CTFs that exfiltrate via a remote bot need a publicly-reachable
-listener. CTFmanager has a built-in collector that takes any HTTP
+listener. HextTech_CTF_TOOL has a built-in collector that takes any HTTP
 request, logs it, and auto-extracts flag-shaped strings.
 
 Setup once:
