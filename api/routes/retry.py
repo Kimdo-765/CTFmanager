@@ -330,6 +330,14 @@ def _resubmit(
         "model": model,
         "retry_of": prev_meta.get("id"),
         "resumed_from": prev_meta.get("id") if mark_resumed else None,
+        # Pass the prior Claude SDK session_id along so the new agent
+        # can resume + fork the conversation rather than start fresh.
+        # Only meaningful when we're carrying the work/ tree too —
+        # without that the forked thread would reference paths that
+        # don't exist any more in the new cwd.
+        "resume_session_id": (
+            prev_meta.get("claude_session_id") if carry_work else None
+        ),
     }
 
     q = get_queue()

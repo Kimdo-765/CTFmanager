@@ -10,6 +10,7 @@ import anyio
 import docker
 from claude_agent_sdk import (
     AssistantMessage,
+    SystemMessage,
     ClaudeAgentOptions,
     ResultMessage,
     TextBlock,
@@ -21,6 +22,7 @@ from claude_agent_sdk import (
 )
 
 from modules._common import (
+    capture_session_id,
     extract_cost,
     format_tool_result,
     log_thinking,
@@ -119,6 +121,7 @@ async def _claude_summary(
 
     try:
         async for msg in query(prompt=prompt, options=options):
+            capture_session_id(msg, job_id)
             if isinstance(msg, AssistantMessage):
                 summary["messages"] += 1
                 for block in msg.content:

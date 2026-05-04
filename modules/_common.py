@@ -266,6 +266,25 @@ REFUSAL_HINTS = (
 )
 
 
+def capture_session_id(msg, job_id: str) -> None:
+    """If `msg` is the SDK 'init' SystemMessage, persist its session_id
+    to meta.json so a later /retry or /resume can fork the conversation
+    (carrying full reasoning history, not just the work/ artifacts).
+
+    Tolerant of variant SDK shapes — duck-types `subtype` and `data`,
+    no-ops if the message isn't an init or has no usable session_id.
+    """
+    subtype = getattr(msg, "subtype", None)
+    if subtype != "init":
+        return
+    data = getattr(msg, "data", None)
+    sid = None
+    if isinstance(data, dict):
+        sid = data.get("session_id") or data.get("sessionId")
+    if sid:
+        write_meta(job_id, claude_session_id=sid)
+
+
 _RETRY_HINT_MARKER = "[retry-hint]"
 
 

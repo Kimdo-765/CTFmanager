@@ -8,6 +8,7 @@ from typing import Optional
 import anyio
 from claude_agent_sdk import (
     AssistantMessage,
+    SystemMessage,
     ClaudeAgentOptions,
     ResultMessage,
     TextBlock,
@@ -19,6 +20,7 @@ from claude_agent_sdk import (
 )
 
 from modules._common import (
+    capture_session_id,
     classify_agent_error,
     collect_outputs,
     extract_cost,
@@ -49,6 +51,7 @@ async def _run_agent(
 
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     add_dirs = [src_root] if src_root else []
+    resume_sid = read_meta(job_id).get("resume_session_id")
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         model=model,
@@ -56,10 +59,14 @@ async def _run_agent(
         allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
         permission_mode="bypassPermissions",
         add_dirs=add_dirs,
+        resume=resume_sid,
+        fork_session=bool(resume_sid),
     )
     user_prompt = build_user_prompt(src_root, target, description, auto_run)
 
     log_line(job_id, f"Launching Claude agent (model={model})")
+    if resume_sid:
+        log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")
     summary: dict = {"messages": 0, "tool_calls": 0, "model": model}
 
     soft_timeout = int(read_meta(job_id).get("job_timeout") or 0)
@@ -67,6 +74,7 @@ async def _run_agent(
 
     try:
         async for msg in query(prompt=user_prompt, options=options):
+            capture_session_id(msg, job_id)
             if isinstance(msg, AssistantMessage):
                 summary["messages"] += 1
                 for block in msg.content:
