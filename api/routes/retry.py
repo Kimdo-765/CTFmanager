@@ -261,9 +261,19 @@ async def _ask_reviewer_streaming(context: str) -> AsyncIterator[tuple[str, dict
     yield "done", {"hint": hint}
 
 
-def _resubmit(prev_meta: dict, hint: str, prev_jd: Path) -> str:
+def _resubmit(
+    prev_meta: dict,
+    hint: str,
+    prev_jd: Path,
+    *,
+    carry_work: bool = False,
+) -> str:
     """Enqueue a new job in the same module with description + hint, copying
     over the original uploaded source/binary so the user doesn't re-upload.
+
+    `carry_work=True` additionally copies prev_jd/work → new_jd/work so the
+    new agent inherits any partial exploit/solver/report drafts the prior
+    attempt had written. Used by /resume to keep mid-run context.
     """
     module = prev_meta.get("module")
     if module not in ("web", "pwn", "crypto", "rev"):
@@ -274,6 +284,14 @@ def _resubmit(prev_meta: dict, hint: str, prev_jd: Path) -> str:
 
     new_id = new_job_id()
     new_jd = job_dir(new_id)
+
+    # Carry forward the previous agent's work directory (drafts, notes,
+    # partial exploit.py / solver.py / report.md). Done first so any
+    # subsequent module-specific copy step sits alongside it cleanly.
+    if carry_work:
+        prev_work = prev_jd / "work"
+        if prev_work.is_dir():
+            shutil.copytree(prev_work, new_jd / "work", dirs_exist_ok=False)
 
     target = (prev_meta.get("target_url") or "").strip() or None
     description = (prev_meta.get("description") or "").strip()
@@ -293,6 +311,7 @@ def _resubmit(prev_meta: dict, hint: str, prev_jd: Path) -> str:
         "job_timeout": job_timeout,
         "model": model,
         "retry_of": prev_meta.get("id"),
+        "resumed_from": prev_meta.get("id") if carry_work else None,
     }
 
     q = get_queue()
@@ -572,11 +591,25 @@ async def stop_and_resume(job_id: str, request: Request):
         }
         write_job_meta(safe, stopped_meta)
 
-    new_id = _resubmit(prev_meta, manual_hint, jd)
+    # Prepend a context note so the new agent knows ./work/ already
+    # contains the prior attempt's drafts and should pick up from there.
+    augmented_hint = (
+        f"[RESUMING from job {safe}]\n"
+        f"The previous agent's working directory has been preserved as "
+        f"./work/. Before doing anything else, list ./work/ and read any "
+        f"files it contains (partial exploit.py / solver.py / report.md / "
+        f"notes). They show how far the prior attempt got. Continue from "
+        f"there — do not re-do work that's already done — and apply the "
+        f"following user instruction:\n\n"
+        f"{manual_hint}"
+    )
+
+    new_id = _resubmit(prev_meta, augmented_hint, jd, carry_work=True)
     return {
         "new_job_id": new_id,
         "hint": manual_hint,
         "stopped_from": safe,
         "prev_status": prev_status,
         "halt": halt_info,
+        "carried_work": (jd / "work").is_dir(),
     }
