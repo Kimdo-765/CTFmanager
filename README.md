@@ -178,6 +178,7 @@ upload ──► /data/jobs/<id>/         ─► RQ enqueue
 | POST | `/api/jobs/{id}/retry` | regenerate the job with a hint (body: `{"hint":"…"}` for manual hint, empty body = auto reviewer) |
 | POST | `/api/jobs/{id}/retry/stream` | same as `/retry` but returns Server-Sent Events with reviewer progress |
 | POST | `/api/jobs/{id}/resume` | hard-stop the job (if still queued/running), then enqueue a fresh one with `{"hint":"…"}` appended as `[retry-hint]` |
+| POST | `/api/jobs/{id}/resume/stream` | SSE-streamed resume. With `{"hint":"…"}` body works exactly like `/resume`. With an empty body, calls the latest reviewer to write the hint (same flow as `/retry/stream`) before submitting. Both modes carry `./work/` and prepend the `[RESUMING]` preamble. |
 | POST | `/api/jobs/{id}/timeout/continue` | acknowledge the soft timeout — let the agent keep running |
 | POST | `/api/jobs/{id}/timeout/kill` | acknowledge the soft timeout — hard-stop the job |
 
@@ -321,7 +322,8 @@ without a flag`, the job detail panel shows two retry buttons:
 |---|---|
 | **↻ Retry with reviewer hint** | A separate Claude (Opus 4.7 by default) reads the prior job's `run.log`, exploit/solver, stdout/stderr, and key source files, then writes a one-paragraph diagnosis. That hint is appended to the original description as `[retry-hint] …` and a fresh job is enqueued. Reviewer output streams into the UI live (SSE). |
 | **✏ Retry with my hint** | Opens an inline textarea. Whatever you type is appended verbatim as `[retry-hint]` — the reviewer is **not** called and no Claude credit is spent. Useful when you've already spotted the bug and just want the agent to focus on a specific lead. |
-| **✋ Stop & resume with extra hint** | Only visible while the job is `queued`/`running`. Halts the in-flight job (worker + sibling containers) and immediately enqueues a fresh one with your extra description appended as `[retry-hint]`. **Resume preserves context**: the previous agent's working directory (`./work/` — partial `exploit.py` / `solver.py` / `report.md` / notes) is copied into the new job, and the auto-prepended hint instructs the new agent to read those drafts first and continue from where they left off rather than start over. Use this when you notice mid-run that the agent is going down the wrong path and you want to redirect it without throwing away its progress. |
+| **↻ Stop & resume with reviewer hint** | Only visible while the job is `queued`/`running`. Halts the in-flight job, then asks the latest Claude (Opus 4.7) to read the partial run.log + work/ + sources and write a one-paragraph diagnosis. That hint becomes the next job's `[retry-hint]`. SSE-streamed, so reviewer output appears live in the same purple panel used by `/retry/stream`. **Resume preserves context**: the previous agent's `./work/` (partial `exploit.py` / `solver.py` / `report.md` / notes) is copied into the new job and the agent is told to read those first. |
+| **✋ Stop & resume with my hint** | Same as the reviewer variant, but you write the hint yourself in an inline textarea — no Claude credit spent. Use this when you've already spotted the wrong turn and want to redirect without paying for a reviewer pass. |
 
 The new job inherits the previous module, target, model, timeout, source/binary
 upload, and `auto_run` setting — you don't re-upload anything. The retry

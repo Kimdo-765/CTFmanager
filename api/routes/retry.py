@@ -573,36 +573,9 @@ async def stop_and_resume(job_id: str, request: Request):
     # auto-runs the agent it will pick up auth itself via apply_to_env.
     jd, prev_meta = _validate_retry(safe, require_claude_auth=False)
 
-    halt_info = None
     prev_status = prev_meta.get("status")
-    if prev_status in ("queued", "running"):
-        # Late import to avoid a circular at module load time.
-        from api.routes.jobs import _hard_stop_job
-
-        halt_info = _hard_stop_job(safe)
-        # Reflect the cancellation so list/detail endpoints stop showing
-        # the source job as 'running'. Mark *why* it died so the user
-        # can see it in the UI.
-        stopped_meta = {
-            **prev_meta,
-            "status": "stopped",
-            "error": "Stopped by user (resume with extra hint)",
-            "error_kind": "stopped_for_resume",
-        }
-        write_job_meta(safe, stopped_meta)
-
-    # Prepend a context note so the new agent knows ./work/ already
-    # contains the prior attempt's drafts and should pick up from there.
-    augmented_hint = (
-        f"[RESUMING from job {safe}]\n"
-        f"The previous agent's working directory has been preserved as "
-        f"./work/. Before doing anything else, list ./work/ and read any "
-        f"files it contains (partial exploit.py / solver.py / report.md / "
-        f"notes). They show how far the prior attempt got. Continue from "
-        f"there — do not re-do work that's already done — and apply the "
-        f"following user instruction:\n\n"
-        f"{manual_hint}"
-    )
+    halt_info = _halt_source_job(safe, prev_meta) if prev_status in ("queued", "running") else None
+    augmented_hint = _resume_preamble(safe, manual_hint)
 
     new_id = _resubmit(prev_meta, augmented_hint, jd, carry_work=True)
     return {
@@ -613,3 +586,153 @@ async def stop_and_resume(job_id: str, request: Request):
         "halt": halt_info,
         "carried_work": (jd / "work").is_dir(),
     }
+
+
+def _halt_source_job(safe: str, prev_meta: dict) -> dict:
+    """Hard-stop a queued/running job and rewrite its meta so the UI
+    no longer shows it as live. Late-imports _hard_stop_job to avoid a
+    circular at module load.
+    """
+    from api.routes.jobs import _hard_stop_job
+
+    halt = _hard_stop_job(safe)
+    stopped_meta = {
+        **prev_meta,
+        "status": "stopped",
+        "error": "Stopped by user (resume with extra hint)",
+        "error_kind": "stopped_for_resume",
+    }
+    write_job_meta(safe, stopped_meta)
+    return halt
+
+
+def _resume_preamble(prev_id: str, hint: str) -> str:
+    """Prepend the standard [RESUMING] preamble to whatever hint the
+    next agent gets — applied uniformly across the manual and reviewer
+    resume paths so both share the "read ./work/ first" instruction.
+    """
+    return (
+        f"[RESUMING from job {prev_id}]\n"
+        f"The previous agent's working directory has been preserved as "
+        f"./work/. Before doing anything else, list ./work/ and read any "
+        f"files it contains (partial exploit.py / solver.py / report.md / "
+        f"notes). They show how far the prior attempt got. Continue from "
+        f"there — do not re-do work that's already done — and apply the "
+        f"following hint:\n\n"
+        f"{hint}"
+    )
+
+
+@router.post("/{job_id}/resume/stream")
+async def stop_and_resume_stream(job_id: str, request: Request):
+    """Streaming variant of /resume. Stops the running source job, then
+    either uses the user's `{"hint": "..."}` body verbatim or — when the
+    body is empty — calls the latest reviewer to write the hint, exactly
+    like /retry/stream. Either way the new job carries the prior agent's
+    work/ and gets a [RESUMING] preamble.
+
+    SSE events:
+      stage : {"name": "halting" | "gathering" | "asking" | "submitting"}
+      token : {"delta": "<reviewer text>"}
+      done  : {"new_job_id": "...", "hint": "...", "stopped_from": "...",
+               "manual": bool, "carried_work": bool}
+      error : {"message": "...", "kind": "..."}
+    """
+    safe = Path(job_id).name
+    manual_hint = await _read_manual_hint(request)
+    jd, prev_meta = _validate_retry(safe, require_claude_auth=manual_hint is None)
+
+    async def event_gen():
+        def sse(name: str, data: dict) -> bytes:
+            return f"event: {name}\ndata: {json.dumps(data)}\n\n".encode()
+
+        prev_status = prev_meta.get("status")
+        halt_info = None
+        # 1) halt the source job up front so its watchdog/log doesn't keep
+        #    growing while we ask the reviewer.
+        if prev_status in ("queued", "running"):
+            yield sse("stage", {"name": "halting"})
+            try:
+                halt_info = _halt_source_job(safe, prev_meta)
+            except Exception as e:
+                yield sse("error", {
+                    "message": f"halt failed: {e}",
+                    "kind": "halt",
+                })
+                return
+
+        # 2) decide the hint — manual vs reviewer.
+        hint = manual_hint or ""
+        if manual_hint is None:
+            yield sse("stage", {"name": "gathering"})
+            await asyncio.sleep(0)
+            try:
+                context = _gather_context(jd)
+                if not context.strip():
+                    yield sse("error", {
+                        "message": "no prior-job context found to review",
+                        "kind": "no_context",
+                    })
+                    return
+            except Exception as e:
+                yield sse("error", {
+                    "message": f"gather failed: {e}",
+                    "kind": "gather",
+                })
+                return
+
+            yield sse("stage", {"name": "asking"})
+            try:
+                async for kind, payload in _ask_reviewer_streaming(context):
+                    if kind == "token":
+                        yield sse("token", payload)
+                    elif kind == "done":
+                        hint = payload.get("hint", "")
+                    elif kind == "error":
+                        yield sse("error", payload)
+                        return
+            except Exception as e:
+                raw = str(e)
+                yield sse("error", {
+                    "message": f"reviewer failed: {raw}",
+                    "kind": classify_agent_error(raw) or "api_error",
+                })
+                return
+
+        # 3) submit the new job with the same [RESUMING] preamble used
+        #    by /resume + carry_work=True.
+        yield sse("stage", {"name": "submitting"})
+        augmented = _resume_preamble(safe, hint)
+        try:
+            new_id = _resubmit(prev_meta, augmented, jd, carry_work=True)
+        except HTTPException as he:
+            yield sse("error", {
+                "message": f"submit rejected: {he.detail}",
+                "kind": "submit",
+            })
+            return
+        except Exception as e:
+            yield sse("error", {
+                "message": f"submit failed: {e}",
+                "kind": "submit",
+            })
+            return
+
+        yield sse("done", {
+            "new_job_id": new_id,
+            "hint": hint,
+            "stopped_from": safe,
+            "prev_status": prev_status,
+            "manual": manual_hint is not None,
+            "carried_work": (jd / "work").is_dir(),
+            "halt": halt_info,
+        })
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )

@@ -277,30 +277,42 @@ async function decideTimeout(jobId, decision, btn) {
   }
 }
 
-async function streamRetry(jobId, btn, manualHint = null) {
+async function streamRetry(jobId, btn, manualHint = null, opts = {}) {
+  // Endpoint can be /retry/stream (default) or /resume/stream — same SSE
+  // protocol either way, only the stage labels differ.
+  const endpoint = opts.endpoint || `${API}/jobs/${jobId}/retry/stream`;
+  const flow = opts.flow || "retry";   // "retry" | "resume"
+  const flowVerb = flow === "resume" ? "resume" : "retry";
+  const flowEmoji = flow === "resume" ? "✋" : "↻";
+
   // Disable every retry button on the detail panel — only one path runs.
   const allRetryBtns = document.querySelectorAll(
-    `#job-detail .retry-btn, #job-detail .retry-manual-submit`,
+    `#job-detail .retry-btn, #job-detail .retry-manual-submit, #job-detail .stop-resume-submit`,
   );
   allRetryBtns.forEach((b) => (b.disabled = true));
   const origText = btn.textContent;
-  btn.textContent = "⏳ retrying…";
+  btn.textContent = `⏳ ${flowVerb}…`;
   const isManual = typeof manualHint === "string" && manualHint.length > 0;
 
   // Stop the regular polling so it doesn't fight our progress panel
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
 
-  // Tear down any in-flight manual-hint form so it doesn't linger.
+  // Tear down any in-flight inline form so it doesn't linger.
   const manualForm = document.getElementById("retry-manual-form-" + jobId);
   if (manualForm) manualForm.remove();
+  const resumeForm = document.getElementById("stop-resume-form-" + jobId);
+  if (resumeForm) resumeForm.remove();
 
   // Insert a live progress panel right above the run-log heading
   const detail = document.getElementById("job-detail");
   const panel = document.createElement("div");
   panel.className = "retry-panel";
   panel.id = "retry-panel-" + jobId;
+  const headerText = isManual
+    ? `${flowEmoji} ${flow === "resume" ? "Resume" : "Retry"} — your hint`
+    : `${flowEmoji} ${flow === "resume" ? "Resume" : "Retry"} — reviewer in progress`;
   panel.innerHTML = `
-    <h4>${isManual ? "✏ Retry — your hint" : "↻ Retry — reviewer in progress"}</h4>
+    <h4>${headerText}</h4>
     <div class="stage"><span class="dot"></span><span class="stage-text">${isManual ? "submitting…" : "starting…"}</span></div>
     <pre class="hint-stream"></pre>
   `;
@@ -326,7 +338,7 @@ async function streamRetry(jobId, btn, manualHint = null) {
 
   let resp;
   try {
-    resp = await fetch(`${API}/jobs/${jobId}/retry/stream`, fetchOpts);
+    resp = await fetch(endpoint, fetchOpts);
   } catch (e) {
     streamEl.textContent = "[err] " + e;
     allRetryBtns.forEach((b) => (b.disabled = false));
@@ -351,9 +363,16 @@ async function streamRetry(jobId, btn, manualHint = null) {
     if (name === "stage") {
       const s = data.name;
       stageEl.textContent = ({
+        halting: "halting current job…",
         gathering: "gathering prior job context…",
         asking: "asking reviewer (Opus 4.7)…",
-        submitting: isManual ? "enqueueing new job with your hint…" : "enqueueing new job…",
+        submitting: isManual
+          ? (flow === "resume"
+              ? "enqueueing fresh job (carrying ./work/) with your hint…"
+              : "enqueueing new job with your hint…")
+          : (flow === "resume"
+              ? "enqueueing fresh job (carrying ./work/)…"
+              : "enqueueing new job…"),
       })[s] || s;
     } else if (name === "token") {
       if (firstToken) { streamEl.textContent = ""; firstToken = false; }
@@ -376,9 +395,8 @@ async function streamRetry(jobId, btn, manualHint = null) {
       dot.style.animation = "none";
       panel.classList.add("retry-panel-error");
       const headerEl = panel.querySelector("h4");
-      if (headerEl) headerEl.textContent = isManual
-        ? "✏ Retry — error (no new job created)"
-        : "↻ Retry — error (no new job created)";
+      if (headerEl) headerEl.textContent =
+        `${flowEmoji} ${flow === "resume" ? "Resume" : "Retry"} — error (no new job created)`;
       const kind = data.kind || "error";
       const kindLabel = ({
         api_error: "API error",
@@ -389,10 +407,11 @@ async function streamRetry(jobId, btn, manualHint = null) {
         empty: "empty response",
         no_context: "no prior context",
         gather: "context gather failed",
+        halt: "stop failed",
         submit: "submit rejected",
         unknown: "unknown error",
       })[kind] || kind;
-      stageEl.textContent = `${kindLabel} — retry aborted`;
+      stageEl.textContent = `${kindLabel} — ${flowVerb} aborted`;
       const errMsg = (data.message || "unknown error").trim();
       // If the reviewer streamed partial text before erroring, keep it as
       // forensic context above the error block. Otherwise just show error.
@@ -745,11 +764,12 @@ async function renderJob(id, opts = {}) {
       ? `<button class="retry-btn" data-action="retry">↻ Retry with reviewer hint</button>
          <button class="retry-btn retry-manual-open-btn" data-action="retry-manual">✏ Retry with my hint</button>` : "";
     const stopResumeHtml = showStopResume
-      ? `<button class="retry-btn retry-stop-resume-btn" data-action="stop-resume">✋ Stop &amp; resume with extra hint</button>` : "";
+      ? `<button class="retry-btn retry-stop-resume-btn" data-action="stop-resume-reviewer">↻ Stop &amp; resume with reviewer hint</button>
+         <button class="retry-btn retry-stop-resume-btn" data-action="stop-resume">✋ Stop &amp; resume with my hint</button>` : "";
     const helperBits = [];
     if (runHtml) helperBits.push("re-runs the produced script");
     if (retryHtml) helperBits.push("reviewer hint = Claude diagnoses the failure · my hint = you write the hint yourself");
-    if (stopResumeHtml) helperBits.push("stop & resume = halt the current job and start a fresh one with your extra hint appended");
+    if (stopResumeHtml) helperBits.push("stop & resume = halt this job, carry over ./work/, and start fresh with a reviewer-written or hand-written hint");
     runBlock = `<div class="retry-row" style="margin:0.5rem 0">
       ${runHtml} ${retryHtml} ${stopResumeHtml}
       <small style="color:#8b949e">${helperBits.join(" · ")}</small>
@@ -852,6 +872,20 @@ async function renderJob(id, opts = {}) {
   const stopResumeBtn = detail.querySelector('.retry-btn[data-action="stop-resume"]');
   if (stopResumeBtn) {
     stopResumeBtn.addEventListener("click", () => openStopResumeForm(id, stopResumeBtn));
+  }
+  const stopResumeReviewerBtn = detail.querySelector(
+    '.retry-btn[data-action="stop-resume-reviewer"]',
+  );
+  if (stopResumeReviewerBtn) {
+    stopResumeReviewerBtn.addEventListener("click", () => {
+      // No manual hint: streamRetry will fetch the reviewer over SSE,
+      // backend will halt the source job first, carry ./work/, and
+      // submit the new job with a [RESUMING] preamble.
+      streamRetry(id, stopResumeReviewerBtn, null, {
+        endpoint: `${API}/jobs/${id}/resume/stream`,
+        flow: "resume",
+      });
+    });
   }
 
   const continueBtn = detail.querySelector('.timeout-continue-btn[data-action="continue"]');
