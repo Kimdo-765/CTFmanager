@@ -206,6 +206,68 @@ def extract_cost(claude_summary: dict | None) -> float:
     return 0.0
 
 
+def format_tool_result(content: Any, is_error: bool | None = None) -> str:
+    """Compact one-line preview of a tool result for the run log.
+
+    Tool results are otherwise invisible — the agent sees them, but the
+    user just sees a TOOL line followed by silence until the agent's
+    next message lands. Surfacing a short preview closes that gap.
+    """
+    text = ""
+    if content is None:
+        text = ""
+    elif isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        # SDK shape: list of {"type": "text"|"image", "text": "..."} dicts.
+        parts = []
+        for blk in content:
+            if isinstance(blk, dict):
+                if blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                    parts.append(blk["text"])
+                elif blk.get("type") == "image":
+                    parts.append("<image>")
+                else:
+                    parts.append(str(blk)[:200])
+            else:
+                parts.append(str(blk)[:200])
+        text = "\n".join(parts)
+    else:
+        text = str(content)
+    text = text.replace("\n", " | ")
+    text = text.strip()
+    cap = 300
+    if len(text) > cap:
+        text = text[:cap] + "…"
+    prefix = "TOOL_RESULT"
+    if is_error:
+        prefix = "TOOL_ERROR"
+    if not text:
+        return f"{prefix}: (empty)"
+    return f"{prefix}: {text}"
+
+
+def log_thinking(log_fn, prefix: str, thinking_text: str) -> None:
+    """Write a multi-line ThinkingBlock to run.log, line-by-line, so the
+    user can see reasoning progress instead of one truncated 500-char
+    blob. Caps each line at 500 chars and the whole burst at 2 KB.
+    """
+    if not thinking_text:
+        return
+    text = thinking_text[:2000]
+    seen = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if len(line) > 500:
+            line = line[:500] + "…"
+        log_fn(f"{prefix}: {line}")
+        seen += 1
+        if seen >= 8:
+            break
+
+
 async def soft_timeout_watchdog(job_id: str, soft_timeout_s: int) -> None:
     """Sleep until the user-set soft timeout elapses, then mark the job as
     `awaiting_decision` in meta and log a single line. The agent loop is

@@ -12,7 +12,9 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     ThinkingBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
     query,
 )
 
@@ -20,8 +22,10 @@ from modules._common import (
     classify_agent_error,
     collect_outputs,
     extract_cost,
+    format_tool_result,
     job_dir,
     log_line,
+    log_thinking,
     read_meta,
     scan_job_for_flags,
     soft_timeout_watchdog,
@@ -77,7 +81,21 @@ async def _run_agent(
                         # Surfaces extended-thinking output so the live
                         # log doesn't go silent for minutes between tool
                         # calls when Claude is reasoning.
-                        log_line(job_id, f"THINK: {block.thinking[:500]}")
+                        log_thinking(
+                            lambda s: log_line(job_id, s),
+                            "THINK", block.thinking,
+                        )
+            elif isinstance(msg, UserMessage):
+                # ToolResultBlock comes back in the next user turn — without
+                # logging it, the run.log goes silent for the entire tool
+                # execution (long Bash commands, big Reads, ...).
+                content = msg.content if isinstance(msg.content, list) else []
+                for block in content:
+                    if isinstance(block, ToolResultBlock):
+                        log_line(
+                            job_id,
+                            format_tool_result(block.content, block.is_error),
+                        )
             elif isinstance(msg, ResultMessage):
                 summary["result"] = {
                     "duration_ms": msg.duration_ms,
