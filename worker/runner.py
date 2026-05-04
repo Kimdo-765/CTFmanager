@@ -62,7 +62,7 @@ def run_one_worker(idx: int, scheduler: bool) -> None:
     from rq import Queue, Worker
 
     conn = Redis.from_url(REDIS_URL)
-    q = Queue("hexttech_ctf_tool", connection=conn)
+    q = Queue("hextech_ctf_tool", connection=conn)
     name = f"htct-w{idx}"
     print(f"[worker] {name} starting (scheduler={scheduler})", flush=True)
     Worker([q], connection=conn, name=name).work(with_scheduler=scheduler)

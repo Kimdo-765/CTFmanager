@@ -35,7 +35,7 @@ from modules.settings_io import apply_to_env, get_setting, has_claude_auth
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 JOBS_DIR = DATA_DIR / "jobs"
 
-MISC_IMAGE = "hexttech_ctf_tool-misc"
+MISC_IMAGE = "hextech_ctf_tool-misc"
 MISC_TIMEOUT_S = 600
 MISC_MEM = "2g"
 
@@ -82,7 +82,7 @@ def _spawn_misc(job_id: str, filename: str, passphrase: Optional[str]) -> str:
         mem_limit=MISC_MEM,
         network_mode="none",
         detach=True,
-        labels={"hexttech_ctf_tool_job_id": job_id, "hexttech_ctf_tool_role": "misc"},
+        labels={"hextech_ctf_tool_job_id": job_id, "hextech_ctf_tool_role": "misc"},
     )
     try:
         result = container.wait(timeout=MISC_TIMEOUT_S)

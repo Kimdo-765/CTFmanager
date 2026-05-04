@@ -14,7 +14,7 @@ router = APIRouter()
 def _hard_stop_job(job_id: str) -> dict:
     """Try to actually halt work on a running job:
     1. Send STOP_JOB command to whichever worker is running it (RQ pub-sub).
-    2. Find sibling docker containers labelled hexttech_ctf_tool_job_id=<id> and
+    2. Find sibling docker containers labelled hextech_ctf_tool_job_id=<id> and
        force-remove them (decompiler / forensic / misc / runner).
     Errors are swallowed — best-effort.
     """
@@ -45,7 +45,7 @@ def _hard_stop_job(job_id: str) -> dict:
         client = _docker.from_env()
         containers = client.containers.list(
             all=True,
-            filters={"label": f"hexttech_ctf_tool_job_id={job_id}"},
+            filters={"label": f"hextech_ctf_tool_job_id={job_id}"},
         )
         for c in containers:
             try:

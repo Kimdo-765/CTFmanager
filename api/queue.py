@@ -53,7 +53,7 @@ def hard_timeout_for(soft: int) -> int:
 
 def get_queue() -> Queue:
     return Queue(
-        "hexttech_ctf_tool",
+        "hextech_ctf_tool",
         connection=_redis,
         default_timeout=hard_timeout_for(_job_timeout()),
     )

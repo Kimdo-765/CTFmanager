@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ghiant — agent-callable Ghidra decompiler wrapper.
 
-Invokes the hexttech_ctf_tool-decompiler sibling container against a binary inside
+Invokes the hextech_ctf_tool-decompiler sibling container against a binary inside
 the current job's directory and stages the per-function .c files locally.
 
 Usage (called by the Claude agent via Bash):

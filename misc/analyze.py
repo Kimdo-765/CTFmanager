@@ -3,7 +3,7 @@
 and writes findings.json + an extracted/ directory.
 
 Invoked by the worker:
-    docker run --rm -v <hostjob>:/job hexttech_ctf_tool-misc <input_path> [--passphrase ...]
+    docker run --rm -v <hostjob>:/job hextech_ctf_tool-misc <input_path> [--passphrase ...]
 """
 from __future__ import annotations
 

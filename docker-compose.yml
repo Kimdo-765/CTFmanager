@@ -1,4 +1,4 @@
-name: hexttech_ctf_tool
+name: hextech_ctf_tool
 
 services:
   redis:
@@ -54,7 +54,7 @@ services:
 
   # Built but not started by default. Worker spawns transient instances per job.
   decompiler:
-    image: hexttech_ctf_tool-decompiler
+    image: hextech_ctf_tool-decompiler
     build:
       context: .
       dockerfile: decompiler/Dockerfile
@@ -64,21 +64,21 @@ services:
     profiles: ["tools"]
 
   forensic:
-    image: hexttech_ctf_tool-forensic
+    image: hextech_ctf_tool-forensic
     build:
       context: .
       dockerfile: forensic/Dockerfile
     profiles: ["tools"]
 
   misc:
-    image: hexttech_ctf_tool-misc
+    image: hextech_ctf_tool-misc
     build:
       context: .
       dockerfile: misc/Dockerfile
     profiles: ["tools"]
 
   runner:
-    image: hexttech_ctf_tool-runner
+    image: hextech_ctf_tool-runner
     build:
       context: .
       dockerfile: runner/Dockerfile
