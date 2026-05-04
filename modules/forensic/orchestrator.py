@@ -36,7 +36,7 @@ from modules.settings_io import apply_to_env, get_setting, has_claude_auth
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 JOBS_DIR = DATA_DIR / "jobs"
 
-FORENSIC_IMAGE = "ctfmanager-forensic"
+FORENSIC_IMAGE = "hexttech_ctf_tool-forensic"
 FORENSIC_TIMEOUT_S = 1800  # 30 min — vol3 + tsk on big images can be slow
 FORENSIC_MEM = "6g"
 
@@ -91,7 +91,7 @@ def _spawn_collector(
         # network=bridge by default — needed so volatility3 can fetch PDB
         # symbols from microsoft for unknown windows builds.
         detach=True,
-        labels={"ctfmanager_job_id": job_id, "ctfmanager_role": "forensic"},
+        labels={"hexttech_ctf_tool_job_id": job_id, "hexttech_ctf_tool_role": "forensic"},
     )
     try:
         result = container.wait(timeout=FORENSIC_TIMEOUT_S)

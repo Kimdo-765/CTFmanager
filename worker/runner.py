@@ -62,8 +62,8 @@ def run_one_worker(idx: int, scheduler: bool) -> None:
     from rq import Queue, Worker
 
     conn = Redis.from_url(REDIS_URL)
-    q = Queue("ctfmanager", connection=conn)
-    name = f"ctfm-w{idx}"
+    q = Queue("hexttech_ctf_tool", connection=conn)
+    name = f"htct-w{idx}"
     print(f"[worker] {name} starting (scheduler={scheduler})", flush=True)
     Worker([q], connection=conn, name=name).work(with_scheduler=scheduler)
 
@@ -83,7 +83,7 @@ def main() -> int:
         p = ctx.Process(
             target=run_one_worker,
             args=(i, i == 0),  # only worker 0 runs the RQ scheduler
-            name=f"ctfm-w{i}",
+            name=f"htct-w{i}",
         )
         p.start()
         procs.append(p)
@@ -109,7 +109,7 @@ def main() -> int:
                 np = ctx.Process(
                     target=run_one_worker,
                     args=(i, i == 0),
-                    name=f"ctfm-w{i}",
+                    name=f"htct-w{i}",
                 )
                 np.start()
                 procs[i] = np

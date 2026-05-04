@@ -2,7 +2,7 @@
 """Forensic collector entrypoint.
 
 Invoked by the worker via:
-    docker run --rm -v <hostjob>:/job ctfmanager-forensic <image_path> \
+    docker run --rm -v <hostjob>:/job hexttech_ctf_tool-forensic <image_path> \
         [--type auto|raw|qcow2|vmdk|memory|log] [--os auto|linux|windows] \
         [--bulk-extractor]
 

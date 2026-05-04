@@ -1,6 +1,6 @@
 """Web terminal — WebSocket → docker exec → xterm.js.
 
-Opens an interactive bash inside a transient ctfmanager-runner container
+Opens an interactive bash inside a transient hexttech_ctf_tool-runner container
 with the requested job's directory mounted at /work. The user can edit /
 re-run exploit.py, try ad-hoc payloads, install extra tools, etc.
 
@@ -20,7 +20,7 @@ from modules.settings_io import get_setting
 
 router = APIRouter()
 
-RUNNER_IMAGE = "ctfmanager-runner"
+RUNNER_IMAGE = "hexttech_ctf_tool-runner"
 DEFAULT_MEM = "2g"
 
 
@@ -81,8 +81,8 @@ async def terminal_ws(ws: WebSocket, job_id: str):
             network_mode="bridge",
             environment={"TERM": "xterm-256color", "JOB_ID": safe_id},
             labels={
-                "ctfmanager_job_id": safe_id,
-                "ctfmanager_role": "terminal",
+                "hexttech_ctf_tool_job_id": safe_id,
+                "hexttech_ctf_tool_role": "terminal",
             },
         )
     except docker.errors.ImageNotFound:

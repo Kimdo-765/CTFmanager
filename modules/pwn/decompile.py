@@ -8,7 +8,7 @@ from pathlib import Path
 
 import docker
 
-DECOMPILER_IMAGE = "ctfmanager-decompiler"
+DECOMPILER_IMAGE = "hexttech_ctf_tool-decompiler"
 DECOMPILER_TIMEOUT_S = 900  # 15 min — Ghidra auto-analysis can be slow
 DECOMPILER_MEM = "4g"
 
@@ -47,7 +47,7 @@ def run_decompiler(job_id: str, binary_rel: str) -> tuple[Path, str]:
         mem_limit=DECOMPILER_MEM,
         network_mode="none",
         detach=True,
-        labels={"ctfmanager_job_id": job_id, "ctfmanager_role": "decompiler"},
+        labels={"hexttech_ctf_tool_job_id": job_id, "hexttech_ctf_tool_role": "decompiler"},
     )
     try:
         result = container.wait(timeout=DECOMPILER_TIMEOUT_S)

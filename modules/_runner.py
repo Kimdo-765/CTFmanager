@@ -1,7 +1,7 @@
 """Sandboxed exploit/solver execution helper.
 
 After a Claude agent has produced exploit.py / solver.py, the orchestrator
-calls run_in_sandbox() to execute the script inside the ctfmanager-runner
+calls run_in_sandbox() to execute the script inside the hexttech_ctf_tool-runner
 container instead of the worker. This isolates network and resources from
 the worker that holds the docker socket and the API key.
 
@@ -16,7 +16,7 @@ from typing import Optional
 
 import docker
 
-RUNNER_IMAGE = "ctfmanager-runner"
+RUNNER_IMAGE = "hexttech_ctf_tool-runner"
 SAGE_IMAGE = "sagemath/sagemath:latest"
 DEFAULT_TIMEOUT_S = 300
 DEFAULT_MEM = "2g"
@@ -78,7 +78,7 @@ def run_in_sandbox(
         stdout=True,
         stderr=True,
         detach=True,
-        labels={"ctfmanager_job_id": job_id, "ctfmanager_role": "runner"},
+        labels={"hexttech_ctf_tool_job_id": job_id, "hexttech_ctf_tool_role": "runner"},
     )
     exit_code = -1
     out = b""
