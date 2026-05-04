@@ -163,6 +163,34 @@ textarea, select {
 .timeout-kill-btn:hover { background: #da3633; }
 .timeout-kill-btn:disabled { background: #21262d; color: #6e7681; cursor: wait; }
 
+/* Forensic log-miner findings panel */
+.log-findings-panel {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  margin: 0.5rem 0;
+}
+.log-findings-panel h4 {
+  margin: 0 0 0.4rem 0;
+  font-size: 0.78rem; color: #8b949e;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.lf-chips {
+  display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.4rem;
+}
+.lf-chip {
+  display: inline-block; padding: 0.15rem 0.55rem;
+  border-radius: 999px; font-size: 0.75rem;
+  border: 1px solid transparent;
+}
+.lf-chip.hit {
+  background: #2d2208; color: #f5d062; border-color: #d4a72c66;
+}
+.lf-chip.zero {
+  background: #0d1117; color: #6e7681; border-color: #30363d;
+}
+
 /* Job description block (above the retry/run buttons) */
 .description-block {
   background: #161b22;

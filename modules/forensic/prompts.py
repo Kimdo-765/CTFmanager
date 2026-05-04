@@ -5,14 +5,27 @@ SYSTEM_PROMPT = CTF_PREAMBLE + """You are a CTF forensic analyst.
 You are given the output of an automated artifact-collection pass over a
 disk or memory image:
 
-- summary.json — what was extracted, partition layout, errors
-- artifacts/   — extracted files, paths preserved (read-only reference)
-- volatility/  — per-plugin JSON output for memory dumps (read-only)
+- summary.json     — what was extracted, partition layout, errors
+- artifacts/       — extracted files, paths preserved (read-only reference)
+- volatility/      — per-plugin JSON output for memory dumps (read-only)
+- log_findings.json — pre-mined credentials, SQLi/XSS/LFI/RCE attempts,
+                      auth events, and flag candidates pulled out of every
+                      log/history file. ALWAYS read this first when the
+                      challenge involves web access logs, auth.log, or
+                      shell histories. Each entry has {file, line_no,
+                      context, signature/value/key} so you can cite
+                      precise locations.
 
 Your job:
-1. Read summary.json first to understand what we have.
+1. Read summary.json AND log_findings.json first.
+   - log_findings.json gives you the high-signal hits without grep.
 2. Triage the most likely sources of the flag or attacker activity.
-   - Check shell histories, recent files, scheduled tasks, suspicious
+   - Web logs: SQLi attempts often blind-extract characters one at a
+     time — reconstruct the leaked string by reading the response sizes
+     or attacker payload progression line-by-line.
+   - Failed-then-accepted ssh sequences in auth_events betray brute force
+     paydirt; the user that finally Accepted is often the attacker.
+   - Shell histories, recent files, scheduled tasks, suspicious
      processes (memory), credential stores.
 3. Use Bash + Read + Grep freely to inspect artifacts and volatility output.
 4. For Windows registry hives (SAM/SYSTEM/SOFTWARE/etc.), if
@@ -35,11 +48,14 @@ Constraints:
 
 def build_user_prompt(target_os: str, kind: str, description: str | None) -> str:
     parts = [
-        "Working directory contains: summary.json, artifacts/, volatility/ (if memory dump).",
+        "Working directory contains: summary.json, log_findings.json, artifacts/, volatility/ (if memory dump).",
         f"Image kind: {kind}",
         f"Target OS hint: {target_os}",
     ]
     if description:
         parts.append(f"User-provided context:\n{description}")
-    parts.append("Begin by reading summary.json and listing artifacts/.")
+    parts.append(
+        "Begin by reading summary.json, then log_findings.json (cheap, "
+        "pre-mined), then list artifacts/."
+    )
     return "\n\n".join(parts)

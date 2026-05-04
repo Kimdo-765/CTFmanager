@@ -230,6 +230,24 @@ CTFmanager/
 - Auto-detects qcow2 / vmdk / vhd / vhdx / e01 / raw / memory.
 - E01 is converted to raw via `ewfexport`; vmdk/qcow2/vhd via `qemu-img`.
 - Memory dumps run a curated Volatility 3 plugin set per detected OS.
+- After artifacts are extracted, `log_miner` scans every log/history file
+  (Apache/Nginx access + error logs, `auth.log`, `syslog`, `bash_history`,
+  PowerShell `ConsoleHost_history.txt`, Volatility `linux.bash` output, …)
+  and writes `log_findings.json` with categorized hits:
+  - **passwords** — credentials leaked in URL params, JSON bodies,
+    `mysql -p<pw>`, `curl -u user:pass`, HTTP `Authorization: Basic …`.
+  - **sqli_attempts / xss_attempts / lfi_attempts / rce_attempts** —
+    classic web-attack signatures (`UNION SELECT`, `' OR 1=1`, `<script>`,
+    `../../etc/passwd`, ``$(…)`` , …). Lines are URL-decoded before
+    matching so encoded payloads register.
+  - **auth_events** — sshd Accepted/Failed/Invalid-user lines and sudo
+    auth events. Useful for spotting brute-force-then-success sequences.
+  - **flag_candidates** — anything matching the project's CTF flag regex.
+
+  The job detail panel shows category counts as colored chips; the full
+  report is one click away (`log_findings.json`). The Claude summarizer
+  is told to read `log_findings.json` first since it's the highest-signal
+  source for web-CTF disk images.
 
 ### Misc
 - Unifies binwalk extraction, exiftool, zsteg LSB, steghide, pngcheck, pdf

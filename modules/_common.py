@@ -102,6 +102,7 @@ def scan_job_for_flags(job_id: str, extra_files: list[str] | None = None) -> lis
         "solver.py.stderr",
         "summary.json",
         "findings.json",
+        "log_findings.json",
         "result.json",
         "run.log",
         "callbacks.jsonl",

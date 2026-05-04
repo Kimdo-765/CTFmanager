@@ -190,10 +190,27 @@ def run_job(
         flags = scan_job_for_flags(job_id)
         result["flags"] = flags
 
+        # Surface log-miner stats so the UI can render counts without
+        # re-reading log_findings.json.
+        log_findings_path = _job_dir(job_id) / "log_findings.json"
+        log_findings_counts = None
+        if log_findings_path.exists():
+            try:
+                lf = json.loads(log_findings_path.read_text())
+                log_findings_counts = lf.get("counts") or {
+                    k: len(v) for k, v in lf.items() if isinstance(v, list)
+                }
+                result["log_findings_counts"] = log_findings_counts
+            except Exception:
+                pass
+
         (_job_dir(job_id) / "result.json").write_text(json.dumps(result, indent=2, default=str))
-        _write_meta(job_id, status="finished", stage="done", cost_usd=cost,
-                    flags=flags,
-                    result={"kind": kind, "had_claude": bool(result.get("claude"))})
+        _write_meta(
+            job_id, status="finished", stage="done", cost_usd=cost,
+            flags=flags,
+            log_findings_counts=log_findings_counts,
+            result={"kind": kind, "had_claude": bool(result.get("claude"))},
+        )
         return result
     except Exception as e:
         _log(job_id, f"ERROR: {e}\n{traceback.format_exc()}")

@@ -558,6 +558,7 @@ async function renderJob(id) {
     }
     if (job.module === "forensic") {
       links.push(`<a href="${API}/jobs/${id}/file/summary.json" target="_blank">summary.json</a>`);
+      links.push(`<a href="${API}/jobs/${id}/file/log_findings.json" target="_blank">log_findings.json</a>`);
       links.push(`<a href="${API}/jobs/${id}/file/collector.log" target="_blank">collector.log</a>`);
     }
     if (job.module === "misc") {
@@ -661,6 +662,37 @@ async function renderJob(id) {
     </div>`;
   }
 
+  // Forensic-only: log-miner findings panel. Shows category counts so the
+  // user can see at a glance whether the run captured anything actionable.
+  let logFindingsBlock = "";
+  if (job.module === "forensic" && job.log_findings_counts) {
+    const c = job.log_findings_counts;
+    const cells = [
+      ["passwords", c.passwords],
+      ["sqli", c.sqli_attempts],
+      ["xss", c.xss_attempts],
+      ["lfi", c.lfi_attempts],
+      ["rce", c.rce_attempts],
+      ["auth events", c.auth_events],
+      ["flag candidates", c.flag_candidates],
+    ];
+    const chips = cells
+      .filter(([, v]) => typeof v === "number")
+      .map(([label, v]) =>
+        `<span class="lf-chip ${v > 0 ? "hit" : "zero"}">${escapeHtml(label)}: ${v}</span>`
+      ).join(" ");
+    const scanned = typeof c.scanned_files === "number"
+      ? `<small style="color:#8b949e">scanned ${c.scanned_files} log/history files</small>` : "";
+    logFindingsBlock = `<div class="log-findings-panel">
+      <h4>🔎 Log mining</h4>
+      <div class="lf-chips">${chips}</div>
+      ${scanned}
+      <small style="color:#8b949e;margin-left:0.5rem">
+        full report: <a href="${API}/jobs/${id}/file/log_findings.json" target="_blank">log_findings.json</a>
+      </small>
+    </div>`;
+  }
+
   let flagBlock = "";
   if (job.flags && job.flags.length) {
     const rows = job.flags.map((f, i) =>
@@ -684,6 +716,7 @@ async function renderJob(id) {
     ${runBlock}
     ${errorBlock}
     ${flagBlock}
+    ${logFindingsBlock}
     ${resultBlock}
     <h4>Run log <small style="color:#8b949e;font-weight:normal">(auto-follows when scrolled to bottom)</small></h4>
     <pre class="run-log" data-job-id="${id}">${escapeHtml(log) || "(empty)"}</pre>

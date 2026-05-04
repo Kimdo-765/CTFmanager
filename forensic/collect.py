@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 from disk import process_disk
+from log_miner import scan_logs
 from memory import process_memory
 
 
@@ -95,6 +96,26 @@ def main() -> int:
         summary["error"] = str(e)
         (out / "summary.json").write_text(json.dumps(summary, indent=2))
         return 1
+
+    # Mine extracted text artifacts (logs, bash_history, browser history,
+    # volatility plugin output) for credentials, web-attack signatures
+    # (SQLi/XSS/LFI/RCE), auth events, and flag-shaped strings. Failures
+    # are non-fatal — the rest of the report is still useful.
+    try:
+        roots = [out / "artifacts", out / "volatility"]
+        log_findings = scan_logs(
+            [r for r in roots if r.exists()],
+            out / "log_findings.json",
+            log_fn=L,
+        )
+        summary["log_findings"] = {
+            "scanned_files": log_findings.get("scanned_files", 0),
+            "counts": log_findings.get("counts", {}),
+        }
+    except Exception as e:
+        import traceback
+        L(f"log_miner failed (non-fatal): {e}\n{traceback.format_exc()}")
+        summary["log_findings"] = {"error": str(e)}
 
     (out / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     L("done")
