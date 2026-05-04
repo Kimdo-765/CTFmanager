@@ -5,6 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>CTFmanager</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <!-- Syntax highlighting + Markdown rendering for the file preview modal.
+       Loaded from jsDelivr CDN. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css" />
+  <script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/marked@13.0.3/marked.min.js"></script>
 </head>
 <body>
   <header>
@@ -310,6 +315,23 @@
       <div id="job-detail"></div>
     </section>
   </main>
+
+  <!-- File preview modal (populated by openFileModal() in app.js) -->
+  <div id="file-modal" class="file-modal" hidden>
+    <div class="file-modal-backdrop"></div>
+    <div class="file-modal-window" role="dialog" aria-modal="true">
+      <header class="file-modal-header">
+        <span class="file-modal-name"></span>
+        <span class="file-modal-meta"></span>
+        <div class="file-modal-actions">
+          <a class="file-modal-raw" target="_blank" rel="noopener">Open raw</a>
+          <button type="button" class="file-modal-copy">Copy</button>
+          <button type="button" class="file-modal-close" aria-label="Close">✕</button>
+        </div>
+      </header>
+      <div class="file-modal-body"></div>
+    </div>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

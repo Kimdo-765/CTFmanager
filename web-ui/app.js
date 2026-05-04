@@ -630,30 +630,37 @@ async function renderJob(id, opts = {}) {
   const prevScrollTop = prevPre ? prevPre.scrollTop : 0;
   const isSameJob = prevPre && prevPre.dataset.jobId === id;
 
+  // File-link helper. Left-click opens the syntax-highlighting preview
+  // modal; middle-click / Ctrl+click / right-click "Open in new tab" still
+  // gets the raw response since the underlying href is the API URL.
+  const fileLink = (label, url, name) =>
+    `<a href="${url}" target="_blank" class="file-preview-link"
+        data-url="${url}" data-name="${escapeHtml(name)}">${escapeHtml(label)}</a>`;
+
   let resultBlock = "";
   if (["finished", "running", "no_flag"].includes(job.status)) {
     const links = [
-      `<a href="${API}/jobs/${id}/result" target="_blank">result.json</a>`,
-      `<a href="${API}/jobs/${id}/file/report.md" target="_blank">report.md</a>`,
+      fileLink("result.json", `${API}/jobs/${id}/result`, "result.json"),
+      fileLink("report.md", `${API}/jobs/${id}/file/report.md`, "report.md"),
     ];
     if (job.module === "web" || job.module === "pwn") {
-      links.push(`<a href="${API}/jobs/${id}/file/exploit.py" target="_blank">exploit.py</a>`);
-      links.push(`<a href="${API}/jobs/${id}/file/exploit.py.stdout" target="_blank">stdout</a>`);
-      links.push(`<a href="${API}/jobs/${id}/file/exploit.py.stderr" target="_blank">stderr</a>`);
+      links.push(fileLink("exploit.py", `${API}/jobs/${id}/file/exploit.py`, "exploit.py"));
+      links.push(fileLink("stdout", `${API}/jobs/${id}/file/exploit.py.stdout`, "exploit.py.stdout"));
+      links.push(fileLink("stderr", `${API}/jobs/${id}/file/exploit.py.stderr`, "exploit.py.stderr"));
     }
     if (job.module === "crypto" || job.module === "rev") {
-      links.push(`<a href="${API}/jobs/${id}/file/solver.py" target="_blank">solver.py</a>`);
-      links.push(`<a href="${API}/jobs/${id}/file/solver.py.stdout" target="_blank">stdout</a>`);
-      links.push(`<a href="${API}/jobs/${id}/file/solver.py.stderr" target="_blank">stderr</a>`);
+      links.push(fileLink("solver.py", `${API}/jobs/${id}/file/solver.py`, "solver.py"));
+      links.push(fileLink("stdout", `${API}/jobs/${id}/file/solver.py.stdout`, "solver.py.stdout"));
+      links.push(fileLink("stderr", `${API}/jobs/${id}/file/solver.py.stderr`, "solver.py.stderr"));
     }
     if (job.module === "forensic") {
-      links.push(`<a href="${API}/jobs/${id}/file/summary.json" target="_blank">summary.json</a>`);
-      links.push(`<a href="${API}/jobs/${id}/file/log_findings.json" target="_blank">log_findings.json</a>`);
-      links.push(`<a href="${API}/jobs/${id}/file/collector.log" target="_blank">collector.log</a>`);
+      links.push(fileLink("summary.json", `${API}/jobs/${id}/file/summary.json`, "summary.json"));
+      links.push(fileLink("log_findings.json", `${API}/jobs/${id}/file/log_findings.json`, "log_findings.json"));
+      links.push(fileLink("collector.log", `${API}/jobs/${id}/file/collector.log`, "collector.log"));
     }
     if (job.module === "misc") {
-      links.push(`<a href="${API}/jobs/${id}/file/findings.json" target="_blank">findings.json</a>`);
-      links.push(`<a href="${API}/jobs/${id}/file/analyze.log" target="_blank">analyze.log</a>`);
+      links.push(fileLink("findings.json", `${API}/jobs/${id}/file/findings.json`, "findings.json"));
+      links.push(fileLink("analyze.log", `${API}/jobs/${id}/file/analyze.log`, "analyze.log"));
     }
     links.push(`<a href="/terminal?job_id=${encodeURIComponent(id)}" target="_blank">⌨ open terminal</a>`);
     resultBlock = `<div class="file-links">${links.join(" ")}</div>`;
@@ -909,6 +916,148 @@ function escapeHtml(s) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
+
+// --- File preview modal -----------------------------------------------------
+// Pretty-prints JSON, renders Markdown, and syntax-highlights source code
+// using highlight.js + marked (loaded from CDN in index.html). Falls back
+// to plain text if the libraries didn't load (e.g. offline).
+
+const _LANG_FROM_EXT = {
+  py: "python", sage: "python",
+  js: "javascript", ts: "typescript",
+  json: "json", jsonl: "json",
+  md: "markdown", markdown: "markdown",
+  html: "xml", xml: "xml",
+  css: "css",
+  sh: "bash", bash: "bash",
+  c: "c", h: "c", cpp: "cpp", hpp: "cpp", cc: "cpp",
+  rb: "ruby", go: "go", rs: "rust",
+  yml: "yaml", yaml: "yaml",
+  sql: "sql",
+  log: "plaintext", stdout: "plaintext", stderr: "plaintext", txt: "plaintext",
+};
+
+function _languageFor(name) {
+  const ext = (name.split(".").pop() || "").toLowerCase();
+  return _LANG_FROM_EXT[ext] || "plaintext";
+}
+
+function _isMarkdown(name) {
+  const ext = (name.split(".").pop() || "").toLowerCase();
+  return ext === "md" || ext === "markdown";
+}
+
+function _isJson(name) {
+  const ext = (name.split(".").pop() || "").toLowerCase();
+  return ext === "json" || name === "result.json";
+}
+
+async function openFileModal(name, sourceUrl) {
+  const modal = document.getElementById("file-modal");
+  if (!modal) return;
+  const body = modal.querySelector(".file-modal-body");
+  const nameEl = modal.querySelector(".file-modal-name");
+  const metaEl = modal.querySelector(".file-modal-meta");
+  const rawLink = modal.querySelector(".file-modal-raw");
+  const copyBtn = modal.querySelector(".file-modal-copy");
+
+  nameEl.textContent = name;
+  metaEl.textContent = "loading…";
+  rawLink.href = sourceUrl;
+  body.innerHTML = "";
+  modal.hidden = false;
+  modal.dataset.url = sourceUrl;
+  modal.dataset.name = name;
+
+  let text;
+  try {
+    const res = await fetch(sourceUrl);
+    if (!res.ok) {
+      metaEl.textContent = `error ${res.status}`;
+      body.innerHTML = `<pre class="file-modal-error">${escapeHtml(await res.text())}</pre>`;
+      return;
+    }
+    text = await res.text();
+  } catch (e) {
+    metaEl.textContent = "fetch failed";
+    body.innerHTML = `<pre class="file-modal-error">${escapeHtml(String(e))}</pre>`;
+    return;
+  }
+  modal.dataset.raw = text;
+  metaEl.textContent = `${text.length.toLocaleString()} bytes`;
+
+  // Render based on extension.
+  if (_isJson(name)) {
+    let pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
+    const code = `<pre><code class="language-json">${escapeHtml(pretty)}</code></pre>`;
+    body.innerHTML = code;
+  } else if (_isMarkdown(name)) {
+    if (window.marked) {
+      const html = window.marked.parse(text, { mangle: false, headerIds: false });
+      body.innerHTML = `<div class="markdown-rendered">${html}</div>`;
+    } else {
+      body.innerHTML = `<pre><code class="language-markdown">${escapeHtml(text)}</code></pre>`;
+    }
+  } else {
+    const lang = _languageFor(name);
+    body.innerHTML = `<pre><code class="language-${lang}">${escapeHtml(text)}</code></pre>`;
+  }
+
+  // Highlight every code block (including those produced by marked).
+  if (window.hljs) {
+    body.querySelectorAll("pre code").forEach((el) => {
+      try { window.hljs.highlightElement(el); } catch (_) {}
+    });
+  }
+
+  // Wire one-shot Copy that pulls from the cached raw.
+  copyBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(modal.dataset.raw || "");
+      const orig = copyBtn.textContent;
+      copyBtn.textContent = "✓ Copied";
+      setTimeout(() => (copyBtn.textContent = orig), 1200);
+    } catch (e) {
+      alert("clipboard error: " + e);
+    }
+  };
+}
+
+function _closeFileModal() {
+  const modal = document.getElementById("file-modal");
+  if (!modal) return;
+  modal.hidden = true;
+  modal.dataset.url = "";
+  modal.dataset.name = "";
+  modal.dataset.raw = "";
+}
+
+// Single delegated click handler for all file-preview links + the modal's
+// own close/backdrop/Escape. Set up once at load.
+document.addEventListener("click", (e) => {
+  const link = e.target.closest("a.file-preview-link");
+  if (link) {
+    // Allow modifier-clicks (new tab / window / download) to fall through
+    // to the browser's normal link behavior.
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) {
+      return;
+    }
+    e.preventDefault();
+    openFileModal(link.dataset.name, link.dataset.url);
+    return;
+  }
+  if (e.target.closest(".file-modal-close, .file-modal-backdrop")) {
+    _closeFileModal();
+  }
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    const modal = document.getElementById("file-modal");
+    if (modal && !modal.hidden) _closeFileModal();
+  }
+});
 
 fillModelSelects();
 refreshJobs();
