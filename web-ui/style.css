@@ -496,3 +496,32 @@ button[type="submit"], #refresh-jobs {
 .markdown-rendered hr {
   border: 0; border-top: 1px solid #30363d; margin: 1rem 0;
 }
+
+/* Run log: colorize timestamp + label + body produced by colorizeRunLog().
+   The base <pre.run-log> already has font + scrolling from the global
+   <pre> rule; these classes only add semantic colors. */
+.run-log .rl-ts {
+  color: #6e7681;
+}
+.run-log .rl-system {
+  color: #8b949e; font-style: italic;
+}
+.run-log .rl-label {
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+.run-log .rl-toolname {
+  color: #ffa657; font-weight: 600;
+}
+.run-log .rl-tool         { color: #79c0ff; }   /* TOOL */
+.run-log .rl-tool-result  { color: #56d364; }   /* TOOL_RESULT */
+.run-log .rl-tool-error   { color: #ff7b72; }   /* TOOL_ERROR */
+.run-log .rl-agent        { color: #d2a8ff; }   /* AGENT */
+.run-log .rl-think        { color: #f5d062; }   /* THINK */
+.run-log .rl-done         { color: #a5d6ff; }   /* DONE */
+.run-log .rl-error,
+.run-log .rl-agent-error  { color: #ff7b72; }   /* AGENT_ERROR / ERROR */
+.run-log .rl-body         { color: #c9d1d9; }
+.run-log .rl-think-body   { color: #d4a72c; font-style: italic; }
+.run-log .rl-done-body    { color: #a5d6ff; }
+.run-log .rl-error-body   { color: #ffd5d3; }

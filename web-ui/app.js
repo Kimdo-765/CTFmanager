@@ -849,7 +849,7 @@ async function renderJob(id, opts = {}) {
     ${logFindingsBlock}
     ${resultBlock}
     <h4>Run log <small style="color:#8b949e;font-weight:normal">(auto-follows when scrolled to bottom)</small></h4>
-    <pre class="run-log" data-job-id="${id}">${escapeHtml(log) || "(empty)"}</pre>
+    <pre class="run-log" data-job-id="${id}">${log ? colorizeRunLog(log) : "(empty)"}</pre>
   `;
 
   const newPre = detail.querySelector("pre.run-log");
@@ -949,6 +949,68 @@ function escapeHtml(s) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+// --- Run-log colorizer ------------------------------------------------------
+// Lines look like: "[HH:MM:SS] LABEL[: body...]". Classify by LABEL and wrap
+// the timestamp + label + body in spans so the run.log <pre> can show
+// agent text, tool calls, tool results, thinking, and errors at a glance.
+
+const _RUNLOG_PATTERNS = [
+  // AGENT_ERROR (kind): body  — must come before plain ERROR
+  { re: /^(AGENT_ERROR)(\s*\([^)]*\))?\s*:\s*([\s\S]*)$/,
+    cls: "rl-agent-error",
+    render: (m) => `<span class="rl-label rl-agent-error">${escapeHtml(m[1])}${escapeHtml(m[2] || "")}</span>: <span class="rl-body rl-error-body">${escapeHtml(m[3])}</span>` },
+  // TOOL_RESULT: body
+  { re: /^(TOOL_RESULT)\s*:\s*([\s\S]*)$/,
+    render: (m) => `<span class="rl-label rl-tool-result">${escapeHtml(m[1])}</span>: <span class="rl-body">${escapeHtml(m[2])}</span>` },
+  // TOOL_ERROR: body
+  { re: /^(TOOL_ERROR)\s*:\s*([\s\S]*)$/,
+    render: (m) => `<span class="rl-label rl-tool-error">${escapeHtml(m[1])}</span>: <span class="rl-body rl-error-body">${escapeHtml(m[2])}</span>` },
+  // TOOL <name>: body
+  { re: /^(TOOL)\s+(\S+)\s*:\s*([\s\S]*)$/,
+    render: (m) => `<span class="rl-label rl-tool">${escapeHtml(m[1])}</span> <span class="rl-toolname">${escapeHtml(m[2])}</span>: <span class="rl-body">${escapeHtml(m[3])}</span>` },
+  // AGENT: body
+  { re: /^(AGENT)\s*:\s*([\s\S]*)$/,
+    render: (m) => `<span class="rl-label rl-agent">${escapeHtml(m[1])}</span>: <span class="rl-body">${escapeHtml(m[2])}</span>` },
+  // THINK: body
+  { re: /^(THINK)\s*:\s*([\s\S]*)$/,
+    render: (m) => `<span class="rl-label rl-think">${escapeHtml(m[1])}</span>: <span class="rl-body rl-think-body">${escapeHtml(m[2])}</span>` },
+  // DONE: body
+  { re: /^(DONE)\s*:\s*([\s\S]*)$/,
+    render: (m) => `<span class="rl-label rl-done">${escapeHtml(m[1])}</span>: <span class="rl-body rl-done-body">${escapeHtml(m[2])}</span>` },
+  // ERROR: body  (catastrophic — exception in run_job etc.)
+  { re: /^(ERROR)\s*:\s*([\s\S]*)$/,
+    render: (m) => `<span class="rl-label rl-error">${escapeHtml(m[1])}</span>: <span class="rl-body rl-error-body">${escapeHtml(m[2])}</span>` },
+];
+
+function _colorizeRunLogLine(line) {
+  // Header injected by /api/jobs/{id}/log?tail=… (e.g. "…(showing last X
+  // of Y bytes — download full log via …)…"). Render dim+italic.
+  if (line.startsWith("…(showing last")) {
+    return `<span class="rl-system">${escapeHtml(line)}</span>`;
+  }
+  const m = line.match(/^\[(\d{2}:\d{2}:\d{2})\]\s+([\s\S]*)$/);
+  if (!m) {
+    if (!line) return "";
+    return `<span class="rl-system">${escapeHtml(line)}</span>`;
+  }
+  const ts = m[1];
+  const rest = m[2];
+  for (const p of _RUNLOG_PATTERNS) {
+    const mm = rest.match(p.re);
+    if (mm) {
+      return `<span class="rl-ts">[${ts}]</span> ${p.render(mm)}`;
+    }
+  }
+  // System / unrecognised lines (e.g. "Launching Claude agent…",
+  // "User chose CONTINUE…", "⏰ Soft timeout reached…").
+  return `<span class="rl-ts">[${ts}]</span> <span class="rl-system">${escapeHtml(rest)}</span>`;
+}
+
+function colorizeRunLog(text) {
+  if (!text) return "";
+  return text.split("\n").map(_colorizeRunLogLine).join("\n");
 }
 
 // --- File preview modal -----------------------------------------------------
