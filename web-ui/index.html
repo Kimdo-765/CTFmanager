@@ -92,11 +92,12 @@
     </section>
 
     <section id="panel-forensic" class="panel">
-      <h2>Forensic — Disk / Memory Image Triage</h2>
+      <h2>Forensic — Disk / Memory Image Triage · Log analysis</h2>
       <form id="forensic-form">
         <label>
-          Image file (raw / qcow2 / vmdk for disk · raw for memory)
+          Image / log file
           <input type="file" name="file" required />
+          <small style="color:#8b949e">disk image (raw/qcow2/vmdk/...) · memory dump · or a single log / .gz / .zip / .tar.gz of logs</small>
         </label>
         <label>
           Image type
@@ -109,6 +110,7 @@
             <option value="vhdx">vhdx</option>
             <option value="e01">e01 (encase)</option>
             <option value="memory">memory dump</option>
+            <option value="log">log file (text / .gz / .zip / .tar.gz)</option>
           </select>
         </label>
         <label>

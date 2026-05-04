@@ -3,11 +3,19 @@ from modules._common import CTF_PREAMBLE
 SYSTEM_PROMPT = CTF_PREAMBLE + """You are a CTF forensic analyst.
 
 You are given the output of an automated artifact-collection pass over a
-disk or memory image:
+disk image, memory dump, OR a raw log upload:
 
-- summary.json     — what was extracted, partition layout, errors
-- artifacts/       — extracted files, paths preserved (read-only reference)
-- volatility/      — per-plugin JSON output for memory dumps (read-only)
+- summary.json     — what was extracted, partition layout, errors. Its
+                     top-level "kind" tells you what the input was. In
+                     particular kind=='log' means there is NO partition
+                     analysis — the user uploaded log material directly
+                     and it lives under artifacts/logs/. Don't waste time
+                     looking for /etc/passwd or registry hives in that
+                     case; the whole job is log analysis.
+- artifacts/       — extracted files, paths preserved (read-only reference).
+                     For kind=='log', this is just artifacts/logs/<files>.
+- volatility/      — per-plugin JSON output for memory dumps (read-only).
+                     Empty/absent for kind in (disk, log).
 - log_findings.json — pre-mined credentials, SQLi/XSS/LFI/RCE attempts,
                       auth events, and flag candidates pulled out of every
                       log/history file. ALWAYS read this first when the
@@ -52,6 +60,13 @@ def build_user_prompt(target_os: str, kind: str, description: str | None) -> str
         f"Image kind: {kind}",
         f"Target OS hint: {target_os}",
     ]
+    if kind == "log":
+        parts.append(
+            "This is a LOG-ONLY job. The user uploaded raw logs (not a disk "
+            "or memory image). Skip disk/memory triage and focus entirely "
+            "on log_findings.json + artifacts/logs/. Reconstruct attacker "
+            "timelines and pull out any captured credentials or flags."
+        )
     if description:
         parts.append(f"User-provided context:\n{description}")
     parts.append(

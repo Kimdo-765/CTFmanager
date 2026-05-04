@@ -227,9 +227,17 @@ CTFmanager/
 - Per-job timeline: ~2–3 min decompile + Claude analysis time.
 
 ### Forensic
-- Auto-detects qcow2 / vmdk / vhd / vhdx / e01 / raw / memory.
+- Auto-detects qcow2 / vmdk / vhd / vhdx / e01 / raw / memory / **log**.
 - E01 is converted to raw via `ewfexport`; vmdk/qcow2/vhd via `qemu-img`.
 - Memory dumps run a curated Volatility 3 plugin set per detected OS.
+- **Image type `log`** is a fast path for raw log uploads: skip
+  disk/memory analysis and run only the log-mining stage. Accepts a
+  single text file (`.log`, `.txt`, …), a `.gz` of one, or any
+  `.zip` / `.tar` / `.tar.gz` / `.tgz` of logs. The archive is unpacked
+  into `artifacts/logs/` and `log_miner` mines every text file
+  underneath (`force=True` — name hints are ignored). Auto-detect picks
+  this kind for plain `.log/.txt/.csv/.json/...` uploads or anything
+  the `file(1)` command labels as ASCII/UTF-8 text.
 - After artifacts are extracted, `log_miner` scans every log/history file
   (Apache/Nginx access + error logs, `auth.log`, `syslog`, `bash_history`,
   PowerShell `ConsoleHost_history.txt`, Volatility `linux.bash` output, …)

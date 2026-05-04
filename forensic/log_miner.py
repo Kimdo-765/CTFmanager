@@ -283,9 +283,14 @@ def scan_logs(
     roots: list[Path],
     out_file: Path,
     log_fn: Callable[[str], None] | None = None,
+    force: bool = False,
 ) -> dict:
     """Walk each root, mine every log-shaped file underneath, and write a
     consolidated `log_findings.json` to `out_file`. Returns the same dict.
+
+    `force=True` skips the filename-hint gate and scans every file under
+    the roots — use it when the user explicitly uploaded log material so
+    we don't miss files with non-canonical names.
     """
     L = log_fn or (lambda _msg: None)
 
@@ -309,7 +314,7 @@ def scan_logs(
             if not p.is_file() or p in seen:
                 continue
             seen.add(p)
-            if not _looks_minable(p):
+            if not force and not _looks_minable(p):
                 continue
             try:
                 _scan_one_file(p, root, findings)
