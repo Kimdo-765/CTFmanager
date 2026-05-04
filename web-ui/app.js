@@ -583,7 +583,7 @@ async function selectJob(id) {
   document.querySelectorAll("#jobs-list li").forEach((li) => {
     li.classList.toggle("selected", li.dataset.id === id);
   });
-  await renderJob(id);
+  await renderJob(id, { force: true });
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
     const job = await renderJob(id);
@@ -596,8 +596,18 @@ async function selectJob(id) {
   }, 2000);
 }
 
-async function renderJob(id) {
+async function renderJob(id, opts = {}) {
   const detail = document.getElementById("job-detail");
+  // If the user is actively typing in an inline form (manual retry hint
+  // or stop-and-resume hint), the 2-second polling re-render would blow
+  // it away mid-keystroke. Skip this poll cycle. selectJob() passes
+  // {force:true} so explicit job switches still re-render.
+  if (
+    !opts.force
+    && detail.querySelector(".retry-manual-form, .stop-resume-form")
+  ) {
+    return null;
+  }
   const res = await fetch(`${API}/jobs/${id}`);
   if (!res.ok) {
     detail.textContent = "job not found";
@@ -868,7 +878,7 @@ async function renderJob(id) {
       } finally {
         runBtn.disabled = false;
         runBtn.textContent = origText;
-        await renderJob(id);
+        await renderJob(id, { force: true });
         await refreshJobs();
       }
     });
