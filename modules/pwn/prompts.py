@@ -144,15 +144,18 @@ def build_user_prompt(
             "loop, stop. Tight per-stage timeouts make a per-turn approach "
             "impossible."
         )
-    if binary_name:
-        parts.append(
-            "Begin with file/checksec/strings on the binary. Decompile with "
-            f"`ghiant ./bin/{binary_name}` ONLY if the disasm is too dense to follow."
-        )
-    else:
-        parts.append(
-            "Begin by connecting to the target and observing the protocol. "
-            "Try sending various probes (long strings, `%p %p %p`, format "
-            "specifiers, common menu inputs) and study responses."
-        )
+    if not retry_hint:
+        # Fresh-start orientation only — the forked retry/resume session
+        # already knows the binary layout.
+        if binary_name:
+            parts.append(
+                "Begin with file/checksec/strings on the binary. Decompile with "
+                f"`ghiant ./bin/{binary_name}` ONLY if the disasm is too dense to follow."
+            )
+        else:
+            parts.append(
+                "Begin by connecting to the target and observing the protocol. "
+                "Try sending various probes (long strings, `%p %p %p`, format "
+                "specifiers, common menu inputs) and study responses."
+            )
     return "\n\n".join(parts)

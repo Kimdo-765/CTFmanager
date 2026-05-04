@@ -640,36 +640,45 @@ def _halt_source_job(safe: str, prev_meta: dict) -> dict:
 
 
 def _retry_preamble(prev_id: str, hint: str) -> str:
-    """Prepend a context note for the standard retry path (failed /
-    no_flag / finished). Like resume, retry now copies the prior agent's
-    work/ directory across so the new attempt can read what was tried
-    and what didn't work — but unlike resume the next agent is told to
-    treat the artifacts as REFERENCE and approach the problem fresh
-    with the (reviewer- or hand-written) hint.
+    """Preamble for the standard retry path (failed / no_flag /
+    finished). The new agent is launched with `resume=<prev_session>` +
+    `fork_session=True`, so its conversation already holds the prior
+    reasoning, thinking, and tool history; ./work/ has been carried
+    over so any path the prior agent wrote still resolves.
+
+    The text is intentionally short — most signal already lives in the
+    forked conversation. The fallback line covers the rare case where
+    SDK couldn't locate the prior transcript and the agent boots
+    fresh: in that case ./work/ is still the right place to catch up.
     """
     return (
-        f"[retry of job {prev_id}]\n"
-        f"The previous attempt's working directory has been carried "
-        f"over as ./work/ — it contains the partial exploit.py / "
-        f"solver.py / report.md / scratch from the failed run. Use "
-        f"them to understand what was tried and where it broke, then "
-        f"approach the problem with this guidance:\n\n{hint}"
+        f"[retry of job {prev_id} — same Claude session, forked]\n"
+        f"You should already have the prior conversation in context "
+        f"(reasoning, tool calls, and what didn't work). The previous "
+        f"./work/ tree has been carried over so file paths still "
+        f"resolve. Treat the hint below as the priority direction "
+        f"and continue toward the flag — do not re-list the source "
+        f"tree or re-read files you already inspected. Fallback: if "
+        f"you don't see the prior context for any reason, `ls ./work/` "
+        f"first to catch up before applying the hint.\n\n"
+        f"{hint}"
     )
 
 
 def _resume_preamble(prev_id: str, hint: str) -> str:
-    """Prepend the standard [RESUMING] preamble to whatever hint the
-    next agent gets — applied uniformly across the manual and reviewer
-    resume paths so both share the "read ./work/ first" instruction.
+    """Preamble for stop-and-resume. Same fork semantics as retry, but
+    the prior session was halted MID-RUN by the user — so the agent
+    should treat the work as in-flight ("pick up where you left off")
+    rather than as a finished failure to revisit.
     """
     return (
-        f"[RESUMING from job {prev_id}]\n"
-        f"The previous agent's working directory has been preserved as "
-        f"./work/. Before doing anything else, list ./work/ and read any "
-        f"files it contains (partial exploit.py / solver.py / report.md / "
-        f"notes). They show how far the prior attempt got. Continue from "
-        f"there — do not re-do work that's already done — and apply the "
-        f"following hint:\n\n"
+        f"[resume of job {prev_id} — interrupted, same session forked]\n"
+        f"Your prior session was halted mid-run. You should still have "
+        f"all your reasoning + tool history in context, and ./work/ "
+        f"has been carried over with whatever files you'd already "
+        f"written. Continue from where you left off and apply the new "
+        f"guidance below — do not restart the analysis. Fallback: if "
+        f"you don't see prior context, `ls ./work/` first to catch up.\n\n"
         f"{hint}"
     )
 

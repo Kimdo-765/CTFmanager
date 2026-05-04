@@ -39,5 +39,6 @@ def build_user_prompt(filename: str, description: str | None) -> str:
     parts.append("Working directory contents: findings.json, extracted/, analyze.log")
     if base_desc:
         parts.append(f"User-provided context:\n{base_desc}")
-    parts.append("Begin by reading findings.json.")
+    if not retry_hint:
+        parts.append("Begin by reading findings.json.")
     return "\n\n".join(parts)

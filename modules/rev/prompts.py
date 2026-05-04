@@ -76,9 +76,10 @@ def build_user_prompt(
         f"auto_run_after_you_finish={'true' if auto_run else 'false'} "
         "(handled by orchestrator — do not run solver.py yourself)."
     )
-    parts.append(
-        "Begin with file/strings/objdump on the binary. Decompile with "
-        "`ghiant ./bin/" + binary_name + "` ONLY if the disasm alone is "
-        "too dense to follow."
-    )
+    if not retry_hint:
+        parts.append(
+            "Begin with file/strings/objdump on the binary. Decompile with "
+            "`ghiant ./bin/" + binary_name + "` ONLY if the disasm alone is "
+            "too dense to follow."
+        )
     return "\n\n".join(parts)

@@ -117,12 +117,16 @@ def build_user_prompt(
         "(handled by the orchestrator outside your context — do not run "
         "exploit.py yourself)."
     )
-    if src_root:
-        parts.append("Begin by listing the source tree, then read the entry-point files first.")
-    else:
-        parts.append(
-            "Begin by probing the target — `curl -i <url>`, look at headers, "
-            "error pages, common paths (/robots.txt, /admin, /api). Then form "
-            "a hypothesis and craft the exploit."
-        )
+    if not retry_hint:
+        # Fresh-start orientation. On retry/resume the forked session
+        # already knows the layout — repeating "begin by listing…"
+        # just wastes turns and tokens.
+        if src_root:
+            parts.append("Begin by listing the source tree, then read the entry-point files first.")
+        else:
+            parts.append(
+                "Begin by probing the target — `curl -i <url>`, look at headers, "
+                "error pages, common paths (/robots.txt, /admin, /api). Then form "
+                "a hypothesis and craft the exploit."
+            )
     return "\n\n".join(parts)

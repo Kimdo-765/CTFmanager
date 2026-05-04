@@ -74,8 +74,9 @@ def build_user_prompt(target_os: str, kind: str, description: str | None) -> str
         )
     if base_desc:
         parts.append(f"User-provided context:\n{base_desc}")
-    parts.append(
-        "Begin by reading summary.json, then log_findings.json (cheap, "
-        "pre-mined), then list artifacts/."
-    )
+    if not retry_hint:
+        parts.append(
+            "Begin by reading summary.json, then log_findings.json (cheap, "
+            "pre-mined), then list artifacts/."
+        )
     return "\n\n".join(parts)

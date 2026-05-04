@@ -78,12 +78,13 @@ def build_user_prompt(
         f"auto_run_after_you_finish={'true' if auto_run else 'false'} "
         "(handled by the orchestrator — do not run solver.py yourself)."
     )
-    if src_root:
-        parts.append("Begin by listing the source tree and reading every .py / .txt / .pem file.")
-    else:
-        parts.append(
-            "Begin by connecting to the target. Send neutral test inputs "
-            "(short / long, all-zero, ASCII, hex) and study responses to "
-            "identify the cryptosystem."
-        )
+    if not retry_hint:
+        if src_root:
+            parts.append("Begin by listing the source tree and reading every .py / .txt / .pem file.")
+        else:
+            parts.append(
+                "Begin by connecting to the target. Send neutral test inputs "
+                "(short / long, all-zero, ASCII, hex) and study responses to "
+                "identify the cryptosystem."
+            )
     return "\n\n".join(parts)
