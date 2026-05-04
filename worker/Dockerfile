@@ -6,6 +6,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl git ca-certificates gnupg lsb-release \
     file binutils \
     libgmp-dev libmpfr-dev libmpc-dev \
+    # Archive tools the agent often calls from Bash (zips inside source
+    # uploads, nested archives, prebuilt CTF distributions, etc.). The
+    # Python zipfile fallback in api/storage.py only handles the initial
+    # upload — anything the agent unpacks itself needs the CLI.
+    unzip zip p7zip-full xz-utils bzip2 tar \
+    # Light editing / inspection helpers commonly used by the agent.
+    less jq xxd \
  && rm -rf /var/lib/apt/lists/*
 
 # Node.js (required by claude-agent-sdk to run the bundled `claude` CLI)
