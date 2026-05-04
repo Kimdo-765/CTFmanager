@@ -80,6 +80,144 @@ textarea, select {
 .retry-btn:hover { background: #8957e5; }
 .retry-btn:disabled { background: #21262d; color: #6e7681; cursor: wait; }
 
+.retry-panel {
+  background: #161b22;
+  border: 1px solid #6e3eaa;
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  margin: 0.5rem 0;
+  font-size: 0.85rem;
+}
+.retry-panel h4 {
+  margin: 0 0 0.3rem 0;
+  color: #b083f0; font-size: 0.8rem;
+  letter-spacing: 0.5px; text-transform: uppercase;
+}
+.retry-panel .stage {
+  font-size: 0.75rem; color: #8b949e; margin-bottom: 0.4rem;
+}
+.retry-panel .stage .dot {
+  display: inline-block; width: 0.5rem; height: 0.5rem;
+  border-radius: 50%; background: #b083f0; margin-right: 0.3rem;
+  animation: blink 1s ease-in-out infinite;
+}
+@keyframes blink {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+.retry-panel pre {
+  background: #0d1117; border-radius: 4px; padding: 0.5rem;
+  margin: 0; font-size: 0.78rem; max-height: 220px;
+  overflow-y: auto; white-space: pre-wrap; color: #c9d1d9;
+}
+.retry-panel.retry-panel-error {
+  border-color: #f85149;
+  background: #2a0e0e;
+}
+.retry-panel.retry-panel-error h4 { color: #ff7b72; }
+.retry-panel.retry-panel-error .stage-text { color: #ffd5d3; }
+.retry-panel.retry-panel-error pre {
+  background: #1a0707;
+  border: 1px solid #f8514955;
+  color: #ffd5d3;
+}
+
+/* Job description block (above the retry/run buttons) */
+.description-block {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 0.5rem 0.75rem;
+  margin: 0.5rem 0;
+}
+.description-block summary {
+  cursor: pointer; font-size: 0.75rem;
+  color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px;
+  user-select: none;
+}
+.description-block summary:hover { color: #c9d1d9; }
+.description-retry-chip {
+  display: inline-block; background: #6e3eaa33; color: #b083f0;
+  border: 1px solid #6e3eaa; border-radius: 999px;
+  padding: 0 0.4rem; font-size: 0.65rem;
+  margin-left: 0.25rem; letter-spacing: 0.3px;
+}
+.description-text {
+  background: #0d1117; border: 1px solid #21262d;
+  border-radius: 4px; padding: 0.5rem;
+  margin: 0.4rem 0 0 0;
+  font-size: 0.82rem; color: #c9d1d9;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 240px; overflow-y: auto;
+  font-family: inherit;
+}
+.description-hint {
+  margin-top: 0.4rem;
+  border: 1px solid #6e3eaa; border-radius: 4px;
+  padding: 0.4rem 0.5rem; background: #1a1226;
+}
+.description-hint-label {
+  font-size: 0.68rem; color: #b083f0;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.description-hint .description-text {
+  background: transparent; border: 0; padding: 0.2rem 0 0 0;
+  color: #e6dffa; max-height: 200px;
+}
+
+/* Manual-hint inline form (opens when "✏ Retry with my hint" is clicked) */
+.retry-manual-form {
+  background: #0d1117;
+  border: 1px solid #6e3eaa;
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  margin: 0.5rem 0;
+  display: flex; flex-direction: column; gap: 0.45rem;
+}
+.retry-manual-label {
+  font-size: 0.75rem; color: #b083f0;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.retry-manual-form textarea {
+  width: 100%; box-sizing: border-box;
+  background: #161b22; color: #e6edf3;
+  border: 1px solid #30363d; border-radius: 6px;
+  padding: 0.5rem; font-family: inherit; font-size: 0.85rem;
+  resize: vertical; min-height: 5.5rem;
+}
+.retry-manual-form textarea:focus {
+  outline: none; border-color: #8957e5;
+}
+.retry-manual-form textarea.invalid {
+  border-color: #da3633; animation: shake 0.3s ease-in-out;
+}
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-3px); }
+  75% { transform: translateX(3px); }
+}
+.retry-manual-row {
+  display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+}
+.retry-manual-row small { color: #8b949e; font-size: 0.72rem; }
+.retry-manual-row code {
+  background: #161b22; padding: 0.05rem 0.3rem;
+  border-radius: 3px; font-size: 0.7rem;
+}
+.retry-manual-submit {
+  background: #6e3eaa; color: white; border: 0;
+  padding: 0.35rem 0.85rem; border-radius: 6px; cursor: pointer;
+  font-size: 0.82rem;
+}
+.retry-manual-submit:hover { background: #8957e5; }
+.retry-manual-submit:disabled { background: #21262d; color: #6e7681; cursor: wait; }
+.retry-manual-cancel {
+  background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+  padding: 0.35rem 0.75rem; border-radius: 6px; cursor: pointer;
+  font-size: 0.82rem;
+}
+.retry-manual-cancel:hover { background: #30363d; }
+
 .flag-banner {
   background: #1c2f1c;
   border: 1px solid #238636;

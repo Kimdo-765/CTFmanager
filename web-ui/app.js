@@ -251,6 +251,207 @@ async function deleteJob(id, ev) {
   refreshStats();
 }
 
+async function streamRetry(jobId, btn, manualHint = null) {
+  // Disable every retry button on the detail panel — only one path runs.
+  const allRetryBtns = document.querySelectorAll(
+    `#job-detail .retry-btn, #job-detail .retry-manual-submit`,
+  );
+  allRetryBtns.forEach((b) => (b.disabled = true));
+  const origText = btn.textContent;
+  btn.textContent = "⏳ retrying…";
+  const isManual = typeof manualHint === "string" && manualHint.length > 0;
+
+  // Stop the regular polling so it doesn't fight our progress panel
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+
+  // Tear down any in-flight manual-hint form so it doesn't linger.
+  const manualForm = document.getElementById("retry-manual-form-" + jobId);
+  if (manualForm) manualForm.remove();
+
+  // Insert a live progress panel right above the run-log heading
+  const detail = document.getElementById("job-detail");
+  const panel = document.createElement("div");
+  panel.className = "retry-panel";
+  panel.id = "retry-panel-" + jobId;
+  panel.innerHTML = `
+    <h4>${isManual ? "✏ Retry — your hint" : "↻ Retry — reviewer in progress"}</h4>
+    <div class="stage"><span class="dot"></span><span class="stage-text">${isManual ? "submitting…" : "starting…"}</span></div>
+    <pre class="hint-stream"></pre>
+  `;
+  // Place panel before the runBlock area (just under the meta line)
+  const flagBanner = detail.querySelector(".flag-banner");
+  const refNode = flagBanner || detail.querySelector(".file-links") || detail.querySelector("h4");
+  if (refNode) refNode.parentNode.insertBefore(panel, refNode);
+  else detail.appendChild(panel);
+
+  const stageEl = panel.querySelector(".stage-text");
+  const streamEl = panel.querySelector(".hint-stream");
+  // Manual hint: show it immediately. Reviewer hint: wait for the first token.
+  let firstToken = !isManual;
+  if (isManual) streamEl.textContent = manualHint;
+  else streamEl.textContent = "(awaiting reviewer output…)";
+
+  // EventSource only supports GET. Use fetch + ReadableStream to POST + stream.
+  const fetchOpts = { method: "POST" };
+  if (isManual) {
+    fetchOpts.headers = { "Content-Type": "application/json" };
+    fetchOpts.body = JSON.stringify({ hint: manualHint });
+  }
+
+  let resp;
+  try {
+    resp = await fetch(`${API}/jobs/${jobId}/retry/stream`, fetchOpts);
+  } catch (e) {
+    streamEl.textContent = "[err] " + e;
+    allRetryBtns.forEach((b) => (b.disabled = false));
+    btn.textContent = origText;
+    return;
+  }
+  if (!resp.ok) {
+    const body = await resp.text();
+    streamEl.textContent = `[err] ${resp.status}: ${body}`;
+    allRetryBtns.forEach((b) => (b.disabled = false));
+    btn.textContent = origText;
+    return;
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+
+  function handleEvent(name, dataStr) {
+    let data = {};
+    try { data = JSON.parse(dataStr); } catch (_) {}
+    if (name === "stage") {
+      const s = data.name;
+      stageEl.textContent = ({
+        gathering: "gathering prior job context…",
+        asking: "asking reviewer (Opus 4.7)…",
+        submitting: isManual ? "enqueueing new job with your hint…" : "enqueueing new job…",
+      })[s] || s;
+    } else if (name === "token") {
+      if (firstToken) { streamEl.textContent = ""; firstToken = false; }
+      streamEl.textContent += data.delta || "";
+      streamEl.scrollTop = streamEl.scrollHeight;
+    } else if (name === "done") {
+      panel.querySelector(".dot").style.animation = "none";
+      panel.querySelector(".dot").style.background = "#56d364";
+      stageEl.textContent = `submitted new job ${data.new_job_id}`;
+      // Switch to the new job after a beat so user can read the hint
+      allRetryBtns.forEach((b) => (b.disabled = false));
+      btn.textContent = origText;
+      setTimeout(async () => {
+        await refreshJobs();
+        await selectJob(data.new_job_id);
+      }, 800);
+    } else if (name === "error") {
+      const dot = panel.querySelector(".dot");
+      dot.style.background = "#f85149";
+      dot.style.animation = "none";
+      panel.classList.add("retry-panel-error");
+      const headerEl = panel.querySelector("h4");
+      if (headerEl) headerEl.textContent = isManual
+        ? "✏ Retry — error (no new job created)"
+        : "↻ Retry — error (no new job created)";
+      const kind = data.kind || "error";
+      const kindLabel = ({
+        api_error: "API error",
+        auth: "auth error",
+        rate_limit: "rate limit",
+        policy_refusal: "usage-policy refusal",
+        timeout: "timeout",
+        empty: "empty response",
+        no_context: "no prior context",
+        gather: "context gather failed",
+        submit: "submit rejected",
+        unknown: "unknown error",
+      })[kind] || kind;
+      stageEl.textContent = `${kindLabel} — retry aborted`;
+      const errMsg = (data.message || "unknown error").trim();
+      // If the reviewer streamed partial text before erroring, keep it as
+      // forensic context above the error block. Otherwise just show error.
+      if (firstToken) {
+        streamEl.textContent = errMsg;
+      } else {
+        streamEl.textContent += `\n\n--- ${kindLabel} ---\n${errMsg}`;
+      }
+      streamEl.scrollTop = streamEl.scrollHeight;
+      allRetryBtns.forEach((b) => (b.disabled = false));
+      btn.textContent = origText;
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    // SSE frames are separated by blank lines
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      let evName = "message";
+      let dataLines = [];
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) evName = line.slice(7).trim();
+        else if (line.startsWith("data: ")) dataLines.push(line.slice(6));
+      }
+      if (dataLines.length) handleEvent(evName, dataLines.join("\n"));
+    }
+  }
+}
+
+function openManualHintForm(jobId, anchorBtn) {
+  // If a form is already open for this job, just refocus it.
+  const existing = document.getElementById("retry-manual-form-" + jobId);
+  if (existing) {
+    existing.querySelector("textarea")?.focus();
+    return;
+  }
+  const form = document.createElement("div");
+  form.className = "retry-manual-form";
+  form.id = "retry-manual-form-" + jobId;
+  form.innerHTML = `
+    <label class="retry-manual-label">Your hint for the next agent</label>
+    <textarea rows="5" placeholder="e.g. The bot visits /report?id= and the cookie is on .site.com — exfiltrate via document.cookie to \$COLLECTOR_URL. Or: the heap leak comes from the formatted error on /api/echo, not /api/profile."></textarea>
+    <div class="retry-manual-row">
+      <button type="button" class="retry-manual-submit">Submit hint &amp; retry</button>
+      <button type="button" class="retry-manual-cancel">Cancel</button>
+      <small>Skips reviewer · appended to new job's description as <code>[retry-hint]</code></small>
+    </div>
+  `;
+  // Place the form right after the button row.
+  const buttonRow = anchorBtn.parentElement;
+  buttonRow.insertAdjacentElement("afterend", form);
+
+  const ta = form.querySelector("textarea");
+  const submit = form.querySelector(".retry-manual-submit");
+  const cancel = form.querySelector(".retry-manual-cancel");
+  ta.focus();
+
+  cancel.addEventListener("click", () => form.remove());
+  submit.addEventListener("click", () => {
+    const hint = ta.value.trim();
+    if (!hint) {
+      ta.focus();
+      ta.classList.add("invalid");
+      setTimeout(() => ta.classList.remove("invalid"), 600);
+      return;
+    }
+    streamRetry(jobId, submit, hint);
+  });
+  // Ctrl/Cmd+Enter shortcut
+  ta.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      submit.click();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      form.remove();
+    }
+  });
+}
+
 async function refreshJobs() {
   const res = await fetch(`${API}/jobs`);
   const data = await res.json();
@@ -346,6 +547,34 @@ async function renderJob(id) {
   const timeout = job.job_timeout ? ` · timeout: ${job.job_timeout}s` : "";
   const modelInfo = job.model ? ` · model: ${escapeHtml(job.model)}` : "";
 
+  // Description block: render the original description and any appended
+  // `[retry-hint]` segment in a separate, color-coded chip so the user can
+  // see at a glance which run is a retry and what hint was used.
+  let descBlock = "";
+  const rawDesc = (job.description || "").trim();
+  if (rawDesc) {
+    const marker = "[retry-hint]";
+    const idx = rawDesc.indexOf(marker);
+    let baseHtml = "";
+    let hintHtml = "";
+    if (idx === -1) {
+      baseHtml = `<pre class="description-text">${escapeHtml(rawDesc)}</pre>`;
+    } else {
+      const base = rawDesc.slice(0, idx).trim();
+      const hint = rawDesc.slice(idx + marker.length).trim();
+      if (base) baseHtml = `<pre class="description-text">${escapeHtml(base)}</pre>`;
+      if (hint) hintHtml = `
+        <div class="description-hint">
+          <span class="description-hint-label">retry hint</span>
+          <pre class="description-text">${escapeHtml(hint)}</pre>
+        </div>`;
+    }
+    descBlock = `<details class="description-block" open>
+      <summary>Description${idx !== -1 ? " <span class=\"description-retry-chip\">retry</span>" : ""}</summary>
+      ${baseHtml}${hintHtml}
+    </details>`;
+  }
+
   // Run-now button: show whenever the job dir actually contains a runnable
   // script (exploit.py / solver.py / solver.sage). Don't gate on status —
   // even 'failed' jobs sometimes have a usable partial script.
@@ -362,10 +591,11 @@ async function renderJob(id) {
       ? `<button class="run-now-btn" data-action="run">▶ Run ${escapeHtml(scriptName)} in sandbox</button>`
       : "";
     const retryHtml = showRetry
-      ? `<button class="retry-btn" data-action="retry">↻ Retry with hint (new job)</button>` : "";
-    runBlock = `<div style="margin:0.5rem 0">
+      ? `<button class="retry-btn" data-action="retry">↻ Retry with reviewer hint</button>
+         <button class="retry-btn retry-manual-open-btn" data-action="retry-manual">✏ Retry with my hint</button>` : "";
+    runBlock = `<div class="retry-row" style="margin:0.5rem 0">
       ${runHtml} ${retryHtml}
-      <small style="color:#8b949e">${runHtml ? "re-runs the produced script · " : ""}retry asks the latest Claude to diagnose what went wrong, append a hint to the description, and submit a fresh job</small>
+      <small style="color:#8b949e">${runHtml ? "re-runs the produced script · " : ""}reviewer hint = Claude diagnoses the failure · my hint = you write the hint yourself</small>
     </div>`;
   }
 
@@ -403,6 +633,7 @@ async function renderJob(id) {
       <span class="status ${job.status}">${job.status}</span>
     </h3>
     <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}${modelInfo}</small></div>
+    ${descBlock}
     ${runBlock}
     ${errorBlock}
     ${flagBlock}
@@ -422,27 +653,11 @@ async function renderJob(id) {
 
   const retryBtn = detail.querySelector('.retry-btn[data-action="retry"]');
   if (retryBtn) {
-    retryBtn.addEventListener("click", async () => {
-      retryBtn.disabled = true;
-      const orig = retryBtn.textContent;
-      retryBtn.textContent = "⏳ asking reviewer…";
-      try {
-        const res = await fetch(`${API}/jobs/${id}/retry`, { method: "POST" });
-        const body = await res.json();
-        if (!res.ok) {
-          alert(`retry failed: ${res.status} ${body.detail || JSON.stringify(body)}`);
-          return;
-        }
-        alert(`New job ${body.new_job_id}\n\nHint:\n${body.hint}`);
-        await refreshJobs();
-        await selectJob(body.new_job_id);
-      } catch (e) {
-        alert(`retry error: ${e}`);
-      } finally {
-        retryBtn.disabled = false;
-        retryBtn.textContent = orig;
-      }
-    });
+    retryBtn.addEventListener("click", () => streamRetry(id, retryBtn));
+  }
+  const retryManualBtn = detail.querySelector('.retry-btn[data-action="retry-manual"]');
+  if (retryManualBtn) {
+    retryManualBtn.addEventListener("click", () => openManualHintForm(id, retryManualBtn));
   }
 
   const runBtn = detail.querySelector('.run-now-btn[data-action="run"]');

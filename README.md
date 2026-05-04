@@ -174,6 +174,9 @@ upload ──► /data/jobs/<id>/         ─► RQ enqueue
 | POST | `/api/modules/misc/analyze` | upload file → enqueue |
 | POST | `/api/modules/crypto/analyze` | upload zip → enqueue |
 | POST | `/api/modules/rev/analyze` | upload binary → enqueue |
+| POST | `/api/jobs/{id}/run` | re-run produced exploit/solver in a fresh sandbox |
+| POST | `/api/jobs/{id}/retry` | regenerate the job with a hint (body: `{"hint":"…"}` for manual hint, empty body = auto reviewer) |
+| POST | `/api/jobs/{id}/retry/stream` | same as `/retry` but returns Server-Sent Events with reviewer progress |
 
 ## File layout
 
@@ -255,6 +258,26 @@ docker compose build api          # rebuild after code changes in api/
 # Wipe all jobs (UI also has a Bulk Delete button)
 curl -X DELETE 'http://localhost:8000/api/jobs?all=true'
 ```
+
+## Retry with hint
+
+When a Web/Pwn/Crypto/Rev job ends in `failed`, `no_flag`, or `finished
+without a flag`, the job detail panel shows two retry buttons:
+
+| Button | What happens |
+|---|---|
+| **↻ Retry with reviewer hint** | A separate Claude (Opus 4.7 by default) reads the prior job's `run.log`, exploit/solver, stdout/stderr, and key source files, then writes a one-paragraph diagnosis. That hint is appended to the original description as `[retry-hint] …` and a fresh job is enqueued. Reviewer output streams into the UI live (SSE). |
+| **✏ Retry with my hint** | Opens an inline textarea. Whatever you type is appended verbatim as `[retry-hint]` — the reviewer is **not** called and no Claude credit is spent. Useful when you've already spotted the bug and just want the agent to focus on a specific lead. |
+
+The new job inherits the previous module, target, model, timeout, source/binary
+upload, and `auto_run` setting — you don't re-upload anything. The retry
+chain is recorded as `meta.retry_of` on the new job so you can trace lineage.
+
+Errors from the reviewer (Claude API auth/rate-limit/credit failures, policy
+refusals, empty responses) are surfaced in the panel with a red "no new job
+created" header and the error body. The new job is **not** enqueued in that
+case — fix the underlying issue (or use the manual-hint button) and try
+again.
 
 ## Out-of-band callbacks (XSS / SSRF / blind RCE)
 
