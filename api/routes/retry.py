@@ -267,13 +267,19 @@ def _resubmit(
     prev_jd: Path,
     *,
     carry_work: bool = False,
+    mark_resumed: bool = False,
 ) -> str:
     """Enqueue a new job in the same module with description + hint, copying
     over the original uploaded source/binary so the user doesn't re-upload.
 
     `carry_work=True` additionally copies prev_jd/work → new_jd/work so the
     new agent inherits any partial exploit/solver/report drafts the prior
-    attempt had written. Used by /resume to keep mid-run context.
+    attempt had written. Both /retry and /resume now set this.
+
+    `mark_resumed=True` records the new job as a 'resume' lineage in
+    meta.resumed_from. /resume uses this; /retry does not (it remains a
+    plain retry that just happens to read prior drafts as reference).
+    Either way the new meta still records `retry_of` for traceability.
     """
     module = prev_meta.get("module")
     if module not in ("web", "pwn", "crypto", "rev"):
@@ -311,7 +317,7 @@ def _resubmit(
         "job_timeout": job_timeout,
         "model": model,
         "retry_of": prev_meta.get("id"),
-        "resumed_from": prev_meta.get("id") if carry_work else None,
+        "resumed_from": prev_meta.get("id") if mark_resumed else None,
     }
 
     q = get_queue()
@@ -477,8 +483,9 @@ async def retry_with_hint_stream(job_id: str, request: Request):
                 return
 
         yield sse("stage", {"name": "submitting"})
+        augmented = _retry_preamble(safe, hint)
         try:
-            new_id = _resubmit(prev_meta, hint, jd)
+            new_id = _resubmit(prev_meta, augmented, jd, carry_work=True)
         except HTTPException as he:
             yield sse("error", {
                 "message": f"submit rejected: {he.detail}",
@@ -497,6 +504,7 @@ async def retry_with_hint_stream(job_id: str, request: Request):
             "hint": hint,
             "retry_of": safe,
             "manual": manual_hint is not None,
+            "carried_work": (jd / "work").is_dir(),
         })
 
     return StreamingResponse(
@@ -542,12 +550,14 @@ async def retry_with_hint(job_id: str, request: Request):
                 },
             ) from e
 
-    new_id = _resubmit(prev_meta, hint, jd)
+    augmented = _retry_preamble(safe, hint)
+    new_id = _resubmit(prev_meta, augmented, jd, carry_work=True)
     return {
         "new_job_id": new_id,
         "hint": hint,
         "retry_of": safe,
         "manual": manual_hint is not None,
+        "carried_work": (jd / "work").is_dir(),
     }
 
 
@@ -577,7 +587,10 @@ async def stop_and_resume(job_id: str, request: Request):
     halt_info = _halt_source_job(safe, prev_meta) if prev_status in ("queued", "running") else None
     augmented_hint = _resume_preamble(safe, manual_hint)
 
-    new_id = _resubmit(prev_meta, augmented_hint, jd, carry_work=True)
+    new_id = _resubmit(
+        prev_meta, augmented_hint, jd,
+        carry_work=True, mark_resumed=True,
+    )
     return {
         "new_job_id": new_id,
         "hint": manual_hint,
@@ -604,6 +617,24 @@ def _halt_source_job(safe: str, prev_meta: dict) -> dict:
     }
     write_job_meta(safe, stopped_meta)
     return halt
+
+
+def _retry_preamble(prev_id: str, hint: str) -> str:
+    """Prepend a context note for the standard retry path (failed /
+    no_flag / finished). Like resume, retry now copies the prior agent's
+    work/ directory across so the new attempt can read what was tried
+    and what didn't work — but unlike resume the next agent is told to
+    treat the artifacts as REFERENCE and approach the problem fresh
+    with the (reviewer- or hand-written) hint.
+    """
+    return (
+        f"[retry of job {prev_id}]\n"
+        f"The previous attempt's working directory has been carried "
+        f"over as ./work/ — it contains the partial exploit.py / "
+        f"solver.py / report.md / scratch from the failed run. Use "
+        f"them to understand what was tried and where it broke, then "
+        f"approach the problem with this guidance:\n\n{hint}"
+    )
 
 
 def _resume_preamble(prev_id: str, hint: str) -> str:
@@ -704,7 +735,10 @@ async def stop_and_resume_stream(job_id: str, request: Request):
         yield sse("stage", {"name": "submitting"})
         augmented = _resume_preamble(safe, hint)
         try:
-            new_id = _resubmit(prev_meta, augmented, jd, carry_work=True)
+            new_id = _resubmit(
+                prev_meta, augmented, jd,
+                carry_work=True, mark_resumed=True,
+            )
         except HTTPException as he:
             yield sse("error", {
                 "message": f"submit rejected: {he.detail}",
