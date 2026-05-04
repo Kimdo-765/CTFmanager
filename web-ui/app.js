@@ -764,11 +764,14 @@ async function renderJob(id, opts = {}) {
   // even 'failed' jobs sometimes have a usable partial script.
   let runBlock = "";
   const isExploitableModule = ["web", "pwn", "crypto", "rev"].includes(job.module);
-  const showRetry = isExploitableModule && (
-    job.status === "failed" ||
-    job.status === "no_flag" ||
-    (job.status === "finished" && (!job.flags || job.flags.length === 0))
-  );
+  // Retry is offered for every TERMINAL status on an exploitable module
+  // — including 'finished' with a flag, so the user can rerun against a
+  // suspect / placeholder flag or grab additional flags. The reviewer
+  // path is still useful in that case ("the captured value looks like a
+  // dummy — find the real flag").
+  const showRetry = isExploitableModule && [
+    "failed", "no_flag", "finished", "stopped",
+  ].includes(job.status);
   // Stop & resume: only meaningful while the job is still in flight.
   const showStopResume = isExploitableModule && (
     job.status === "queued" || job.status === "running"
