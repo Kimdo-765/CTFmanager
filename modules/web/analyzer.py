@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import traceback
@@ -20,7 +21,9 @@ from modules._common import (
     extract_cost,
     job_dir,
     log_line,
+    read_meta,
     scan_job_for_flags,
+    soft_timeout_watchdog,
     write_meta,
 )
 from modules._runner import attempt_sandbox_run
@@ -54,6 +57,9 @@ async def _run_agent(
     log_line(job_id, f"Launching Claude agent (model={model})")
     log_line(job_id, f"Source root: {src_root or '(remote-only)'}")
 
+    soft_timeout = int(read_meta(job_id).get("job_timeout") or 0)
+    watchdog = asyncio.create_task(soft_timeout_watchdog(job_id, soft_timeout))
+
     summary: dict = {"messages": 0, "tool_calls": 0, "model": model}
     try:
         async for msg in query(prompt=user_prompt, options=options):
@@ -80,6 +86,12 @@ async def _run_agent(
         summary["agent_error"] = msg_text
         summary["agent_error_kind"] = kind
         log_line(job_id, f"AGENT_ERROR ({kind}): {msg_text[:400]}")
+    finally:
+        watchdog.cancel()
+        # Clear the awaiting_decision flag if the watchdog already fired —
+        # the job has finished and the user no longer needs to decide.
+        if read_meta(job_id).get("awaiting_decision"):
+            write_meta(job_id, awaiting_decision=False)
 
     jd = job_dir(job_id)
     # Prefer the agent's cwd, but also check /root/ AND the job root in case

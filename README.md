@@ -91,7 +91,7 @@ All knobs live in two places:
    | `HOST_DATA_DIR` | `./data` | absolute host path for sibling-container bind mounts |
    | `WORKER_CONCURRENCY` | `3` | parallel job slots |
    | `JOB_TTL_DAYS` | `7` | auto-delete jobs older than N days (`0`=keep) |
-   | `JOB_TIMEOUT` | `900` | RQ job timeout in seconds |
+   | `JOB_TIMEOUT` | `6000` | soft job timeout in seconds — see [Timeout & soft-deadline decision](#timeout--soft-deadline-decision) |
    | `WEB_PORT` | `8000` | host port |
    | `GHIDRA_VERSION` / `GHIDRA_BUILD_DATE` | `12.0.4` / `20260303` | Ghidra release used by decompiler image |
    | `ANTHROPIC_API_KEY` | empty | leave empty for OAuth |
@@ -177,6 +177,8 @@ upload ──► /data/jobs/<id>/         ─► RQ enqueue
 | POST | `/api/jobs/{id}/run` | re-run produced exploit/solver in a fresh sandbox |
 | POST | `/api/jobs/{id}/retry` | regenerate the job with a hint (body: `{"hint":"…"}` for manual hint, empty body = auto reviewer) |
 | POST | `/api/jobs/{id}/retry/stream` | same as `/retry` but returns Server-Sent Events with reviewer progress |
+| POST | `/api/jobs/{id}/timeout/continue` | acknowledge the soft timeout — let the agent keep running |
+| POST | `/api/jobs/{id}/timeout/kill` | acknowledge the soft timeout — hard-stop the job |
 
 ## File layout
 
@@ -258,6 +260,30 @@ docker compose build api          # rebuild after code changes in api/
 # Wipe all jobs (UI also has a Bulk Delete button)
 curl -X DELETE 'http://localhost:8000/api/jobs?all=true'
 ```
+
+## Timeout & soft-deadline decision
+
+Default job timeout is **6000s** (≈100 min). Override per-job from each
+Analyze form, or globally in Settings (`job_timeout_seconds`).
+
+The timeout is **soft**: when it elapses while the agent is still working,
+the job is **not** killed. Instead a yellow banner appears on the job
+detail panel showing two buttons:
+
+| Button | What happens |
+|---|---|
+| **▶ Continue running** | Acknowledges the timeout and lets the agent run to completion. The watchdog does not fire again — your acknowledgment carries through to the natural end of the job. |
+| **■ Stop now** | Hard-kills the job: signals the worker, removes any sibling containers, marks `meta.status = failed` with `error: "Stopped by user at soft timeout"`. |
+
+Internally:
+- The worker spawns an `asyncio` watchdog at the start of the agent loop
+  that sleeps the user-set soft timeout, then sets `meta.awaiting_decision`
+  and logs a single line. The agent loop is never interrupted.
+- RQ's hard timeout is set automatically to **4× the soft budget (min 24 h,
+  max 7 d)** so the worker has plenty of runway after a `continue` decision
+  before RQ's safety net fires.
+- If the agent finishes naturally before the soft timeout, the watchdog is
+  cancelled silently and no banner ever appears.
 
 ## Retry with hint
 

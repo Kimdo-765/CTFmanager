@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import shutil
@@ -17,7 +18,13 @@ from claude_agent_sdk import (
     query,
 )
 
-from modules._common import extract_cost, scan_job_for_flags
+from modules._common import (
+    extract_cost,
+    read_meta,
+    scan_job_for_flags,
+    soft_timeout_watchdog,
+    write_meta,
+)
 from modules.forensic.prompts import SYSTEM_PROMPT, build_user_prompt
 from modules.settings_io import apply_to_env, get_setting, has_claude_auth
 
@@ -114,23 +121,32 @@ async def _claude_summary(
     prompt = build_user_prompt(target_os, kind, description)
     _log(job_id, f"Launching Claude summary agent (model={model})")
     summary: dict = {"messages": 0, "tool_calls": 0}
-    async for msg in query(prompt=prompt, options=options):
-        if isinstance(msg, AssistantMessage):
-            summary["messages"] += 1
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    _log(job_id, f"AGENT: {block.text[:500]}")
-                elif isinstance(block, ToolUseBlock):
-                    summary["tool_calls"] += 1
-                    args_preview = json.dumps(block.input)[:200]
-                    _log(job_id, f"TOOL {block.name}: {args_preview}")
-        elif isinstance(msg, ResultMessage):
-            summary["result"] = {
-                "duration_ms": msg.duration_ms,
-                "num_turns": msg.num_turns,
-                "total_cost_usd": msg.total_cost_usd,
-                "is_error": msg.is_error,
-            }
+
+    soft_timeout = int(read_meta(job_id).get("job_timeout") or 0)
+    watchdog = asyncio.create_task(soft_timeout_watchdog(job_id, soft_timeout))
+
+    try:
+        async for msg in query(prompt=prompt, options=options):
+            if isinstance(msg, AssistantMessage):
+                summary["messages"] += 1
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        _log(job_id, f"AGENT: {block.text[:500]}")
+                    elif isinstance(block, ToolUseBlock):
+                        summary["tool_calls"] += 1
+                        args_preview = json.dumps(block.input)[:200]
+                        _log(job_id, f"TOOL {block.name}: {args_preview}")
+            elif isinstance(msg, ResultMessage):
+                summary["result"] = {
+                    "duration_ms": msg.duration_ms,
+                    "num_turns": msg.num_turns,
+                    "total_cost_usd": msg.total_cost_usd,
+                    "is_error": msg.is_error,
+                }
+    finally:
+        watchdog.cancel()
+        if read_meta(job_id).get("awaiting_decision"):
+            write_meta(job_id, awaiting_decision=False)
     return summary
 
 

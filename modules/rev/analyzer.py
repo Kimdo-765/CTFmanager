@@ -1,3 +1,4 @@
+import asyncio
 import json
 import shutil
 import traceback
@@ -20,7 +21,9 @@ from modules._common import (
     extract_cost,
     job_dir,
     log_line,
+    read_meta,
     scan_job_for_flags,
+    soft_timeout_watchdog,
     write_meta,
 )
 from modules._runner import attempt_sandbox_run
@@ -65,6 +68,9 @@ async def _run_agent(
     log_line(job_id, f"Launching Claude agent (model={model})")
     summary: dict = {"messages": 0, "tool_calls": 0, "model": model}
 
+    soft_timeout = int(read_meta(job_id).get("job_timeout") or 0)
+    watchdog = asyncio.create_task(soft_timeout_watchdog(job_id, soft_timeout))
+
     try:
         async for msg in query(prompt=user_prompt, options=options):
             if isinstance(msg, AssistantMessage):
@@ -90,6 +96,10 @@ async def _run_agent(
         summary["agent_error"] = msg_text
         summary["agent_error_kind"] = kind
         log_line(job_id, f"AGENT_ERROR ({kind}): {msg_text[:400]}")
+    finally:
+        watchdog.cancel()
+        if read_meta(job_id).get("awaiting_decision"):
+            write_meta(job_id, awaiting_decision=False)
 
     found = collect_outputs(work_dir, ["solver.py", "report.md"])
     summary["solver_present"] = "solver.py" in found

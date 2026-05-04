@@ -251,6 +251,32 @@ async function deleteJob(id, ev) {
   refreshStats();
 }
 
+async function decideTimeout(jobId, decision, btn) {
+  // Disable both decision buttons in the same banner
+  const banner = btn.closest(".timeout-banner");
+  if (banner) banner.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  const orig = btn.textContent;
+  btn.textContent = decision === "continue" ? "▶ continuing…" : "■ stopping…";
+  try {
+    const res = await fetch(`${API}/jobs/${jobId}/timeout/${decision}`, { method: "POST" });
+    if (!res.ok) {
+      const body = await res.text();
+      alert(`timeout/${decision} failed: ${res.status} ${body}`);
+      if (banner) banner.querySelectorAll("button").forEach((b) => (b.disabled = false));
+      btn.textContent = orig;
+      return;
+    }
+    // Refresh the job view; meta.awaiting_decision should now be false
+    // (and on 'kill', status flips to 'failed').
+    await refreshJobs();
+    await selectJob(jobId);
+  } catch (e) {
+    alert(`timeout/${decision} error: ${e}`);
+    if (banner) banner.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    btn.textContent = orig;
+  }
+}
+
 async function streamRetry(jobId, btn, manualHint = null) {
   // Disable every retry button on the detail panel — only one path runs.
   const allRetryBtns = document.querySelectorAll(
@@ -547,6 +573,26 @@ async function renderJob(id) {
   const timeout = job.job_timeout ? ` · timeout: ${job.job_timeout}s` : "";
   const modelInfo = job.model ? ` · model: ${escapeHtml(job.model)}` : "";
 
+  // Soft-timeout decision banner. Fires when the worker's wall-clock
+  // watchdog sets meta.awaiting_decision=true. The agent is still running
+  // — the user picks Continue (let it run) or Stop (hard-kill).
+  let timeoutBlock = "";
+  if (job.awaiting_decision) {
+    const at = job.decision_at ? new Date(job.decision_at).toLocaleTimeString() : "";
+    const budget = job.soft_timeout_s || job.job_timeout || "?";
+    timeoutBlock = `<div class="timeout-banner" data-job-id="${id}">
+      <h4>⏰ Soft timeout reached${at ? ` at ${escapeHtml(at)}` : ""}</h4>
+      <div class="timeout-msg">
+        The agent has been running for ~${escapeHtml(String(budget))}s and is still working.
+        It will keep running until you decide. Pick one:
+      </div>
+      <div class="timeout-actions">
+        <button class="timeout-continue-btn" data-action="continue">▶ Continue running</button>
+        <button class="timeout-kill-btn" data-action="kill">■ Stop now</button>
+      </div>
+    </div>`;
+  }
+
   // Description block: render the original description and any appended
   // `[retry-hint]` segment in a separate, color-coded chip so the user can
   // see at a glance which run is a retry and what hint was used.
@@ -633,6 +679,7 @@ async function renderJob(id) {
       <span class="status ${job.status}">${job.status}</span>
     </h3>
     <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}${modelInfo}</small></div>
+    ${timeoutBlock}
     ${descBlock}
     ${runBlock}
     ${errorBlock}
@@ -658,6 +705,15 @@ async function renderJob(id) {
   const retryManualBtn = detail.querySelector('.retry-btn[data-action="retry-manual"]');
   if (retryManualBtn) {
     retryManualBtn.addEventListener("click", () => openManualHintForm(id, retryManualBtn));
+  }
+
+  const continueBtn = detail.querySelector('.timeout-continue-btn[data-action="continue"]');
+  if (continueBtn) {
+    continueBtn.addEventListener("click", () => decideTimeout(id, "continue", continueBtn));
+  }
+  const killBtn = detail.querySelector('.timeout-kill-btn[data-action="kill"]');
+  if (killBtn) {
+    killBtn.addEventListener("click", () => decideTimeout(id, "kill", killBtn));
   }
 
   const runBtn = detail.querySelector('.run-now-btn[data-action="run"]');

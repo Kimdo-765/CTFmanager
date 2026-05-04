@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from api.queue import get_queue, get_redis
-from api.storage import JOBS_DIR, read_job_meta
+from api.storage import JOBS_DIR, read_job_meta, write_job_meta
 
 router = APIRouter()
 
@@ -317,3 +317,66 @@ def post_run_script(job_id: str, target: str | None = None):
     new_status = "finished" if flags else "no_flag"
     write_meta(safe, status=new_status, flags=flags, manual_run=True)
     return {"sandbox": res, "flags": flags, "status": new_status}
+
+
+def _record_decision(safe: str, decision: str, log_msg: str) -> dict:
+    """Clear the awaiting_decision flag and append a run.log line. Returns
+    the merged meta on success."""
+    meta = read_job_meta(safe)
+    if not meta:
+        raise HTTPException(status_code=404, detail="job not found")
+    merged = {
+        **meta,
+        "awaiting_decision": False,
+        "timeout_decision": decision,
+    }
+    write_job_meta(safe, merged)
+
+    # Append to run.log so the user can see the decision in the live log
+    from datetime import datetime
+    log = JOBS_DIR / safe / "run.log"
+    try:
+        ts = datetime.utcnow().strftime("%H:%M:%S")
+        with log.open("a") as fp:
+            fp.write(f"[{ts}] {log_msg}\n")
+    except Exception:
+        pass
+    return merged
+
+
+@router.post("/{job_id}/timeout/continue")
+def timeout_continue(job_id: str):
+    """User chose to keep the job running past its soft timeout. The
+    watchdog has already fired once and will NOT re-fire — the agent
+    runs to natural completion (or hits RQ's hard kill ceiling)."""
+    safe = Path(job_id).name
+    meta = read_job_meta(safe)
+    if not meta:
+        raise HTTPException(status_code=404, detail="job not found")
+    if not meta.get("awaiting_decision"):
+        return {"ok": True, "noop": True, "decision": meta.get("timeout_decision")}
+    _record_decision(
+        safe, "continue",
+        "User chose CONTINUE — job keeps running past the soft timeout.",
+    )
+    return {"ok": True, "decision": "continue"}
+
+
+@router.post("/{job_id}/timeout/kill")
+def timeout_kill(job_id: str):
+    """User chose to halt the job. Runs the same hard-stop path as
+    DELETE: signals RQ, kills sibling containers."""
+    safe = Path(job_id).name
+    meta = read_job_meta(safe)
+    if not meta:
+        raise HTTPException(status_code=404, detail="job not found")
+    _record_decision(
+        safe, "kill",
+        "User chose STOP — halting the job at soft timeout.",
+    )
+    halt_info = _hard_stop_job(safe)
+    # Reflect the cancellation in meta so list/detail endpoints don't
+    # keep showing it as 'running'.
+    final = read_job_meta(safe) or {}
+    write_job_meta(safe, {**final, "status": "failed", "error": "Stopped by user at soft timeout"})
+    return {"ok": True, "decision": "kill", "halt": halt_info}

@@ -53,7 +53,7 @@
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
-          <input type="number" name="job_timeout" min="60" placeholder="900" />
+          <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
         <button type="submit">Analyze</button>
       </form>
@@ -84,7 +84,7 @@
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
-          <input type="number" name="job_timeout" min="60" placeholder="900" />
+          <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
         <button type="submit">Decompile + Analyze</button>
         <small style="color:#8b949e">First run requires the decompiler image: <code>docker compose --profile tools build decompiler</code></small>
@@ -133,7 +133,7 @@
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
-          <input type="number" name="job_timeout" min="60" placeholder="1800" />
+          <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
         <button type="submit">Collect Artifacts</button>
         <small style="color:#8b949e">First run requires the forensic image: <code>docker compose --profile tools build forensic</code></small>
@@ -165,7 +165,7 @@
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
-          <input type="number" name="job_timeout" min="60" placeholder="600" />
+          <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
         <button type="submit">Analyze</button>
         <small style="color:#8b949e">First run requires the misc image: <code>docker compose --profile tools build misc</code></small>
@@ -201,7 +201,7 @@
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
-          <input type="number" name="job_timeout" min="60" placeholder="900" />
+          <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
         <button type="submit">Analyze + Solve</button>
         <small style="color:#8b949e">Worker has pycryptodome, gmpy2, sympy, z3-solver, ecdsa, pwntools. Sage requires <code>docker compose --profile tools-sage pull sage</code>.</small>
@@ -229,7 +229,7 @@
         </label>
         <label>
           Job timeout (seconds, blank = global setting)
-          <input type="number" name="job_timeout" min="60" placeholder="900" />
+          <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
         <button type="submit">Decompile + Solve</button>
         <small style="color:#8b949e">Reuses decompiler image. Solver runs with crypto libs (pycryptodome, gmpy2, sympy, z3, pwntools).</small>
@@ -270,7 +270,7 @@
         </label>
         <label>
           Job timeout (seconds)
-          <input type="number" name="job_timeout_seconds" min="60" placeholder="900" />
+          <input type="number" name="job_timeout_seconds" min="60" placeholder="6000" />
         </label>
         <label>
           Worker concurrency (parallel jobs)

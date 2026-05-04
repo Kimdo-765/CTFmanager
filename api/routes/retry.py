@@ -32,7 +32,7 @@ from claude_agent_sdk import (
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from api.queue import get_queue, resolve_timeout
+from api.queue import get_queue, hard_timeout_for, resolve_timeout
 from api.storage import JOBS_DIR, job_dir, new_job_id, read_job_meta, write_job_meta
 from modules._common import classify_agent_error
 from modules.settings_io import apply_to_env, get_setting
@@ -314,13 +314,13 @@ def _resubmit(prev_meta: dict, hint: str, prev_jd: Path) -> str:
             q.enqueue(
                 "modules.web.analyzer.run_job",
                 new_id, new_src_root, target, description, auto_run, model,
-                job_id=new_id, job_timeout=job_timeout,
+                job_id=new_id, job_timeout=hard_timeout_for(job_timeout),
             )
         else:
             q.enqueue(
                 "modules.crypto.analyzer.run_job",
                 new_id, new_src_root, target, description, auto_run, use_sage, model,
-                job_id=new_id, job_timeout=job_timeout,
+                job_id=new_id, job_timeout=hard_timeout_for(job_timeout),
             )
     else:  # pwn / rev
         prev_bin = prev_jd / "bin"
@@ -339,13 +339,13 @@ def _resubmit(prev_meta: dict, hint: str, prev_jd: Path) -> str:
             q.enqueue(
                 "modules.pwn.analyzer.run_job",
                 new_id, binary_name, target, description, auto_run, model,
-                job_id=new_id, job_timeout=job_timeout,
+                job_id=new_id, job_timeout=hard_timeout_for(job_timeout),
             )
         else:  # rev
             q.enqueue(
                 "modules.rev.analyzer.run_job",
                 new_id, binary_name, description, auto_run, model,
-                job_id=new_id, job_timeout=job_timeout,
+                job_id=new_id, job_timeout=hard_timeout_for(job_timeout),
             )
     return new_id
 

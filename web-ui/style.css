@@ -122,6 +122,47 @@ textarea, select {
   color: #ffd5d3;
 }
 
+/* Soft-timeout decision banner: appears when the worker watchdog has fired
+   and the user must pick continue / kill. Styled as a yellow alert. */
+.timeout-banner {
+  background: #2d2208;
+  border: 1px solid #d4a72c;
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+  margin: 0.6rem 0;
+  animation: timeoutPulse 2s ease-in-out infinite;
+}
+@keyframes timeoutPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(212, 167, 44, 0.0); }
+  50%      { box-shadow: 0 0 0 4px rgba(212, 167, 44, 0.18); }
+}
+.timeout-banner h4 {
+  margin: 0 0 0.3rem 0;
+  font-size: 0.88rem;
+  color: #f5d062;
+  letter-spacing: 0.3px;
+}
+.timeout-banner .timeout-msg {
+  font-size: 0.82rem; color: #e6dfb8; margin-bottom: 0.5rem;
+}
+.timeout-banner .timeout-actions {
+  display: flex; gap: 0.5rem; flex-wrap: wrap;
+}
+.timeout-continue-btn {
+  background: #1f6feb; color: white; border: 0;
+  padding: 0.4rem 0.85rem; border-radius: 6px; cursor: pointer;
+  font-size: 0.85rem;
+}
+.timeout-continue-btn:hover { background: #388bfd; }
+.timeout-continue-btn:disabled { background: #21262d; color: #6e7681; cursor: wait; }
+.timeout-kill-btn {
+  background: #b62324; color: white; border: 0;
+  padding: 0.4rem 0.85rem; border-radius: 6px; cursor: pointer;
+  font-size: 0.85rem;
+}
+.timeout-kill-btn:hover { background: #da3633; }
+.timeout-kill-btn:disabled { background: #21262d; color: #6e7681; cursor: wait; }
+
 /* Job description block (above the retry/run buttons) */
 .description-block {
   background: #161b22;

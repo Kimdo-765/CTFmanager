@@ -1,6 +1,7 @@
 """Shared helpers for module orchestrators."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -42,6 +43,18 @@ def write_meta(job_id: str, **updates: Any) -> None:
     meta.update(updates)
     meta["updated_at"] = datetime.now(timezone.utc).isoformat()
     f.write_text(json.dumps(meta, indent=2))
+
+
+def read_meta(job_id: str) -> dict[str, Any]:
+    """Best-effort read of the job's meta.json. Returns {} if absent."""
+    f = job_dir(job_id) / "meta.json"
+    if not f.exists():
+        return {}
+    try:
+        data = json.loads(f.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def collect_outputs(work_dir: Path, names: list[str]) -> dict[str, Path]:
@@ -190,3 +203,33 @@ def extract_cost(claude_summary: dict | None) -> float:
         if isinstance(v, (int, float)):
             return float(v)
     return 0.0
+
+
+async def soft_timeout_watchdog(job_id: str, soft_timeout_s: int) -> None:
+    """Sleep until the user-set soft timeout elapses, then mark the job as
+    `awaiting_decision` in meta and log a single line. The agent loop is
+    NOT interrupted — this is a courtesy notification only. The caller is
+    expected to cancel this task when the agent finishes normally.
+
+    The user can then click "Continue running" or "Stop now" in the UI;
+    the API endpoints handle each side. If the user picks 'continue', the
+    watchdog stays cancelled — we don't pester them again — but the worker
+    keeps going until completion or until the RQ hard-kill ceiling.
+    """
+    if soft_timeout_s is None or soft_timeout_s <= 0:
+        return
+    try:
+        await asyncio.sleep(soft_timeout_s)
+    except asyncio.CancelledError:
+        return
+    log_line(
+        job_id,
+        f"⏰ Soft timeout reached ({soft_timeout_s}s) — waiting for user "
+        f"decision (continue / stop). The agent is still running.",
+    )
+    write_meta(
+        job_id,
+        awaiting_decision=True,
+        decision_at=datetime.now(timezone.utc).isoformat(),
+        soft_timeout_s=soft_timeout_s,
+    )

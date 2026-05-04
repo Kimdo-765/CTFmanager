@@ -3,7 +3,7 @@ from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from api.queue import get_queue, resolve_timeout
+from api.queue import get_queue, hard_timeout_for, resolve_timeout
 from api.storage import job_dir, new_job_id, write_job_meta
 
 router = APIRouter()
@@ -56,7 +56,7 @@ async def analyze_rev(
         auto_run,
         chosen_model,
         job_id=job_id,
-        job_timeout=timeout,
+        job_timeout=hard_timeout_for(timeout),
     )
 
     return {"job_id": job_id, "status": "queued", "job_timeout": timeout, "model": chosen_model}
