@@ -11,6 +11,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     TextBlock,
+    ThinkingBlock,
     ToolUseBlock,
     query,
 )
@@ -72,6 +73,11 @@ async def _run_agent(
                         summary["tool_calls"] += 1
                         args_preview = json.dumps(block.input)[:200]
                         log_line(job_id, f"TOOL {block.name}: {args_preview}")
+                    elif isinstance(block, ThinkingBlock):
+                        # Surfaces extended-thinking output so the live
+                        # log doesn't go silent for minutes between tool
+                        # calls when Claude is reasoning.
+                        log_line(job_id, f"THINK: {block.thinking[:500]}")
             elif isinstance(msg, ResultMessage):
                 summary["result"] = {
                     "duration_ms": msg.duration_ms,

@@ -14,6 +14,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     TextBlock,
+    ThinkingBlock,
     ToolUseBlock,
     query,
 )
@@ -136,6 +137,8 @@ async def _claude_summary(
                         summary["tool_calls"] += 1
                         args_preview = json.dumps(block.input)[:200]
                         _log(job_id, f"TOOL {block.name}: {args_preview}")
+                    elif isinstance(block, ThinkingBlock):
+                        _log(job_id, f"THINK: {block.thinking[:500]}")
             elif isinstance(msg, ResultMessage):
                 summary["result"] = {
                     "duration_ms": msg.duration_ms,
