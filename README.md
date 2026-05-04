@@ -177,6 +177,7 @@ upload ──► /data/jobs/<id>/         ─► RQ enqueue
 | POST | `/api/jobs/{id}/run` | re-run produced exploit/solver in a fresh sandbox |
 | POST | `/api/jobs/{id}/retry` | regenerate the job with a hint (body: `{"hint":"…"}` for manual hint, empty body = auto reviewer) |
 | POST | `/api/jobs/{id}/retry/stream` | same as `/retry` but returns Server-Sent Events with reviewer progress |
+| POST | `/api/jobs/{id}/resume` | hard-stop the job (if still queued/running), then enqueue a fresh one with `{"hint":"…"}` appended as `[retry-hint]` |
 | POST | `/api/jobs/{id}/timeout/continue` | acknowledge the soft timeout — let the agent keep running |
 | POST | `/api/jobs/{id}/timeout/kill` | acknowledge the soft timeout — hard-stop the job |
 
@@ -320,6 +321,7 @@ without a flag`, the job detail panel shows two retry buttons:
 |---|---|
 | **↻ Retry with reviewer hint** | A separate Claude (Opus 4.7 by default) reads the prior job's `run.log`, exploit/solver, stdout/stderr, and key source files, then writes a one-paragraph diagnosis. That hint is appended to the original description as `[retry-hint] …` and a fresh job is enqueued. Reviewer output streams into the UI live (SSE). |
 | **✏ Retry with my hint** | Opens an inline textarea. Whatever you type is appended verbatim as `[retry-hint]` — the reviewer is **not** called and no Claude credit is spent. Useful when you've already spotted the bug and just want the agent to focus on a specific lead. |
+| **✋ Stop & resume with extra hint** | Only visible while the job is `queued`/`running`. Halts the in-flight job (worker + sibling containers) and immediately enqueues a fresh one with your extra description appended as `[retry-hint]`. Use this when you notice mid-run that the agent is going down the wrong path and you want to redirect it without waiting for the soft timeout. |
 
 The new job inherits the previous module, target, model, timeout, source/binary
 upload, and `auto_run` setting — you don't re-upload anything. The retry

@@ -285,6 +285,19 @@ textarea, select {
   font-size: 0.82rem;
 }
 .retry-manual-cancel:hover { background: #30363d; }
+/* Stop & resume button — danger-ish color so it's visibly distinct
+   from the green/purple retry buttons. */
+.retry-stop-resume-btn {
+  background: #b62324;
+}
+.retry-stop-resume-btn:hover { background: #da3633; }
+.stop-resume-form { border-color: #d4a72c; }
+.stop-resume-form .retry-manual-label { color: #f5d062; }
+.stop-resume-submit {
+  background: #b62324;
+}
+.stop-resume-submit:hover { background: #da3633; }
+.stop-resume-submit:disabled { background: #21262d; color: #6e7681; cursor: wait; }
 
 .flag-banner {
   background: #1c2f1c;

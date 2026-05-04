@@ -530,3 +530,53 @@ async def retry_with_hint(job_id: str, request: Request):
         "retry_of": safe,
         "manual": manual_hint is not None,
     }
+
+
+@router.post("/{job_id}/resume")
+async def stop_and_resume(job_id: str, request: Request):
+    """Halt a queued/running job and immediately enqueue a fresh one with
+    the user's extra description appended as `[retry-hint]`.
+
+    Required body: JSON `{"hint": "<extra context>"}`. The reviewer is
+    NOT called — this is the manual-hint path applied to in-flight jobs.
+
+    If the source job has already finished/failed, this behaves like
+    `/retry` with a manual hint (no stop is needed).
+    """
+    safe = Path(job_id).name
+    manual_hint = await _read_manual_hint(request)
+    if manual_hint is None:
+        raise HTTPException(
+            status_code=400,
+            detail="hint is required for /resume — provide a non-empty 'hint' field",
+        )
+    # Manual hint means we don't need Claude auth here; if the new job
+    # auto-runs the agent it will pick up auth itself via apply_to_env.
+    jd, prev_meta = _validate_retry(safe, require_claude_auth=False)
+
+    halt_info = None
+    prev_status = prev_meta.get("status")
+    if prev_status in ("queued", "running"):
+        # Late import to avoid a circular at module load time.
+        from api.routes.jobs import _hard_stop_job
+
+        halt_info = _hard_stop_job(safe)
+        # Reflect the cancellation so list/detail endpoints stop showing
+        # the source job as 'running'. Mark *why* it died so the user
+        # can see it in the UI.
+        stopped_meta = {
+            **prev_meta,
+            "status": "stopped",
+            "error": "Stopped by user (resume with extra hint)",
+            "error_kind": "stopped_for_resume",
+        }
+        write_job_meta(safe, stopped_meta)
+
+    new_id = _resubmit(prev_meta, manual_hint, jd)
+    return {
+        "new_job_id": new_id,
+        "hint": manual_hint,
+        "stopped_from": safe,
+        "prev_status": prev_status,
+        "halt": halt_info,
+    }

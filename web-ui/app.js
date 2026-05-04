@@ -427,6 +427,84 @@ async function streamRetry(jobId, btn, manualHint = null) {
   }
 }
 
+function openStopResumeForm(jobId, anchorBtn) {
+  // If a form is already open for this job, just refocus it.
+  const existing = document.getElementById("stop-resume-form-" + jobId);
+  if (existing) {
+    existing.querySelector("textarea")?.focus();
+    return;
+  }
+  const form = document.createElement("div");
+  form.className = "retry-manual-form stop-resume-form";
+  form.id = "stop-resume-form-" + jobId;
+  form.innerHTML = `
+    <label class="retry-manual-label">Extra hint to add before resuming</label>
+    <textarea rows="5" placeholder="What should the next attempt do differently? e.g. 'the leaked endpoint is /api/v2/profile, not /profile' — appended to the new job's description as [retry-hint]"></textarea>
+    <div class="retry-manual-row">
+      <button type="button" class="retry-manual-submit stop-resume-submit">✋ Stop &amp; resume</button>
+      <button type="button" class="retry-manual-cancel">Cancel</button>
+      <small>Halts this job, then enqueues a fresh one with the same files + hint appended</small>
+    </div>
+  `;
+  const buttonRow = anchorBtn.parentElement;
+  buttonRow.insertAdjacentElement("afterend", form);
+
+  const ta = form.querySelector("textarea");
+  const submit = form.querySelector(".stop-resume-submit");
+  const cancel = form.querySelector(".retry-manual-cancel");
+  ta.focus();
+
+  cancel.addEventListener("click", () => form.remove());
+  submit.addEventListener("click", async () => {
+    const hint = ta.value.trim();
+    if (!hint) {
+      ta.focus();
+      ta.classList.add("invalid");
+      setTimeout(() => ta.classList.remove("invalid"), 600);
+      return;
+    }
+    submit.disabled = true;
+    cancel.disabled = true;
+    const orig = submit.textContent;
+    submit.textContent = "⏳ stopping & resuming…";
+    // Stop polling so it doesn't fight the upcoming selectJob call.
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    try {
+      const res = await fetch(`${API}/jobs/${jobId}/resume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hint }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = typeof body.detail === "string"
+          ? body.detail
+          : JSON.stringify(body.detail || body);
+        alert(`stop-and-resume failed: ${res.status} ${detail}`);
+        submit.disabled = false; cancel.disabled = false;
+        submit.textContent = orig;
+        return;
+      }
+      form.remove();
+      await refreshJobs();
+      await selectJob(body.new_job_id);
+    } catch (e) {
+      alert(`stop-and-resume error: ${e}`);
+      submit.disabled = false; cancel.disabled = false;
+      submit.textContent = orig;
+    }
+  });
+  ta.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      submit.click();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      form.remove();
+    }
+  });
+}
+
 function openManualHintForm(jobId, anchorBtn) {
   // If a form is already open for this job, just refocus it.
   const existing = document.getElementById("retry-manual-form-" + jobId);
@@ -634,7 +712,14 @@ async function renderJob(id) {
     job.status === "no_flag" ||
     (job.status === "finished" && (!job.flags || job.flags.length === 0))
   );
-  if (job.runnable_script || job.exploit_present || job.solver_present || showRetry) {
+  // Stop & resume: only meaningful while the job is still in flight.
+  const showStopResume = isExploitableModule && (
+    job.status === "queued" || job.status === "running"
+  );
+  if (
+    job.runnable_script || job.exploit_present || job.solver_present
+    || showRetry || showStopResume
+  ) {
     const scriptName = job.runnable_script || (job.exploit_present ? "exploit.py" : "solver.py");
     const runHtml = (job.runnable_script || job.exploit_present || job.solver_present)
       ? `<button class="run-now-btn" data-action="run">▶ Run ${escapeHtml(scriptName)} in sandbox</button>`
@@ -642,9 +727,15 @@ async function renderJob(id) {
     const retryHtml = showRetry
       ? `<button class="retry-btn" data-action="retry">↻ Retry with reviewer hint</button>
          <button class="retry-btn retry-manual-open-btn" data-action="retry-manual">✏ Retry with my hint</button>` : "";
+    const stopResumeHtml = showStopResume
+      ? `<button class="retry-btn retry-stop-resume-btn" data-action="stop-resume">✋ Stop &amp; resume with extra hint</button>` : "";
+    const helperBits = [];
+    if (runHtml) helperBits.push("re-runs the produced script");
+    if (retryHtml) helperBits.push("reviewer hint = Claude diagnoses the failure · my hint = you write the hint yourself");
+    if (stopResumeHtml) helperBits.push("stop & resume = halt the current job and start a fresh one with your extra hint appended");
     runBlock = `<div class="retry-row" style="margin:0.5rem 0">
-      ${runHtml} ${retryHtml}
-      <small style="color:#8b949e">${runHtml ? "re-runs the produced script · " : ""}reviewer hint = Claude diagnoses the failure · my hint = you write the hint yourself</small>
+      ${runHtml} ${retryHtml} ${stopResumeHtml}
+      <small style="color:#8b949e">${helperBits.join(" · ")}</small>
     </div>`;
   }
 
@@ -740,6 +831,10 @@ async function renderJob(id) {
   const retryManualBtn = detail.querySelector('.retry-btn[data-action="retry-manual"]');
   if (retryManualBtn) {
     retryManualBtn.addEventListener("click", () => openManualHintForm(id, retryManualBtn));
+  }
+  const stopResumeBtn = detail.querySelector('.retry-btn[data-action="stop-resume"]');
+  if (stopResumeBtn) {
+    stopResumeBtn.addEventListener("click", () => openStopResumeForm(id, stopResumeBtn));
   }
 
   const continueBtn = detail.querySelector('.timeout-continue-btn[data-action="continue"]');
