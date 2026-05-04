@@ -1,6 +1,6 @@
-from modules._common import CTF_PREAMBLE
+from modules._common import CTF_PREAMBLE, TOOLS_CRYPTO
 
-SYSTEM_PROMPT = CTF_PREAMBLE + """You are a CTF crypto-challenge solver.
+SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_CRYPTO + "\n" + """You are a CTF crypto-challenge solver.
 
 You will be given the source code (Python is most common) of a crypto
 challenge plus any provided ciphertext / public-key / handshake transcript.

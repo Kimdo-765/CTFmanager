@@ -171,6 +171,94 @@ the educational purpose of the challenge.
 """
 
 
+# ---------------------------------------------------------------------------
+# Worker-container tool catalogue.
+#
+# These blocks are dropped into each module's SYSTEM_PROMPT so the agent
+# knows which CLIs and Python packages it can shell out to via Bash. Keep
+# in sync with worker/Dockerfile + worker/requirements.txt — anything
+# listed here MUST exist in the worker image, otherwise the agent will
+# burn tokens trying to call something that returns "command not found".
+#
+# Heavy reverse-engineering / forensic / unpacking tools live in the
+# *sibling* container images (decompiler / forensic / misc / runner) and
+# are reachable only through the wrappers each module mentions explicitly
+# (e.g. `ghiant` for the agent's Bash, summary.json for forensic, etc.).
+# ---------------------------------------------------------------------------
+
+_TOOLS_BASE = """\
+Bash CLIs always available in this worker container:
+  - core           : python3, bash, curl, wget, git, jq, less, file
+  - archives       : unzip, zip, 7z, tar, gzip, xz, bzip2
+  - inspection     : xxd, hexdump, strings, nm, readelf, objdump, ldd, file
+  - editors        : vim-tiny, nano (use only when an interactive edit is
+                     genuinely required — Edit/Write tools are preferred)
+  - build          : gcc, g++, make, pkg-config, python3-dev
+"""
+
+TOOLS_WEB = _TOOLS_BASE + """\
+Web-specific:
+  - HTTP probing   : curl (-i, -L, -k, --resolve), nmap, dig, ping
+  - shell sockets  : nc (netcat-openbsd), socat
+  - injection      : sqlmap (URL-driven SQLi), Bash one-liners with curl
+  - Python (import): requests, httpx, bs4 (beautifulsoup4), lxml, urllib
+                     pwntools (raw-socket / TLS), Crypto (pycryptodome)
+"""
+
+TOOLS_PWN = _TOOLS_BASE + """\
+Pwn-specific:
+  - dynamic        : gdb (no extra plugins — use Python scripts via -x),
+                     strace, ltrace
+  - binary surgery : patchelf, qemu-aarch64-static / qemu-arm-static
+                     (run cross-arch ELFs with `qemu-<arch>-static ./bin`)
+  - gadgets        : ROPgadget --binary ./bin/<name> --rop / --jop
+  - decompiler     : `ghiant <binary> [outdir]` (Ghidra headless, ./decomp/)
+  - Python (import): pwn (pwntools — checksec / ELF / cyclic / asm / shellcraft),
+                     Crypto, gmpy2, sympy, z3
+"""
+
+TOOLS_REV = _TOOLS_BASE + """\
+Rev-specific:
+  - dynamic        : gdb (-batch + -ex), strace, ltrace,
+                     qemu-{aarch64,arm}-static for cross-arch ELFs
+  - decompiler     : `ghiant <binary> [outdir]` (Ghidra headless, ./decomp/)
+  - Python (import): pwn (ELF / asm / disasm), z3 (constraint solving for
+                     check-input-style crackmes), Crypto, sympy, gmpy2
+"""
+
+TOOLS_CRYPTO = _TOOLS_BASE + """\
+Crypto-specific:
+  - shell          : openssl (genrsa, dgst, aes-*, ec, …)
+  - Python (import): Crypto (pycryptodome), gmpy2, sympy, z3 (z3-solver),
+                     ecdsa, pwntools (for remote-oracle protocols)
+  - SageMath       : NOT in this container — the orchestrator can spawn
+                     a separate Sage runner only if `solver.sage` is
+                     produced and the user enabled the Sage sandbox.
+                     For everything else, prefer the libs above.
+"""
+
+TOOLS_FORENSIC = _TOOLS_BASE + """\
+Forensic-specific (in this worker container):
+  - inspection     : exiftool, yara, jq, xxd, strings, file
+  - Python (import): PIL (Pillow), magic (python-magic), bs4, lxml
+Heavy disk / memory analysis already happened BEFORE you started in the
+sibling forensic image (sleuthkit, qemu-img, ewfexport, Volatility 3) —
+their output sits in summary.json + log_findings.json + artifacts/ +
+volatility/. Don't try to re-run vol/mmls/fls here; just read what's
+already produced.
+"""
+
+TOOLS_MISC = _TOOLS_BASE + """\
+Misc-specific (in this worker container):
+  - inspection     : exiftool, yara, jq, xxd, strings, file
+  - Python (import): PIL (Pillow), magic (python-magic), bs4, lxml,
+                     Crypto (pycryptodome — for stego XOR / AES guesses)
+Heavy carving (binwalk, foremost, steghide, zsteg, pngcheck, qpdf) was
+already run in the sibling misc image; results are in findings.json +
+extracted/ + analyze.log. Read those first instead of re-running.
+"""
+
+
 REFUSAL_HINTS = (
     "usage policy",
     "unable to respond to this request",

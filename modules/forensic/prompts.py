@@ -1,6 +1,6 @@
-from modules._common import CTF_PREAMBLE
+from modules._common import CTF_PREAMBLE, TOOLS_FORENSIC
 
-SYSTEM_PROMPT = CTF_PREAMBLE + """You are a CTF forensic analyst.
+SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_FORENSIC + "\n" + """You are a CTF forensic analyst.
 
 You are given the output of an automated artifact-collection pass over a
 disk image, memory dump, OR a raw log upload:

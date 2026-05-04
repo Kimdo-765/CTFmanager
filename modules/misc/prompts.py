@@ -1,6 +1,6 @@
-from modules._common import CTF_PREAMBLE
+from modules._common import CTF_PREAMBLE, TOOLS_MISC
 
-SYSTEM_PROMPT = CTF_PREAMBLE + """You are a CTF misc/stego triage assistant.
+SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_MISC + "\n" + """You are a CTF misc/stego triage assistant.
 
 You are given the output of an automated tool sweep over a single file:
 
