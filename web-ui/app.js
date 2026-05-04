@@ -201,9 +201,7 @@ document.getElementById("bulk-delete").addEventListener("click", async () => {
   const r = await res.json();
   alert(`Deleted ${r.deleted} ${label}${r.skipped ? ` (skipped ${r.skipped})` : ""}.`);
   if (selectedJob && r.ids && r.ids.includes(selectedJob)) {
-    selectedJob = null;
-    document.getElementById("job-detail").innerHTML = "";
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    _closeJobModal();
   }
   await refreshJobs();
   await refreshStats();
@@ -243,9 +241,7 @@ async function deleteJob(id, ev) {
   if (!confirm(`Delete job ${id}?`)) return;
   await fetch(`${API}/jobs/${id}`, { method: "DELETE" });
   if (selectedJob === id) {
-    selectedJob = null;
-    document.getElementById("job-detail").innerHTML = "";
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    _closeJobModal();
   }
   refreshJobs();
   refreshStats();
@@ -602,6 +598,7 @@ async function selectJob(id) {
   document.querySelectorAll("#jobs-list li").forEach((li) => {
     li.classList.toggle("selected", li.dataset.id === id);
   });
+  _openJobModal(id);
   await renderJob(id, { force: true });
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
@@ -613,6 +610,30 @@ async function selectJob(id) {
       await refreshStats();
     }
   }, 2000);
+}
+
+function _openJobModal(id) {
+  const m = document.getElementById("job-modal");
+  if (!m) return;
+  const title = m.querySelector(".job-modal-title");
+  if (title) title.textContent = `Job ${id}`;
+  m.hidden = false;
+  // Lock background scroll while the modal is open.
+  document.body.classList.add("modal-open");
+}
+
+function _closeJobModal() {
+  const m = document.getElementById("job-modal");
+  if (m) m.hidden = true;
+  document.body.classList.remove("modal-open");
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  selectedJob = null;
+  document.querySelectorAll("#jobs-list li").forEach((li) =>
+    li.classList.remove("selected"),
+  );
+  // Wipe the detail body so a stale render doesn't flash on the next open.
+  const detail = document.getElementById("job-detail");
+  if (detail) detail.innerHTML = "";
 }
 
 async function renderJob(id, opts = {}) {
@@ -1145,13 +1166,24 @@ document.addEventListener("click", (e) => {
   }
   if (e.target.closest(".file-modal-close, .file-modal-backdrop")) {
     _closeFileModal();
+    return;
+  }
+  if (e.target.closest(".job-modal-close, .job-modal-backdrop")) {
+    _closeJobModal();
   }
 });
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") {
-    const modal = document.getElementById("file-modal");
-    if (modal && !modal.hidden) _closeFileModal();
+  if (e.key !== "Escape") return;
+  // File preview is on top of the job modal — close that one first.
+  const fileModal = document.getElementById("file-modal");
+  if (fileModal && !fileModal.hidden) {
+    _closeFileModal();
+    return;
+  }
+  const jobModal = document.getElementById("job-modal");
+  if (jobModal && !jobModal.hidden) {
+    _closeJobModal();
   }
 });
 

@@ -312,9 +312,24 @@
         <button id="bulk-delete" class="bulk-delete-btn">Delete matching</button>
       </div>
       <ul id="jobs-list"></ul>
-      <div id="job-detail"></div>
     </section>
   </main>
+
+  <!-- Job detail modal: clicking any job in the list opens this. The
+       inner #job-detail is populated by renderJob() — same code path as
+       before, only the container moved into the modal. -->
+  <div id="job-modal" class="job-modal" hidden>
+    <div class="job-modal-backdrop"></div>
+    <div class="job-modal-window" role="dialog" aria-modal="true">
+      <header class="job-modal-header">
+        <span class="job-modal-title">Job</span>
+        <div class="job-modal-actions">
+          <button type="button" class="job-modal-close" aria-label="Close">✕</button>
+        </div>
+      </header>
+      <div id="job-detail" class="job-modal-body"></div>
+    </div>
+  </div>
 
   <!-- File preview modal (populated by openFileModal() in app.js) -->
   <div id="file-modal" class="file-modal" hidden>

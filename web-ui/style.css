@@ -525,3 +525,56 @@ button[type="submit"], #refresh-jobs {
 .run-log .rl-think-body   { color: #d4a72c; font-style: italic; }
 .run-log .rl-done-body    { color: #a5d6ff; }
 .run-log .rl-error-body   { color: #ffd5d3; }
+
+/* Job detail modal — full job render lifted out of the page into an
+   overlay. Lower z-index than file-modal so file previews stack above. */
+body.modal-open { overflow: hidden; }
+.job-modal {
+  position: fixed; inset: 0; z-index: 800;
+  display: flex; align-items: center; justify-content: center;
+}
+.job-modal[hidden] { display: none; }
+.job-modal-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  cursor: pointer;
+}
+.job-modal-window {
+  position: relative;
+  width: min(1200px, 95vw);
+  height: min(880px, 92vh);
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.job-modal-header {
+  display: flex; align-items: center; gap: 0.6rem;
+  padding: 0.55rem 0.95rem;
+  background: #161b22;
+  border-bottom: 1px solid #30363d;
+  font-size: 0.9rem;
+}
+.job-modal-title {
+  font-weight: 600; color: #e6edf3;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.job-modal-actions {
+  margin-left: auto;
+  display: flex; align-items: center; gap: 0.4rem;
+}
+.job-modal-actions button {
+  background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+  padding: 0.25rem 0.6rem; border-radius: 5px;
+  font-size: 0.8rem; cursor: pointer;
+}
+.job-modal-actions button:hover { background: #30363d; }
+.job-modal-close { padding: 0.25rem 0.55rem !important; }
+.job-modal-body {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 0.9rem 1rem;
+  background: #0d1117;
+}
