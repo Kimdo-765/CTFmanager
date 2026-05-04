@@ -527,7 +527,9 @@ async function renderJob(id) {
   }
   const job = await res.json();
 
-  const logRes = await fetch(`${API}/jobs/${id}/log`);
+  // Cap the polling fetch at 256 KB so verbose Claude output (after a
+  // big Read or Bash dump) doesn't make every 2s poll re-ship megabytes.
+  const logRes = await fetch(`${API}/jobs/${id}/log?tail=262144`);
   const log = await logRes.text();
 
   // Preserve log scroll position across re-renders. If the user was already

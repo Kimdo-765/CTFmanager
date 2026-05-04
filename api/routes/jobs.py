@@ -235,10 +235,31 @@ def delete_job(job_id: str):
 
 
 @router.get("/{job_id}/log", response_class=PlainTextResponse)
-def get_job_log(job_id: str):
+def get_job_log(job_id: str, tail: int | None = None):
+    """Return run.log. With ?tail=N (bytes), returns at most the last N
+    bytes — used by the polling UI so multi-MB logs don't get re-shipped
+    every 2s after the agent does verbose Read/Bash output. The cut is
+    aligned to the next newline so we never start mid-line.
+    """
     log = JOBS_DIR / job_id / "run.log"
     if not log.exists():
         return PlainTextResponse("", status_code=200)
+    if tail and tail > 0:
+        try:
+            size = log.stat().st_size
+        except OSError:
+            return PlainTextResponse("", status_code=200)
+        if size > tail:
+            with log.open("rb") as fp:
+                fp.seek(size - tail)
+                fp.readline()  # skip partial line
+                data = fp.read()
+            text = data.decode("utf-8", errors="replace")
+            header = (
+                f"…(showing last {len(data)} of {size} bytes — "
+                f"download full log via /api/jobs/{job_id}/file/run.log)…\n"
+            )
+            return PlainTextResponse(header + text)
     return PlainTextResponse(log.read_text(errors="replace"))
 
 

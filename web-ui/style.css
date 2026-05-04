@@ -217,7 +217,6 @@ textarea, select {
   margin: 0.4rem 0 0 0;
   font-size: 0.82rem; color: #c9d1d9;
   white-space: pre-wrap; word-break: break-word;
-  max-height: 240px; overflow-y: auto;
   font-family: inherit;
 }
 .description-hint {
@@ -231,7 +230,7 @@ textarea, select {
 }
 .description-hint .description-text {
   background: transparent; border: 0; padding: 0.2rem 0 0 0;
-  color: #e6dffa; max-height: 200px;
+  color: #e6dffa;
 }
 
 /* Manual-hint inline form (opens when "✏ Retry with my hint" is clicked) */
