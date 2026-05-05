@@ -512,27 +512,52 @@ def budget_exceeded(tool_calls: int, work_dir: Path, expected: tuple[str, ...]) 
 
 _HEARTBEAT_MIN_INTERVAL_S = 5.0
 _heartbeat_state: dict[str, float] = {}
+# Per-job accumulators. Each AssistantMessage emits a usage dict that
+# is the API call's own totals (NOT job-cumulative), so we have to
+# sum across turns to get the real spend. We also dedupe by
+# message_id when available — Anthropic occasionally re-emits the
+# same message snapshot during a stream and we don't want to
+# double-count it.
 _token_state: dict[str, dict[str, int]] = {}
+_token_seen_ids: dict[str, set[str]] = {}
+_token_turns: dict[str, int] = {}
 
 
-def _accumulate_tokens(job_id: str, usage: dict | None) -> dict[str, int]:
-    """Merge the SDK's per-turn usage dict into a job-scoped running
-    max. Anthropic's usage is cumulative within a request, so the
-    safe accumulator is element-wise max(prev, new) — never regress.
-    Returns the merged dict.
+_TOKEN_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+
+def _accumulate_tokens(
+    job_id: str, usage: dict | None, message_id: str | None = None,
+) -> dict[str, int]:
+    """SUM the SDK's per-turn usage into a job-scoped running total.
+
+    Anthropic's `usage` field is per-API-call (each AssistantMessage
+    has the totals for that one call), NOT job-cumulative. Taking
+    max() across turns under-reports massively for any non-trivial
+    run: 50 turns of 4k input each → real spend 200k, but max-only
+    shows 4k.
+
+    Dedupe by message_id when present so an SDK stream snapshot that
+    re-emits the same Assistant message doesn't double-count.
     """
     if not isinstance(usage, dict):
         return _token_state.get(job_id, {})
+    if message_id:
+        seen = _token_seen_ids.setdefault(job_id, set())
+        if message_id in seen:
+            return _token_state.get(job_id, {})
+        seen.add(message_id)
     cur = _token_state.setdefault(job_id, {})
-    for k in (
-        "input_tokens",
-        "output_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-    ):
+    for k in _TOKEN_KEYS:
         v = usage.get(k)
-        if isinstance(v, (int, float)) and v > cur.get(k, 0):
-            cur[k] = int(v)
+        if isinstance(v, (int, float)) and v > 0:
+            cur[k] = cur.get(k, 0) + int(v)
+    _token_turns[job_id] = _token_turns.get(job_id, 0) + 1
     return cur
 
 
@@ -559,12 +584,19 @@ def agent_heartbeat(job_id: str, msg) -> None:
     # in-memory; flush at most once per 5s except on Result.
     updates: dict = {}
     usage = getattr(msg, "usage", None)
-    tokens = _accumulate_tokens(job_id, usage)
+    msg_id = getattr(msg, "message_id", None)
+    tokens = _accumulate_tokens(job_id, usage, msg_id)
+    turns = _token_turns.get(job_id, 0)
 
     if is_result:
         cost = getattr(msg, "total_cost_usd", None)
         if isinstance(cost, (int, float)):
             updates["cost_usd"] = float(cost)
+        # Result also carries the SDK's own authoritative model_usage
+        # — surface alongside our running sum for cross-checking.
+        model_usage = getattr(msg, "model_usage", None)
+        if isinstance(model_usage, dict):
+            updates["model_usage"] = model_usage
 
     now = _time.monotonic()
     last = _heartbeat_state.get(job_id, 0.0)
@@ -578,6 +610,7 @@ def agent_heartbeat(job_id: str, msg) -> None:
         last_agent_event_at=datetime.now(timezone.utc).isoformat(),
         last_event_kind=kind,
         agent_tokens=tokens or None,
+        agent_turns=turns or None,
         **updates,
     )
 

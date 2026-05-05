@@ -873,14 +873,15 @@ async function renderJob(id, opts = {}) {
   }
 
   // Live token meter — reflects meta.agent_tokens (Anthropic usage,
-  // accumulated turn-by-turn) and meta.cost_usd. Hidden until at
-  // least one token has been observed.
+  // SUMMED across turns; cache_read is per-call too so we sum it as
+  // well). Hidden until at least one token has been observed.
   let tokensPill = "";
   const tk = job.agent_tokens || {};
   const ti = +tk.input_tokens || 0;
   const to = +tk.output_tokens || 0;
   const tcc = +tk.cache_creation_input_tokens || 0;
   const tcr = +tk.cache_read_input_tokens || 0;
+  const turns = +job.agent_turns || 0;
   const tTotal = ti + to + tcc + tcr;
   if (tTotal > 0) {
     const fmtN = (n) => {
@@ -889,12 +890,18 @@ async function renderJob(id, opts = {}) {
       return String(n);
     };
     const cost = typeof job.cost_usd === "number"
-      ? `· $${job.cost_usd.toFixed(4)}` : "";
+      ? ` · $${job.cost_usd.toFixed(4)}` : "";
+    const turnTag = turns > 0 ? ` · ${turns}t` : "";
     const fullTitle =
-      `input: ${ti.toLocaleString()}  ·  output: ${to.toLocaleString()}` +
-      `\ncache create: ${tcc.toLocaleString()}  ·  cache read: ${tcr.toLocaleString()}` +
-      (typeof job.cost_usd === "number" ? `\ncost: $${job.cost_usd.toFixed(6)}` : "");
-    tokensPill = `<span class="tokens-pill" title="${escapeHtml(fullTitle)}">📊 in ${fmtN(ti)} · out ${fmtN(to)}${tcr > 0 ? ` · cache ${fmtN(tcr)}` : ""} ${cost}</span>`;
+      `summed across ${turns} turns:\n` +
+      `  input (fresh):  ${ti.toLocaleString()}\n` +
+      `  output:         ${to.toLocaleString()}\n` +
+      `  cache create:   ${tcc.toLocaleString()}\n` +
+      `  cache read:     ${tcr.toLocaleString()}` +
+      (typeof job.cost_usd === "number" ? `\n  cost:           $${job.cost_usd.toFixed(6)}` : "");
+    // Always show cache_read — for prompt-cache-heavy runs it's
+    // where almost all the input lives.
+    tokensPill = `<span class="tokens-pill" title="${escapeHtml(fullTitle)}">📊 in ${fmtN(ti)} · out ${fmtN(to)} · cache ${fmtN(tcr)}${turnTag}${cost}</span>`;
   }
 
   // Soft-timeout decision banner. Fires when the worker's wall-clock
