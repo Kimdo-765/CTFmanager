@@ -56,13 +56,22 @@ def _log(job_id: str, line: str) -> None:
         fp.write(f"[{ts}] {line}\n")
 
 
+_TERMINAL_STATUSES = {"finished", "failed", "no_flag", "stopped"}
+
+
 def _write_meta(job_id: str, **updates) -> None:
     f = _job_dir(job_id) / "meta.json"
     meta = {}
     if f.exists():
         meta = json.loads(f.read_text())
+    now_iso = datetime.now(timezone.utc).isoformat()
+    new_status = updates.get("status")
+    if new_status == "running" and not meta.get("started_at"):
+        updates.setdefault("started_at", now_iso)
+    if new_status in _TERMINAL_STATUSES and not meta.get("finished_at"):
+        updates.setdefault("finished_at", now_iso)
     meta.update(updates)
-    meta["updated_at"] = datetime.now(timezone.utc).isoformat()
+    meta["updated_at"] = now_iso
     f.write_text(json.dumps(meta, indent=2))
 
 

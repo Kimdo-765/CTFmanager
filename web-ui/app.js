@@ -711,6 +711,26 @@ async function renderJob(id, opts = {}) {
   const timeout = job.job_timeout ? ` · timeout: ${job.job_timeout}s` : "";
   const modelInfo = job.model ? ` · model: ${escapeHtml(job.model)}` : "";
 
+  // Elapsed (running) / duration (terminal) — auto-stamped by the
+  // backend the first time status hits running / finished+friends.
+  let timing = "";
+  if (job.started_at) {
+    const start = new Date(job.started_at).getTime();
+    const end = job.finished_at ? new Date(job.finished_at).getTime() : Date.now();
+    const sec = Math.max(0, Math.round((end - start) / 1000));
+    const fmt = (s) => {
+      if (s < 60) return `${s}s`;
+      if (s < 3600) return `${Math.floor(s/60)}m ${s%60}s`;
+      const h = Math.floor(s/3600); const m = Math.floor((s%3600)/60);
+      return `${h}h ${m}m`;
+    };
+    if (job.finished_at) {
+      timing = ` · duration: ${fmt(sec)}`;
+    } else if (job.status === "running") {
+      timing = ` · elapsed: ${fmt(sec)} (running)`;
+    }
+  }
+
   // Soft-timeout decision banner. Fires when the worker's wall-clock
   // watchdog sets meta.awaiting_decision=true. The agent is still running
   // — the user picks Continue (let it run) or Stop (hard-kill).
@@ -864,7 +884,7 @@ async function renderJob(id, opts = {}) {
     <h3>Job ${job.id}
       <span class="status ${job.status}">${job.status}</span>
     </h3>
-    <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}${modelInfo}</small></div>
+    <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}${modelInfo}${timing}</small></div>
     ${timeoutBlock}
     ${descBlock}
     ${runBlock}

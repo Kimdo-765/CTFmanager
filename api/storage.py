@@ -22,9 +22,35 @@ def job_dir(job_id: str) -> Path:
     return p
 
 
+_TERMINAL_STATUSES = {"finished", "failed", "no_flag", "stopped"}
+
+
 def write_job_meta(job_id: str, meta: dict[str, Any]) -> None:
-    meta = {**meta, "updated_at": datetime.now(timezone.utc).isoformat()}
-    (job_dir(job_id) / "meta.json").write_text(json.dumps(meta, indent=2))
+    f = job_dir(job_id) / "meta.json"
+    prev: dict[str, Any] = {}
+    if f.exists():
+        try:
+            prev = json.loads(f.read_text())
+        except Exception:
+            prev = {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # Auto-stamp lifecycle timestamps so the UI can show elapsed /
+    # duration without each call site having to remember to set them.
+    new_status = meta.get("status")
+    if (
+        new_status == "running"
+        and not meta.get("started_at")
+        and not prev.get("started_at")
+    ):
+        meta["started_at"] = now_iso
+    if (
+        new_status in _TERMINAL_STATUSES
+        and not meta.get("finished_at")
+        and not prev.get("finished_at")
+    ):
+        meta["finished_at"] = now_iso
+    meta = {**meta, "updated_at": now_iso}
+    f.write_text(json.dumps(meta, indent=2))
 
 
 def read_job_meta(job_id: str) -> Optional[dict[str, Any]]:
