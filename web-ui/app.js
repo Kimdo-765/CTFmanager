@@ -43,6 +43,34 @@ function fillModelSelects() {
 
 let selectedJob = null;
 let pollTimer = null;
+// Lightweight 1-second tick that updates ONLY the timing pill's
+// textContent on running jobs. Independent of pollTimer (which
+// re-renders the whole detail panel and is paused on selection /
+// open forms), so the elapsed counter stays smooth.
+let livePillTimer = null;
+function _tickLivePill() {
+  document.querySelectorAll(".timing-pill.live").forEach((pill) => {
+    const startedIso = pill.dataset.startedAt;
+    if (!startedIso) return;
+    const sec = Math.max(0, Math.round((Date.now() - new Date(startedIso).getTime()) / 1000));
+    const fmt = sec < 60 ? `${sec}s`
+      : sec < 3600 ? `${Math.floor(sec/60)}m ${sec%60}s`
+      : `${Math.floor(sec/3600)}h ${Math.floor((sec%3600)/60)}m`;
+    // Only replace the text node holding the time; keep the inner
+    // "running" tag span untouched.
+    const tagEl = pill.querySelector(".timing-tag");
+    if (!tagEl) return;
+    pill.firstChild && (pill.firstChild.nodeValue = `⏱ ${fmt} `);
+  });
+  if (!document.querySelector(".timing-pill.live")) {
+    clearInterval(livePillTimer);
+    livePillTimer = null;
+  }
+}
+function _ensureLivePillTimer() {
+  if (livePillTimer) return;
+  livePillTimer = setInterval(_tickLivePill, 1000);
+}
 
 document.querySelectorAll(".tab").forEach((t) => {
   t.addEventListener("click", () => {
@@ -749,9 +777,12 @@ async function renderJob(id, opts = {}) {
   const timeout = job.job_timeout ? ` · timeout: ${job.job_timeout}s` : "";
   const modelInfo = job.model ? ` · model: ${escapeHtml(job.model)}` : "";
 
-  // Elapsed (running) / duration (terminal) — auto-stamped by the
-  // backend the first time status hits running / finished+friends.
-  let timing = "";
+  // Elapsed (running) / duration (terminal). Now rendered as a
+  // standalone badge next to the status pill so it doesn't get
+  // buried at the end of the small meta line. The running variant
+  // is also driven by a tiny per-second interval (see further down)
+  // independent of the 2-second poll re-render.
+  let timingPill = "";
   if (job.started_at) {
     const start = new Date(job.started_at).getTime();
     const end = job.finished_at ? new Date(job.finished_at).getTime() : Date.now();
@@ -763,9 +794,11 @@ async function renderJob(id, opts = {}) {
       return `${h}h ${m}m`;
     };
     if (job.finished_at) {
-      timing = ` · duration: ${fmt(sec)}`;
+      timingPill = `<span class="timing-pill done" title="started ${escapeHtml(job.started_at)}\nfinished ${escapeHtml(job.finished_at)}">⏱ ${fmt(sec)}</span>`;
     } else if (job.status === "running") {
-      timing = ` · elapsed: ${fmt(sec)} (running)`;
+      timingPill = `<span class="timing-pill live" data-started-at="${escapeHtml(job.started_at)}" title="started ${escapeHtml(job.started_at)}">⏱ ${fmt(sec)} <span class="timing-tag">running</span></span>`;
+    } else if (job.status === "queued") {
+      timingPill = `<span class="timing-pill queued">⏱ queued</span>`;
     }
   }
 
@@ -921,8 +954,9 @@ async function renderJob(id, opts = {}) {
   detail.innerHTML = `
     <h3>Job ${job.id}
       <span class="status ${job.status}">${job.status}</span>
+      ${timingPill}
     </h3>
-    <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}${modelInfo}${timing}</small></div>
+    <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}${modelInfo}</small></div>
     ${timeoutBlock}
     ${descBlock}
     ${runBlock}
@@ -941,6 +975,9 @@ async function renderJob(id, opts = {}) {
       <pre class="run-log" data-job-id="${id}" data-status="${escapeHtml(job.status || "")}">${log ? colorizeRunLog(log) : "(empty)"}</pre>
     </div>
   `;
+
+  // Spin up the per-second live timer when a running pill is on screen.
+  if (job.status === "running") _ensureLivePillTimer();
 
   const newPre = detail.querySelector("pre.run-log");
   if (newPre) {

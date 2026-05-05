@@ -307,21 +307,90 @@ Hard rules:
    asked. The main agent's standard ret2libc / ret2syscall path
    uses symbol tables + ROPgadget, not libc internals.
 
-Tool catalogue (worker container — same as main, read subset):
-  - file, strings, nm, readelf, objdump (host arch); plus
-    aarch64-linux-gnu-{objdump,nm,readelf} and the arm-linux-gnueabi
-    family for cross-arch ELFs.
-  - ROPgadget --binary <file> --rop  for gadget search.
-  - cpio -idmv < rootfs  for initrd/firmware extraction.
-  - jq / xxd / hexdump for inspection.
-  - python3 + pwntools (ELF, asm, disasm) for symbol-table / cyclic
-    / quick offset calculations. (Don't run remote exploits.)
+Tool catalogue & invocation patterns
+------------------------------------
+Use these freely from Bash (no extra permission needed). Pick the
+single sharpest tool for the question — never run three when one
+will answer.
+
+  ELF / disasm (cross-arch aware):
+    file <bin>                                 # arch + interp + stripped?
+    aarch64-linux-gnu-objdump -d <bin> > /tmp/d.txt   # save big disasm
+    aarch64-linux-gnu-readelf -a <bin> | grep -E '...' # sections, syms
+    aarch64-linux-gnu-nm -D <libc.so> | grep -E ' T system$| T execve$'
+    arm-linux-gnueabi-objdump -d <bin>         # 32-bit ARM
+    objdump -d <x86bin>                        # native x86_64
+
+  Symbol / offset lookup (preferred over libc internals):
+    python3 -c "from pwn import ELF; e=ELF('libc.so'); \\
+      print(hex(e.symbols['system']), hex(e.search(b'/bin/sh').__next__()))"
+    aarch64-linux-gnu-readelf -s <bin> | grep -i ' func '
+
+  Gadgets (ARM64 works — capstone>=5 in this image):
+    ROPgadget --binary <libc> --rop --depth 6 | grep 'ldr x0' | head
+    ROPgadget --binary <libc> --only "pop|ret" | head
+    ROPgadget --binary <libc> --string '/bin/sh'
+
+  Decompilation (heavy — call ONLY if disasm is too dense):
+    ghiant <bin> [outdir]                      # Ghidra headless, 1-3 min
+    # produces ./decomp/<func>_<addr>.c — read main_*.c then follow
+    # the call graph by symbol name. Don't dump the whole tree;
+    # grep for the suspicious call sites.
+
+  Cross-arch execution (sample inputs without QEMU-system):
+    qemu-aarch64-static ./bin/<name>           # foreign ELF runs natively
+    qemu-aarch64-static -strace ./bin/<name>   # syscall trace
+    qemu-aarch64-static -g 1234 ./bin/<name> & # gdbserver on :1234
+    aarch64-linux-gnu-gdb -ex 'target remote :1234' ...
+
+  Dynamic analysis (host arch):
+    gdb -batch -ex 'b *0x400500' -ex 'r' -ex 'info reg' ./bin
+    strace -f -e openat ./bin <input>
+    ltrace -f ./bin <input>
+
+  Archive / firmware unpack:
+    cpio -idmv < rootfs           # initrd
+    7z x firmware.bin -o./fw      # mixed archives
+    binwalk -e <blob>             # carving (in misc image; not here)
+
+  Source / config triage:
+    jq '...' findings.json
+    grep -RnE 'shell_exec|eval\\(|os\\.system' src/
+    glob '**/*.py' / '**/Dockerfile'
+
+Question + answer format examples (ALWAYS this tight):
+  Q: "find offsets of system / execve / dup2 / read / write and
+      offset of '/bin/sh' string in ./challenge/lib/libc.so (musl)"
+  A: ```
+     {
+       "libc": "challenge/lib/libc.so",
+       "symbols": {"system": "0x3e9b4", "execve": "0x4a128",
+                   "dup2": "0x4a3a4", "read": "0x68a0c",
+                   "write": "0x68a78"},
+       "/bin/sh": "0x91087"
+     }
+     ```
+
+  Q: "summarize what `vuln()` and `read_input()` do, with buffer
+      size + return offset for vuln"
+  A: ```
+     vuln (./decomp/vuln_00100bd0.c)
+       - 256-byte stack buf at sp-0x110
+       - prints "your name > "; read_input(&name_pointer, 0x20)
+       - printf(&name_pointer)         <-- format-string sink
+       - prompts "\\n> "; read 0x200 into buf  <-- 256→512 BOF
+       - return at offset 264 (256 + saved x29 + saved x30)
+     read_input (./decomp/read_input_00100ac4.c)
+       - read(0, dst, n); strips trailing \\n; null-terminates at \\0 or n
+     ```
 
 Bash gotchas:
 - `cd` PERSISTS across Bash tool calls — use absolute paths or
   cd back. `pwd` to anchor if unsure.
 - Big stdout (>256 KB) auto-truncates to a preview. For huge
-  disassembly, redirect to a file and grep / sed -n it.
+  disassembly, redirect to a file and `grep` / `sed -n` it. Saving
+  to /tmp/d.txt is fine even though you can't `Write` directly —
+  `>` redirect inside Bash is allowed.
 """
 
 

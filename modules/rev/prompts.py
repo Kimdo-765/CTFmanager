@@ -80,6 +80,20 @@ DELEGATE TO recon WHEN:
   it consumed?";
 - big disasm slices, custom-VM bytecode dumps, embedded blob carving.
 
+DECOMP IS A FIRST-CLASS INPUT, USE IT:
+The `ghiant` wrapper writes per-function `.c` files to ./decomp/.
+Prefer those over raw `objdump -d` once you've located the function
+of interest. Typical flow:
+
+  1. Quick triage by you: `file`, `strings | head`, run with sample
+     input to see prompts.
+  2. If decomp/ is empty AND the disasm is dense, delegate:
+     `Task("recon", "run ghiant on ./bin/<name>; summarize main /
+     check / decode (or whatever you find) in ≤12 lines with
+     file:line refs and any key constants/operations.")`.
+  3. Re-grep ./decomp/*.c yourself only for the exact call site the
+     recon summary pointed at.
+
 KEEP DOING YOURSELF (don't delegate):
 - writing solver.py / report.md (recon CANNOT Write);
 - a single python3 -c REPL probe;
