@@ -20,6 +20,7 @@ from claude_agent_sdk import (
 )
 
 from modules._common import (
+    agent_tag,
     budget_exceeded,
     build_recon_agents,
     capture_session_id,
@@ -91,25 +92,30 @@ async def _run_agent(
             capture_session_id(msg, job_id)
             if isinstance(msg, AssistantMessage):
                 summary["messages"] += 1
+                tag = agent_tag(msg)
                 for block in msg.content:
                     if isinstance(block, TextBlock):
-                        log_line(job_id, f"AGENT: {block.text[:500]}")
+                        log_line(job_id, f"[{tag}] AGENT: {block.text[:500]}")
                     elif isinstance(block, ToolUseBlock):
                         summary["tool_calls"] += 1
                         args_preview = json.dumps(block.input)[:200]
-                        log_line(job_id, f"TOOL {block.name}: {args_preview}")
+                        log_line(
+                            job_id,
+                            f"[{tag}] TOOL {block.name}: {args_preview}",
+                        )
                     elif isinstance(block, ThinkingBlock):
                         log_thinking(
-                            lambda s: log_line(job_id, s),
+                            lambda s, _t=tag: log_line(job_id, f"[{_t}] {s}"),
                             "THINK", block.thinking,
                         )
             elif isinstance(msg, UserMessage):
+                tag = agent_tag(msg)
                 content = msg.content if isinstance(msg.content, list) else []
                 for block in content:
                     if isinstance(block, ToolResultBlock):
                         log_line(
                             job_id,
-                            format_tool_result(block.content, block.is_error),
+                            f"[{tag}] " + format_tool_result(block.content, block.is_error),
                         )
             if budget_exceeded(summary["tool_calls"], work_dir, ("exploit.py",)):
                 log_line(

@@ -636,6 +636,30 @@ button[type="submit"], #refresh-jobs {
 .run-log .rl-done-body    { color: #a5d6ff; }
 .run-log .rl-error-body   { color: #ffd5d3; }
 
+/* Agent identity chip — distinguishes main writer vs recon subagent.
+   Lines from `recon` also get a small ↳ indent marker so a Task
+   delegation reads visually like a nested call. */
+.run-log .rl-agent-tag {
+  display: inline-block;
+  font-size: 0.68rem;
+  letter-spacing: 0.2px;
+  font-weight: 700;
+  padding: 0 0.35rem;
+  margin-right: 0.35rem;
+  border-radius: 4px;
+  vertical-align: 0.05em;
+  border: 1px solid transparent;
+}
+.run-log .rl-agent-tag-main {
+  color: #d2a8ff; background: #1c0d2e; border-color: #6e3eaa66;
+}
+.run-log .rl-agent-tag-recon {
+  color: #ffa657; background: #2a1b08; border-color: #ffa65766;
+}
+.run-log .rl-recon-indent {
+  color: #6e7681; margin-right: 0.1rem;
+}
+
 /* Job detail modal — full job render lifted out of the page into an
    overlay. Lower z-index than file-modal so file previews stack above. */
 body.modal-open { overflow: hidden; }

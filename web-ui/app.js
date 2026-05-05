@@ -1141,16 +1141,34 @@ function _colorizeRunLogLine(line) {
     return `<span class="rl-system">${escapeHtml(line)}</span>`;
   }
   const ts = m[1];
-  const rest = m[2];
+  let rest = m[2];
+
+  // Per-line agent tag: analyzers prefix lines from the main vs the
+  // recon subagent with "[main] " / "[recon] " right after the
+  // timestamp. Strip the tag and render it as a colored chip; recon
+  // lines get a slight indent so a Task delegation reads visually
+  // like a nested call.
+  let agentChip = "";
+  let isRecon = false;
+  const tagMatch = rest.match(/^\[(main|recon)\]\s+([\s\S]*)$/);
+  if (tagMatch) {
+    const tag = tagMatch[1];
+    isRecon = tag === "recon";
+    rest = tagMatch[2];
+    agentChip = `<span class="rl-agent-tag rl-agent-tag-${tag}">${tag}</span>`;
+  }
+
+  const indent = isRecon ? '<span class="rl-recon-indent">↳ </span>' : "";
+
   for (const p of _RUNLOG_PATTERNS) {
     const mm = rest.match(p.re);
     if (mm) {
-      return `<span class="rl-ts">[${ts}]</span> ${p.render(mm)}`;
+      return `<span class="rl-ts">[${ts}]</span> ${agentChip}${indent}${p.render(mm)}`;
     }
   }
   // System / unrecognised lines (e.g. "Launching Claude agent…",
   // "User chose CONTINUE…", "⏰ Soft timeout reached…").
-  return `<span class="rl-ts">[${ts}]</span> <span class="rl-system">${escapeHtml(rest)}</span>`;
+  return `<span class="rl-ts">[${ts}]</span> ${agentChip}${indent}<span class="rl-system">${escapeHtml(rest)}</span>`;
 }
 
 function colorizeRunLog(text) {

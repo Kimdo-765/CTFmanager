@@ -478,6 +478,19 @@ def budget_exceeded(tool_calls: int, work_dir: Path, expected: tuple[str, ...]) 
     return True
 
 
+def agent_tag(msg) -> str:
+    """Return a stable identifier for whichever agent emitted `msg`.
+
+    Subagents inherit the `parent_tool_use_id` of the Task call that
+    spawned them, so messages with a non-None value come from the
+    `recon` subagent. Otherwise it's the main agent. This gets
+    rendered as a per-line prefix in run.log so the user can tell
+    main work apart from recon delegation at a glance.
+    """
+    parent = getattr(msg, "parent_tool_use_id", None)
+    return "recon" if parent else "main"
+
+
 def capture_session_id(msg, job_id: str) -> None:
     """If `msg` is the SDK 'init' SystemMessage, persist its session_id
     to meta.json so a later /retry or /resume can fork the conversation
