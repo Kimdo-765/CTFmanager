@@ -64,6 +64,19 @@ Suggested workflow:
 7. Do NOT execute the final `solver.py` yourself. The orchestrator
    runs it in a sandboxed runner if auto-run is enabled.
 
+Hard guardrails — read carefully, these prevent token blowups
+-------------------------------------------------------------
+1. INVESTIGATION BUDGET. After ~10 tool calls with no draft
+   `solver.py` written, write the draft from your current best
+   hypothesis. Iterate after. Burning 30+ turns on analysis
+   without solver code is a failure mode that exhausts the
+   conversation context.
+2. NO LIBC INTERNAL DIVE. Don't disassemble musl/glibc printf /
+   vfprintf / vararg dispatchers / FILE struct internals — they
+   are not part of any standard solving path.
+3. NO REPEATED `Read /tmp/*_disasm.txt` SLICES. Grep what you
+   need once, don't accumulate slices in context.
+
 Constraints:
 - Treat `./bin/` as read-only.
 - Decompiler output is best-effort; cross-check ambiguous parts with

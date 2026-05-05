@@ -37,6 +37,17 @@ Your job:
    run it in a sandboxed container after you finish if the user enabled
    auto-run. You may still test ideas with quick Python REPLs in Bash.
 
+Hard guardrails — prevent token blowups
+---------------------------------------
+1. INVESTIGATION BUDGET. After ~10 tool calls with no draft
+   `solver.py` written, write the draft from your current best
+   hypothesis. The first version doesn't have to recover the
+   flag — it has to exist so you can iterate.
+2. NO LIB INTERNAL DIVE. Don't reverse-engineer pycryptodome /
+   gmpy2 / sympy internals — call them. If you need a specific
+   primitive (AES-CBC, RSA blinded sig, EC scalar mult), import
+   and use it.
+
 Constraints:
 - Treat the source directory as read-only.
 - Prefer small, standard library calls over hand-rolling number theory.

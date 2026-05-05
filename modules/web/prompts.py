@@ -74,6 +74,20 @@ local or remote:
    a comment / file the attacker can later GET back, an SSRF whose
    response is reflected on a page, a DNS-record injection, etc.
 
+Hard guardrails — prevent token blowups
+---------------------------------------
+1. INVESTIGATION BUDGET. After ~10 tool calls with no draft
+   `exploit.py` written, write the draft from your current best
+   hypothesis. Iterate after. Endless probing without exploit
+   code exhausts the conversation context and kills the run.
+2. NO FRAMEWORK INTERNAL DIVE. Don't disassemble or read source
+   of Django/Flask/Laravel/Express internals to understand how
+   the framework "really" handles requests — pick the bug class
+   from the user's app code and write the payload.
+3. CACHE YOUR PROBES. Don't curl the same endpoint 5 times with
+   trivially different parameters; capture once with `-D headers
+   -o body` and read locally.
+
 Constraints:
 - Do NOT modify files inside the source directory; treat it as read-only reference.
 - Write exploit.py and report.md in the current working directory.

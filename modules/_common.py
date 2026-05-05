@@ -279,6 +279,30 @@ REFUSAL_HINTS = (
 )
 
 
+def budget_exceeded(tool_calls: int, work_dir: Path, expected: tuple[str, ...]) -> bool:
+    """Trip-wire: True when the agent has burned `INVESTIGATION_BUDGET`
+    tool calls without producing any of the expected output files.
+
+    Used by analyzers as a circuit breaker — better to abort early
+    and let the user retry with a hint than to let the SDK exhaust
+    the conversation context and exit with 'Prompt is too long'.
+    The threshold is intentionally generous (default 60) — the
+    soft prompt budget is 10. We only act on prolonged starvation.
+    """
+    try:
+        cap = int(os.environ.get("INVESTIGATION_BUDGET", "60"))
+    except ValueError:
+        cap = 60
+    if cap <= 0:
+        return False
+    if tool_calls < cap:
+        return False
+    for name in expected:
+        if (work_dir / name).is_file():
+            return False
+    return True
+
+
 def capture_session_id(msg, job_id: str) -> None:
     """If `msg` is the SDK 'init' SystemMessage, persist its session_id
     to meta.json so a later /retry or /resume can fork the conversation

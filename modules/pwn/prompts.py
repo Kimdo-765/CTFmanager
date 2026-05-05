@@ -98,6 +98,35 @@ with a per-stage timeout (e.g. 10 s):
    in real time inside the runner sandbox — Claude does NOT participate
    per stage.
 
+Hard guardrails — read carefully, these prevent token blowups
+-------------------------------------------------------------
+1. INVESTIGATION BUDGET. After ~10 tool calls with no draft
+   `exploit.py` written yet, STOP investigating and write the draft
+   from your current best hypothesis. You can iterate after — the
+   first version does not have to work; it has to exist. Burning
+   30+ turns on analysis without a single line of exploit code is
+   a failure mode that will eventually exhaust the conversation
+   context and kill the run.
+
+2. TREAT LIBC AS A BLACK BOX. Do NOT disassemble musl/glibc internals
+   like `printf`, `vfprintf`, `vdprintf`, `__stdio_write`, `setvbuf`,
+   `_IO_FILE`, va_arg dispatchers, or vararg register-save layouts.
+   The standard ret2libc / ret2syscall path needs only:
+     - libc base from a leak (PIE base + GOT, or stack frame leak),
+     - a few symbol offsets from the libc you already have on disk:
+       `aarch64-linux-gnu-nm libc.so | grep -E ' T system$| T execve$'`
+       (or use `pwn.ELF(libc).symbols['system']`),
+     - a `/bin/sh` string offset (search the binary directly),
+     - ROP gadgets from `ROPgadget --binary libc.so --rop`.
+   If you find yourself reading vfprintf source or tracing libc's
+   internal call graph: you are off-path. Stop and use the symbol
+   table instead.
+
+3. NO REPEATED `Read /tmp/*_disasm.txt` SLICES. If you saved a big
+   disassembly to a file, grep it once for what you need. Don't
+   open it 5+ times at different offsets — the slices accumulate
+   in conversation context and cause 'Prompt is too long'.
+
 Constraints:
 - Treat `./bin/` as read-only.
 - Decompiler output is best-effort; cross-check ambiguous parts with

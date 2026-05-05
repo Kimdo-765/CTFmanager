@@ -20,6 +20,7 @@ from claude_agent_sdk import (
 )
 
 from modules._common import (
+    budget_exceeded,
     capture_session_id,
     classify_agent_error,
     collect_outputs,
@@ -108,7 +109,18 @@ async def _run_agent(
                             job_id,
                             format_tool_result(block.content, block.is_error),
                         )
-            elif isinstance(msg, ResultMessage):
+            if budget_exceeded(summary["tool_calls"], work_dir, ("exploit.py",)):
+                log_line(
+                    job_id,
+                    "BUDGET_ABORT: investigation budget exceeded "
+                    f"({summary['tool_calls']} tool calls, no exploit.py). "
+                    "Stopping early — retry with a hint to push the agent "
+                    "past the analysis loop.",
+                )
+                summary["agent_error"] = "investigation budget exceeded"
+                summary["agent_error_kind"] = "budget"
+                break
+            if isinstance(msg, ResultMessage):
                 summary["result"] = {
                     "duration_ms": msg.duration_ms,
                     "num_turns": msg.num_turns,
