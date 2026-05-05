@@ -1050,8 +1050,6 @@ async function renderJob(id, opts = {}) {
     <h3>Job ${job.id}
       <span class="status ${job.status}">${job.status}</span>
       ${timingPill}
-      ${livenessPill}
-      ${tokensPill}
     </h3>
     <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}${modelInfo}</small></div>
     ${timeoutBlock}
@@ -1070,6 +1068,11 @@ async function renderJob(id, opts = {}) {
         <span class="run-log-title">job ${escapeHtml(id)} — ${escapeHtml(job.module || "?")}</span>
       </div>
       <pre class="run-log" data-job-id="${id}" data-status="${escapeHtml(job.status || "")}">${log ? colorizeRunLog(log) : "(empty)"}</pre>
+      ${livenessPill || tokensPill ? `
+      <div class="run-log-footer">
+        ${livenessPill}
+        ${tokensPill}
+      </div>` : ""}
     </div>
   `;
 
