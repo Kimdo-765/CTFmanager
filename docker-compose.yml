@@ -25,7 +25,12 @@ services:
       - ./data:/data
       - ./modules:/app/modules:ro
       - ./web-ui:/app/web-ui:ro
-      - ${HOST_CLAUDE_HOME:-${HOME}/.claude}:/root/.claude:ro
+      # rw (not ro) so /retry and /resume can copy the previous SDK
+      # session's transcript jsonl into the new job's project-key
+      # directory under ~/.claude/projects/. Without this the SDK
+      # CLI transport searches only the new cwd's project key and
+      # can't find the prior session, so fork_session silently fails.
+      - ${HOST_CLAUDE_HOME:-${HOME}/.claude}:/root/.claude
       # api needs the docker socket to kill sibling containers spawned by
       # workers when the user deletes a running job.
       - /var/run/docker.sock:/var/run/docker.sock

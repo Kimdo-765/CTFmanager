@@ -27,6 +27,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     TextBlock,
+    project_key_for_directory,
     query,
 )
 from fastapi import APIRouter, HTTPException, Request
@@ -261,6 +262,49 @@ async def _ask_reviewer_streaming(context: str) -> AsyncIterator[tuple[str, dict
     yield "done", {"hint": hint}
 
 
+_CLAUDE_HOME = Path("/root/.claude")
+
+
+def _carry_session_jsonl(sid: str, prev_work: Path, new_work: Path) -> None:
+    """Make a prev SDK session reachable from the new job's cwd.
+
+    The bundled `claude` CLI (the SDK's default transport) indexes
+    transcripts by `project_key_for_directory(cwd)`. When the new
+    job's cwd differs from the prior job's cwd — which it always
+    does — fork_session=True can't find the session id and the
+    spawn dies in ~2 seconds with exit 1. Copying the jsonl into
+    the new project-key directory makes the lookup succeed.
+
+    Best-effort: silently no-ops if anything is missing. Worst case
+    the new agent boots fresh, which is the fallback path the
+    preamble already documents.
+    """
+    try:
+        prev_key = project_key_for_directory(str(prev_work))
+        new_key = project_key_for_directory(str(new_work))
+    except Exception:
+        return
+    src = _CLAUDE_HOME / "projects" / prev_key / f"{sid}.jsonl"
+    if not src.is_file():
+        return
+    dst_dir = _CLAUDE_HOME / "projects" / new_key
+    try:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst_dir / src.name)
+        # Subagent jsonls live in a `subagents/` subdir alongside the
+        # main session file — copy those too so subagent context isn't
+        # lost on fork.
+        sub_src = _CLAUDE_HOME / "projects" / prev_key / sid / "subagents"
+        if sub_src.is_dir():
+            sub_dst = dst_dir / sid / "subagents"
+            shutil.copytree(sub_src, sub_dst, dirs_exist_ok=True)
+    except OSError:
+        # ~/.claude mounted read-only, or some other fs error. Caller
+        # already records the prev session id in meta, so the agent
+        # will just start fresh — which is the documented fallback.
+        pass
+
+
 def _resubmit(
     prev_meta: dict,
     hint: str,
@@ -299,6 +343,14 @@ def _resubmit(
         prev_work = prev_jd / "work"
         if prev_work.is_dir():
             shutil.copytree(prev_work, new_jd / "work", dirs_exist_ok=False)
+        # Carry the SDK session transcript so fork_session=True can
+        # actually find the prior conversation. The CLI transport
+        # derives the project key from cwd; without copying the jsonl
+        # into the *new* cwd's key directory, the fork attempt silently
+        # fails (~2s exit 1, no init message).
+        prev_sid = prev_meta.get("claude_session_id")
+        if prev_sid:
+            _carry_session_jsonl(prev_sid, prev_work, new_jd / "work")
 
     # Target: caller can override (user-supplied via UI). Empty
     # override falls back to the prior target. Sentinel "(none)" lets
