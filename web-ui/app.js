@@ -668,6 +668,24 @@ async function renderJob(id, opts = {}) {
   ) {
     return null;
   }
+  // Same idea for an active selection inside the run log: the polling
+  // re-render replaces the text nodes and collapses the user's
+  // selection, which makes copying live logs miserable. Skip the
+  // cycle whenever the user has any selection inside the run log.
+  if (!opts.force) {
+    try {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed) {
+        const anchor = sel.anchorNode;
+        const focus = sel.focusNode;
+        const inRunLog = (n) =>
+          !!n && !!(n.nodeType === 1 ? n : n.parentElement)?.closest?.(".run-log");
+        if (inRunLog(anchor) || inRunLog(focus)) {
+          return null;
+        }
+      }
+    } catch (_) {}
+  }
   const res = await fetch(`${API}/jobs/${id}`);
   if (!res.ok) {
     detail.textContent = "job not found";
