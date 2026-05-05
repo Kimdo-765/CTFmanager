@@ -268,6 +268,7 @@ def _resubmit(
     *,
     carry_work: bool = False,
     mark_resumed: bool = False,
+    target_override: str | None = None,
 ) -> str:
     """Enqueue a new job in the same module with description + hint, copying
     over the original uploaded source/binary so the user doesn't re-upload.
@@ -299,7 +300,17 @@ def _resubmit(
         if prev_work.is_dir():
             shutil.copytree(prev_work, new_jd / "work", dirs_exist_ok=False)
 
-    target = (prev_meta.get("target_url") or "").strip() or None
+    # Target: caller can override (user-supplied via UI). Empty
+    # override falls back to the prior target. Sentinel "(none)" lets
+    # the user explicitly clear a target without re-using the prior.
+    if target_override is not None:
+        clean_t = target_override.strip()
+        if clean_t.lower() in ("(none)", "none", ""):
+            target = None
+        else:
+            target = clean_t
+    else:
+        target = (prev_meta.get("target_url") or "").strip() or None
     # Strip any prior [retry-hint] section so chained retries don't
     # accumulate stale hint paragraphs in the description blob — the
     # newest hint is always the only one attached.
@@ -420,25 +431,40 @@ def _validate_retry(safe: str, *, require_claude_auth: bool = True) -> tuple[Pat
     return jd, prev_meta
 
 
-async def _read_manual_hint(request: Request) -> str | None:
-    """Return a sanitized user-supplied hint from the request body, or None.
+_MAX_MANUAL_TARGET = 1024
 
-    Accepts JSON `{"hint": "..."}`. Empty / whitespace-only hints become None
-    so callers can fall back to the reviewer path.
+
+async def _read_retry_body(request: Request) -> tuple[str | None, str | None]:
+    """Parse `{"hint": "...", "target": "..."}` from the request body.
+
+    Both fields are optional. Empty / whitespace-only values become None
+    so callers can detect "user supplied nothing" vs "user wanted to
+    blank it out". Callers that want to clear a target explicitly can
+    pass the literal string "(none)" — handled at the call site.
     """
     try:
         body = await request.json()
     except Exception:
-        return None
+        return None, None
     if not isinstance(body, dict):
-        return None
-    raw = body.get("hint")
-    if not isinstance(raw, str):
-        return None
-    cleaned = raw.strip()
-    if not cleaned:
-        return None
-    return cleaned[:_MAX_MANUAL_HINT]
+        return None, None
+
+    hint_raw = body.get("hint")
+    hint = (hint_raw.strip()[:_MAX_MANUAL_HINT]) if isinstance(hint_raw, str) and hint_raw.strip() else None
+
+    target_raw = body.get("target") or body.get("target_url")
+    target = (target_raw.strip()[:_MAX_MANUAL_TARGET]) if isinstance(target_raw, str) and target_raw.strip() else None
+    return hint, target
+
+
+async def _read_manual_hint(request: Request) -> str | None:
+    """Back-compat shim. Reads only the hint field; loses target.
+
+    All current call sites have been migrated to _read_retry_body, so
+    this exists only for any out-of-tree caller still on the old name.
+    """
+    hint, _ = await _read_retry_body(request)
+    return hint
 
 
 @router.post("/{job_id}/retry/stream")
@@ -457,7 +483,7 @@ async def retry_with_hint_stream(job_id: str, request: Request):
     omitted — only 'submitting' and 'done' fire.
     """
     safe = Path(job_id).name
-    manual_hint = await _read_manual_hint(request)
+    manual_hint, target_override = await _read_retry_body(request)
     jd, prev_meta = _validate_retry(safe, require_claude_auth=manual_hint is None)
 
     async def event_gen():
@@ -505,7 +531,11 @@ async def retry_with_hint_stream(job_id: str, request: Request):
         yield sse("stage", {"name": "submitting"})
         augmented = _retry_preamble(safe, hint)
         try:
-            new_id = _resubmit(prev_meta, augmented, jd, carry_work=True)
+            new_id = _resubmit(
+                prev_meta, augmented, jd,
+                carry_work=True,
+                target_override=target_override,
+            )
         except HTTPException as he:
             yield sse("error", {
                 "message": f"submit rejected: {he.detail}",
@@ -525,6 +555,7 @@ async def retry_with_hint_stream(job_id: str, request: Request):
             "retry_of": safe,
             "manual": manual_hint is not None,
             "carried_work": (jd / "work").is_dir(),
+            "target_overridden": target_override is not None,
         })
 
     return StreamingResponse(
@@ -541,12 +572,14 @@ async def retry_with_hint_stream(job_id: str, request: Request):
 async def retry_with_hint(job_id: str, request: Request):
     """Non-streaming form, kept for clients that don't want SSE.
 
-    Request body (optional): JSON `{"hint": "..."}`. When provided, the
-    reviewer call is skipped and the user's hint is appended to the new
-    job's description directly.
+    Request body (optional): JSON `{"hint": "...", "target": "..."}`.
+    When `hint` is provided, the reviewer call is skipped and the
+    user's hint is appended to the new job's description directly.
+    When `target` is provided it overrides the prior job's
+    target_url; pass "(none)" to clear it.
     """
     safe = Path(job_id).name
-    manual_hint = await _read_manual_hint(request)
+    manual_hint, target_override = await _read_retry_body(request)
     jd, prev_meta = _validate_retry(safe, require_claude_auth=manual_hint is None)
 
     if manual_hint is not None:
@@ -571,13 +604,18 @@ async def retry_with_hint(job_id: str, request: Request):
             ) from e
 
     augmented = _retry_preamble(safe, hint)
-    new_id = _resubmit(prev_meta, augmented, jd, carry_work=True)
+    new_id = _resubmit(
+        prev_meta, augmented, jd,
+        carry_work=True,
+        target_override=target_override,
+    )
     return {
         "new_job_id": new_id,
         "hint": hint,
         "retry_of": safe,
         "manual": manual_hint is not None,
         "carried_work": (jd / "work").is_dir(),
+        "target_overridden": target_override is not None,
     }
 
 
@@ -586,14 +624,16 @@ async def stop_and_resume(job_id: str, request: Request):
     """Halt a queued/running job and immediately enqueue a fresh one with
     the user's extra description appended as `[retry-hint]`.
 
-    Required body: JSON `{"hint": "<extra context>"}`. The reviewer is
-    NOT called — this is the manual-hint path applied to in-flight jobs.
+    Required body: JSON `{"hint": "<extra context>", "target": "..."}`.
+    `hint` is required (the reviewer is NOT called here). `target` is
+    optional and overrides the prior job's target_url; pass "(none)"
+    to clear it.
 
     If the source job has already finished/failed, this behaves like
     `/retry` with a manual hint (no stop is needed).
     """
     safe = Path(job_id).name
-    manual_hint = await _read_manual_hint(request)
+    manual_hint, target_override = await _read_retry_body(request)
     if manual_hint is None:
         raise HTTPException(
             status_code=400,
@@ -610,6 +650,7 @@ async def stop_and_resume(job_id: str, request: Request):
     new_id = _resubmit(
         prev_meta, augmented_hint, jd,
         carry_work=True, mark_resumed=True,
+        target_override=target_override,
     )
     return {
         "new_job_id": new_id,
@@ -618,6 +659,7 @@ async def stop_and_resume(job_id: str, request: Request):
         "prev_status": prev_status,
         "halt": halt_info,
         "carried_work": (jd / "work").is_dir(),
+        "target_overridden": target_override is not None,
     }
 
 
@@ -710,7 +752,7 @@ async def stop_and_resume_stream(job_id: str, request: Request):
       error : {"message": "...", "kind": "..."}
     """
     safe = Path(job_id).name
-    manual_hint = await _read_manual_hint(request)
+    manual_hint, target_override = await _read_retry_body(request)
     jd, prev_meta = _validate_retry(safe, require_claude_auth=manual_hint is None)
 
     async def event_gen():
@@ -778,6 +820,7 @@ async def stop_and_resume_stream(job_id: str, request: Request):
             new_id = _resubmit(
                 prev_meta, augmented, jd,
                 carry_work=True, mark_resumed=True,
+                target_override=target_override,
             )
         except HTTPException as he:
             yield sse("error", {
@@ -800,6 +843,7 @@ async def stop_and_resume_stream(job_id: str, request: Request):
             "manual": manual_hint is not None,
             "carried_work": (jd / "work").is_dir(),
             "halt": halt_info,
+            "target_overridden": target_override is not None,
         })
 
     return StreamingResponse(

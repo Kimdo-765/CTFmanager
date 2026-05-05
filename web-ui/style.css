@@ -259,6 +259,17 @@ textarea, select {
 .retry-manual-form textarea.invalid {
   border-color: #da3633; animation: shake 0.3s ease-in-out;
 }
+.retry-manual-form input.retry-manual-target {
+  width: 100%; box-sizing: border-box;
+  background: #161b22; color: #e6edf3;
+  border: 1px solid #30363d; border-radius: 6px;
+  padding: 0.4rem 0.55rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+}
+.retry-manual-form input.retry-manual-target:focus {
+  outline: none; border-color: #8957e5;
+}
 @keyframes shake {
   0%, 100% { transform: translateX(0); }
   25% { transform: translateX(-3px); }

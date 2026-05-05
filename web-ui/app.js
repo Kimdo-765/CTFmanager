@@ -326,10 +326,17 @@ async function streamRetry(jobId, btn, manualHint = null, opts = {}) {
   else streamEl.textContent = "(awaiting reviewer output…)";
 
   // EventSource only supports GET. Use fetch + ReadableStream to POST + stream.
+  // Body fields are all optional from the server's POV: hint (manual mode
+  // only) and target (always optional, blank = keep prior target).
+  const targetOverride = (typeof opts.target === "string" && opts.target.trim())
+    ? opts.target.trim() : null;
+  const body = {};
+  if (isManual) body.hint = manualHint;
+  if (targetOverride) body.target = targetOverride;
   const fetchOpts = { method: "POST" };
-  if (isManual) {
+  if (Object.keys(body).length) {
     fetchOpts.headers = { "Content-Type": "application/json" };
-    fetchOpts.body = JSON.stringify({ hint: manualHint });
+    fetchOpts.body = JSON.stringify(body);
   }
 
   let resp;
@@ -455,6 +462,8 @@ function openStopResumeForm(jobId, anchorBtn) {
   form.innerHTML = `
     <label class="retry-manual-label">Extra hint to add before resuming</label>
     <textarea rows="5" placeholder="What should the next attempt do differently? e.g. 'the leaked endpoint is /api/v2/profile, not /profile' — appended to the new job's description as [retry-hint]"></textarea>
+    <label class="retry-manual-label" style="margin-top:0.4rem">Target (override; blank = keep prior, "(none)" = clear)</label>
+    <input type="text" class="retry-manual-target" placeholder="e.g. http://newhost:8080  ·  ctf.example.com:31337" />
     <div class="retry-manual-row">
       <button type="button" class="retry-manual-submit stop-resume-submit">✋ Stop &amp; resume</button>
       <button type="button" class="retry-manual-cancel">Cancel</button>
@@ -465,6 +474,7 @@ function openStopResumeForm(jobId, anchorBtn) {
   buttonRow.insertAdjacentElement("afterend", form);
 
   const ta = form.querySelector("textarea");
+  const targetIn = form.querySelector(".retry-manual-target");
   const submit = form.querySelector(".stop-resume-submit");
   const cancel = form.querySelector(".retry-manual-cancel");
   ta.focus();
@@ -485,10 +495,13 @@ function openStopResumeForm(jobId, anchorBtn) {
     // Stop polling so it doesn't fight the upcoming selectJob call.
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     try {
+      const reqBody = { hint };
+      const t = targetIn.value.trim();
+      if (t) reqBody.target = t;
       const res = await fetch(`${API}/jobs/${jobId}/resume`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ hint }),
+        body: JSON.stringify(reqBody),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -509,15 +522,17 @@ function openStopResumeForm(jobId, anchorBtn) {
       submit.textContent = orig;
     }
   });
-  ta.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-      e.preventDefault();
-      submit.click();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      form.remove();
-    }
-  });
+  for (const el of [ta, targetIn]) {
+    el.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        e.preventDefault();
+        submit.click();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        form.remove();
+      }
+    });
+  }
 }
 
 function openManualHintForm(jobId, anchorBtn) {
@@ -533,6 +548,8 @@ function openManualHintForm(jobId, anchorBtn) {
   form.innerHTML = `
     <label class="retry-manual-label">Your hint for the next agent</label>
     <textarea rows="5" placeholder="e.g. The bot visits /report?id= and the cookie is on .site.com — exfiltrate via document.cookie to \$COLLECTOR_URL. Or: the heap leak comes from the formatted error on /api/echo, not /api/profile."></textarea>
+    <label class="retry-manual-label" style="margin-top:0.4rem">Target (override; blank = keep prior, "(none)" = clear)</label>
+    <input type="text" class="retry-manual-target" placeholder="e.g. http://newhost:8080  ·  ctf.example.com:31337" />
     <div class="retry-manual-row">
       <button type="button" class="retry-manual-submit">Submit hint &amp; retry</button>
       <button type="button" class="retry-manual-cancel">Cancel</button>
@@ -544,6 +561,7 @@ function openManualHintForm(jobId, anchorBtn) {
   buttonRow.insertAdjacentElement("afterend", form);
 
   const ta = form.querySelector("textarea");
+  const targetIn = form.querySelector(".retry-manual-target");
   const submit = form.querySelector(".retry-manual-submit");
   const cancel = form.querySelector(".retry-manual-cancel");
   ta.focus();
@@ -557,18 +575,20 @@ function openManualHintForm(jobId, anchorBtn) {
       setTimeout(() => ta.classList.remove("invalid"), 600);
       return;
     }
-    streamRetry(jobId, submit, hint);
+    streamRetry(jobId, submit, hint, { target: targetIn.value });
   });
   // Ctrl/Cmd+Enter shortcut
-  ta.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-      e.preventDefault();
-      submit.click();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      form.remove();
-    }
-  });
+  for (const el of [ta, targetIn]) {
+    el.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        e.preventDefault();
+        submit.click();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        form.remove();
+      }
+    });
+  }
 }
 
 async function refreshJobs() {
@@ -907,7 +927,18 @@ async function renderJob(id, opts = {}) {
 
   const retryBtn = detail.querySelector('.retry-btn[data-action="retry"]');
   if (retryBtn) {
-    retryBtn.addEventListener("click", () => streamRetry(id, retryBtn));
+    retryBtn.addEventListener("click", () => {
+      // Reviewer-mode retry: prompt for an optional target override.
+      // Cancel keeps the prior target. Empty string keeps prior; the
+      // sentinel "(none)" clears it. Modifier-click skips the prompt.
+      const cur = job.target_url || "";
+      const t = window.prompt(
+        `Optional new target for the retry (blank = keep "${cur || "(none)"}", "(none)" = clear):`,
+        cur,
+      );
+      if (t === null) return; // user cancelled
+      streamRetry(id, retryBtn, null, { target: t });
+    });
   }
   const retryManualBtn = detail.querySelector('.retry-btn[data-action="retry-manual"]');
   if (retryManualBtn) {
@@ -925,9 +956,16 @@ async function renderJob(id, opts = {}) {
       // No manual hint: streamRetry will fetch the reviewer over SSE,
       // backend will halt the source job first, carry ./work/, and
       // submit the new job with a [RESUMING] preamble.
+      const cur = job.target_url || "";
+      const t = window.prompt(
+        `Optional new target for the resume (blank = keep "${cur || "(none)"}", "(none)" = clear):`,
+        cur,
+      );
+      if (t === null) return;
       streamRetry(id, stopResumeReviewerBtn, null, {
         endpoint: `${API}/jobs/${id}/resume/stream`,
         flow: "resume",
+        target: t,
       });
     });
   }
