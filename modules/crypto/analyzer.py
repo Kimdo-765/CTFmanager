@@ -59,7 +59,7 @@ async def _run_agent(
         system_prompt=SYSTEM_PROMPT,
         model=model,
         cwd=str(work_dir),
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task"],
+        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent"],
         permission_mode="bypassPermissions",
         add_dirs=add_dirs,
         resume=resume_sid,

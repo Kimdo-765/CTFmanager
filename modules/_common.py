@@ -184,9 +184,18 @@ MISSION (read first, follow strictly)
 1. WRITE: produce {deliverables} in your CURRENT WORKING DIRECTORY
    using RELATIVE paths. The orchestrator collects only files at cwd.
 2. DELEGATE: heavy investigation goes to the read-only `recon`
-   subagent via `Task("recon", "<one specific question, with paths>")`.
-   It returns ≤2 KB summaries — your context stays small. Don't read
-   big disasm / source trees / libc internals yourself; ask recon.
+   subagent. Call it via the `Agent` tool — exact invocation:
+       Agent(
+         description="<short purpose, ≤8 words>",
+         subagent_type="recon",
+         prompt="<one specific question with the path(s) to look at>"
+       )
+   It returns a ≤2 KB summary; your context stays small. Use this
+   for EVERY heavy investigation, not only at the start of the run:
+   any disasm walk, source-tree grep, libc symbol/offset/gadget
+   lookup, decomp summary, rootfs unpack — first instinct should be
+   to delegate. Doing it yourself in Bash is reserved for short
+   verifications (one-line file Read, single curl, single nc probe).
 3. BUDGET: after ~10 tool calls without a draft {short}, STOP
    investigating and write the draft from your best hypothesis.
    Iterate after. The worker hard-aborts at INVESTIGATION_BUDGET
@@ -311,7 +320,7 @@ REFUSAL_HINTS = (
 
 
 RECON_AGENT_PROMPT = """\
-You are a CTF reconnaissance subagent invoked via Task('recon', ...)
+You are a CTF reconnaissance subagent invoked via the `Agent` tool
 by a main exploit-writing agent. The main agent has limited context
 budget — your job is to absorb large volumes of disassembly / source
 / symbol output, distill the answer to ITS single question, and
@@ -428,7 +437,7 @@ Bash gotchas:
 def build_recon_agents(model: str | None) -> dict:
     """Return an `agents` dict for ClaudeAgentOptions that registers a
     'recon' subagent. Same model as the main agent, read-only tool
-    set. Main delegates heavy recon via Task('recon', '<question>').
+    set. Main delegates heavy recon via Agent(subagent_type='recon', prompt, '<question>').
 
     Imported lazily inside analyzers so unit tests / non-SDK paths
     don't have to install the SDK.

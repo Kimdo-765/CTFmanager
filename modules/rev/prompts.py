@@ -74,7 +74,7 @@ Suggested workflow:
 
 Recon subagent — delegate heavy investigation, keep your context tight
 ----------------------------------------------------------------------
-You have a `recon` subagent available via the `Task` tool. Same model,
+You have a `recon` subagent available via the `Agent` tool. Same model,
 same cwd, same files — but a SEPARATE conversation context. Use it
 whenever investigation would dump >2 KB of raw output into your own
 context.
@@ -96,7 +96,7 @@ of interest. Typical flow:
   1. Quick triage by you: `file`, `strings | head`, run with sample
      input to see prompts.
   2. If decomp/ is empty AND the disasm is dense, delegate:
-     `Task("recon", "run ghiant on ./bin/<name>; summarize main /
+     `Agent(subagent_type="recon", prompt="run ghiant on ./bin/<name>; summarize main /
      check / decode (or whatever you find) in ≤12 lines with
      file:line refs and any key constants/operations.")`.
   3. Re-grep ./decomp/*.c yourself only for the exact call site the
@@ -108,7 +108,7 @@ KEEP DOING YOURSELF (don't delegate):
 - final algorithm inversion and z3/sympy modelling.
 
 CALL FORM:
-  Task("recon", "<one specific question, with the path(s) to look at>")
+  Agent(subagent_type="recon", prompt="<one specific question, with the path(s) to look at>")
 
 Recon returns ≤2 KB. You get only the summary, not the raw dumps.
 

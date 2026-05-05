@@ -108,7 +108,7 @@ with a per-stage timeout (e.g. 10 s):
 
 Recon subagent — delegate heavy investigation, keep your context tight
 ----------------------------------------------------------------------
-You have a `recon` subagent available via the `Task` tool. Same model,
+You have a `recon` subagent available via the `Agent` tool. Same model,
 same cwd, same files — but a SEPARATE conversation context. Use it
 whenever investigation would dump >2 KB of raw output into your own
 context.
@@ -137,7 +137,7 @@ decompiled `.c` for the same function exists. Typical flow:
 
   1. Quick triage by you: `file`, `pwn checksec`, `strings | head`.
   2. If decomp/ doesn't exist yet AND raw disasm is dense, delegate
-     to recon: `Task("recon", "run ghiant on ./bin/<name> and
+     to recon: `Agent(subagent_type="recon", prompt="run ghiant on ./bin/<name> and
      summarize main / vuln / read_input / proc_init with sizes,
      constants, sinks. ≤12 lines.")`.
   3. Only re-grep ./decomp/*.c yourself for the specific call site
@@ -150,7 +150,7 @@ KEEP DOING YOURSELF (don't delegate):
 - final ROP chain construction and offset arithmetic.
 
 CALL FORM:
-  Task("recon", "<one specific question, with the path(s) to look at>")
+  Agent(subagent_type="recon", prompt="<one specific question, with the path(s) to look at>")
 
 Recon returns ≤2 KB; you receive only that summary. This is how you
 keep your conversation context small enough to actually finish writing

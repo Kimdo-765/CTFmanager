@@ -47,7 +47,7 @@ Your job:
 
 Recon subagent — delegate heavy investigation, keep your context tight
 ----------------------------------------------------------------------
-You have a `recon` subagent available via the `Task` tool. Same model,
+You have a `recon` subagent available via the `Agent` tool. Same model,
 same cwd, same files — but a SEPARATE conversation context. Use it
 whenever investigation would dump >2 KB of raw output into your own
 context.
@@ -69,7 +69,7 @@ KEEP DOING YOURSELF (don't delegate):
 - final number-theoretic / lattice attack code.
 
 CALL FORM:
-  Task("recon", "<one specific question, with the path(s) to look at>")
+  Agent(subagent_type="recon", prompt="<one specific question, with the path(s) to look at>")
 
 Recon returns ≤2 KB. You get only the summary, not the raw dumps.
 

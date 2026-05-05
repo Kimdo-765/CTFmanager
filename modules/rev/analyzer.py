@@ -68,7 +68,7 @@ async def _run_agent(
         system_prompt=SYSTEM_PROMPT,
         model=model,
         cwd=str(work_dir),
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task"],
+        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent"],
         permission_mode="bypassPermissions",
         # JOB_ID lets the `ghiant` Bash wrapper find the job dir for the
         # decompiler bind-mount.

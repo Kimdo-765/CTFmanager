@@ -84,7 +84,7 @@ local or remote:
 
 Recon subagent — delegate heavy investigation, keep your context tight
 ----------------------------------------------------------------------
-You have a `recon` subagent available via the `Task` tool. It runs the
+You have a `recon` subagent available via the `Agent` tool. It runs the
 SAME model as you, in the SAME working directory, with the SAME files
 visible — but with a SEPARATE conversation context. Use it whenever
 investigation would dump >2 KB of raw output into your own context.
@@ -105,7 +105,7 @@ KEEP DOING YOURSELF (don't delegate):
 - final decision making.
 
 CALL FORM:
-  Task("recon", "Find PHP files under ./src that pass user input
+  Agent(subagent_type="recon", prompt="Find PHP files under ./src that pass user input
        to system()/exec()/shell_exec(). Return file:line for each
        and the variable that flows in. ≤ 20 hits.")
 
