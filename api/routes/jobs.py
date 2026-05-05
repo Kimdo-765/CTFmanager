@@ -153,20 +153,42 @@ def get_job(job_id: str):
         raise HTTPException(status_code=404, detail="job not found")
 
     rq_status = None
+    rq_worker_name = None
+    rq_worker_heartbeat = None
     try:
         q = get_queue()
         rq_job = q.fetch_job(job_id)
         if rq_job is not None:
             rq_status = rq_job.get_status(refresh=True)
+            rq_worker_name = rq_job.worker_name
     except Exception:
         pass
+
+    # Pull the assigned worker's last_heartbeat directly from Redis so
+    # the UI can tell "agent silent but worker alive" apart from
+    # "worker process dead". RQ refreshes this every ~10s while the
+    # worker is healthy.
+    if rq_worker_name:
+        try:
+            conn = get_redis()
+            hb = conn.hget(f"rq:worker:{rq_worker_name}", "last_heartbeat")
+            if hb:
+                rq_worker_heartbeat = hb.decode() if isinstance(hb, bytes) else hb
+        except Exception:
+            pass
 
     # Always derive a `runnable_script` field from the filesystem so the UI
     # can show the run-now button even on jobs whose meta was written before
     # the field existed (or whose orchestrator didn't set it).
     runnable_script = _detect_runnable_script(JOBS_DIR / Path(job_id).name)
 
-    return {**meta, "rq_status": rq_status, "runnable_script": runnable_script}
+    return {
+        **meta,
+        "rq_status": rq_status,
+        "rq_worker_name": rq_worker_name,
+        "rq_worker_heartbeat_at": rq_worker_heartbeat,
+        "runnable_script": runnable_script,
+    }
 
 
 @router.delete("")

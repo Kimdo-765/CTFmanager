@@ -510,6 +510,35 @@ def budget_exceeded(tool_calls: int, work_dir: Path, expected: tuple[str, ...]) 
     return True
 
 
+_HEARTBEAT_MIN_INTERVAL_S = 5.0
+_heartbeat_state: dict[str, float] = {}
+
+
+def agent_heartbeat(job_id: str, kind: str = "msg") -> None:
+    """Throttled write of `last_agent_event_at` / `last_event_kind` to
+    meta.json. Called from each analyzer's SDK message loop so every
+    received message (Assistant/User/Result/etc.) refreshes the stamp.
+
+    Throttled to one disk write per `_HEARTBEAT_MIN_INTERVAL_S` per
+    job to avoid hammering meta.json. Even with throttling the stamp
+    is good enough to tell:
+      - last_agent_event_at within 30s   → agent stream alive
+      - last_agent_event_at > 30s old    → first-token / thinking wait
+        (cross-check against RQ worker heartbeat for true 'dead')
+    """
+    import time as _time
+    now = _time.monotonic()
+    last = _heartbeat_state.get(job_id, 0.0)
+    if now - last < _HEARTBEAT_MIN_INTERVAL_S:
+        return
+    _heartbeat_state[job_id] = now
+    write_meta(
+        job_id,
+        last_agent_event_at=datetime.now(timezone.utc).isoformat(),
+        last_event_kind=kind,
+    )
+
+
 def agent_tag(msg) -> str:
     """Return a stable identifier for whichever agent emitted `msg`.
 

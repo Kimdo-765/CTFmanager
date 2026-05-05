@@ -420,6 +420,42 @@ button[type="submit"], #refresh-jobs {
   0%, 100% { box-shadow: 0 0 0 0 rgba(212, 167, 44, 0.0); }
   50%      { box-shadow: 0 0 0 3px rgba(212, 167, 44, 0.18); }
 }
+
+/* Liveness ground-truth pill — combines two heartbeats:
+   A. meta.last_agent_event_at  (analyzer writes per SDK msg, throttled 5s)
+   B. RQ worker.last_heartbeat  (worker process alive)
+   Tells "agent making progress" apart from "thinking" apart from
+   "process dead". Updated every second by the same livePillTimer. */
+.liveness-pill {
+  display: inline-flex; align-items: center;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  border: 1px solid transparent;
+  vertical-align: middle;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+}
+.liveness-active {
+  background: #0d2715; color: #56d364; border-color: #23863666;
+}
+.liveness-silent {
+  background: #2d2208; color: #f5d062; border-color: #d4a72c66;
+}
+.liveness-warming {
+  background: #161b22; color: #79c0ff; border-color: #1f6feb55;
+}
+.liveness-dead {
+  background: #2a0e0e; color: #ff7b72; border-color: #f8514999;
+  font-weight: 700;
+  animation: liveness-blink 1.4s ease-in-out infinite;
+}
+@keyframes liveness-blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
 #job-detail pre {
   background: #161b22;
   padding: 0.75rem;

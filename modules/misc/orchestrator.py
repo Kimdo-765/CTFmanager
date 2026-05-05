@@ -23,6 +23,7 @@ from claude_agent_sdk import (
 
 from modules._common import (
     capture_session_id,
+    agent_heartbeat,
     extract_cost,
     format_tool_result,
     log_thinking,
@@ -131,6 +132,7 @@ async def _claude_summary(
     try:
         async for msg in query(prompt=prompt, options=options):
             capture_session_id(msg, job_id)
+            agent_heartbeat(job_id, type(msg).__name__)
             if isinstance(msg, AssistantMessage):
                 summary["messages"] += 1
                 for block in msg.content:

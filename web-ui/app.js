@@ -62,7 +62,30 @@ function _tickLivePill() {
     if (!tagEl) return;
     pill.firstChild && (pill.firstChild.nodeValue = `⏱ ${fmt} `);
   });
-  if (!document.querySelector(".timing-pill.live")) {
+  // Refresh the liveness pill class on the same tick so the color
+  // (active → silent → dead) updates without waiting for the 2s
+  // re-render. The pill's data- timestamps are written by render and
+  // never go stale within the lifetime of this DOM node.
+  document.querySelectorAll(".liveness-pill").forEach((pill) => {
+    const ageMs = (iso) => iso ? (Date.now() - new Date(iso).getTime()) : null;
+    const a = ageMs(pill.dataset.agentAt);
+    const w = ageMs(pill.dataset.workerAt);
+    let cls;
+    if (w != null && w > 60_000) cls = "dead";
+    else if (a != null && a <= 30_000) cls = "active";
+    else if (a != null) cls = "silent";
+    else if (w != null) cls = "warming";
+    if (cls) {
+      pill.className = "liveness-pill liveness-" + cls;
+      const labelText = pill.firstChild && pill.firstChild.nodeValue;
+      if (labelText && labelText.startsWith("● ")) {
+        pill.firstChild.nodeValue = "● " + cls + " ";
+      }
+    }
+  });
+
+  if (!document.querySelector(".timing-pill.live")
+      && !document.querySelector(".liveness-pill")) {
     clearInterval(livePillTimer);
     livePillTimer = null;
   }
@@ -802,6 +825,53 @@ async function renderJob(id, opts = {}) {
     }
   }
 
+  // Liveness chip — ground truth from two heartbeats:
+  //   A. meta.last_agent_event_at  (analyzer writes on each SDK msg, throttled 5s)
+  //   B. job.rq_worker_heartbeat_at (RQ refreshes every ~10s while alive)
+  //
+  // Rules:
+  //   worker stale (>60s)  → "dead"        red, urgent
+  //   agent fresh (≤30s)   → "active"      green, live
+  //   agent stale + worker fresh → "silent" amber (thinking / first-token wait)
+  //   neither timestamp    → omit (queued / pre-startup / non-agent module)
+  let livenessPill = "";
+  if (job.status === "running") {
+    const ageMs = (iso) => iso ? (Date.now() - new Date(iso).getTime()) : null;
+    const agentAge = ageMs(job.last_agent_event_at);
+    const workerAge = ageMs(job.rq_worker_heartbeat_at);
+    const fmtAge = (ms) => {
+      if (ms == null) return "?";
+      const s = Math.max(0, Math.round(ms / 1000));
+      if (s < 60) return `${s}s`;
+      if (s < 3600) return `${Math.floor(s/60)}m`;
+      return `${Math.floor(s/3600)}h`;
+    };
+    let cls, label, title;
+    if (workerAge != null && workerAge > 60_000) {
+      cls = "dead";
+      label = "dead";
+      title = `worker heartbeat ${fmtAge(workerAge)} ago — process likely gone`;
+    } else if (agentAge != null && agentAge <= 30_000) {
+      cls = "active";
+      label = "active";
+      title = `agent event ${fmtAge(agentAge)} ago / worker ${fmtAge(workerAge)} ago`;
+    } else if (agentAge != null) {
+      cls = "silent";
+      label = "silent";
+      title = `agent ${fmtAge(agentAge)} silent (thinking or API wait) · worker ${fmtAge(workerAge)} ago`;
+    } else if (workerAge != null) {
+      cls = "warming";
+      label = "warming";
+      title = `worker alive (${fmtAge(workerAge)} ago) · agent has not emitted yet`;
+    }
+    if (cls) {
+      livenessPill = `<span class="liveness-pill liveness-${cls}"
+        data-agent-at="${escapeHtml(job.last_agent_event_at || "")}"
+        data-worker-at="${escapeHtml(job.rq_worker_heartbeat_at || "")}"
+        title="${escapeHtml(title)}">● ${label}</span>`;
+    }
+  }
+
   // Soft-timeout decision banner. Fires when the worker's wall-clock
   // watchdog sets meta.awaiting_decision=true. The agent is still running
   // — the user picks Continue (let it run) or Stop (hard-kill).
@@ -955,6 +1025,7 @@ async function renderJob(id, opts = {}) {
     <h3>Job ${job.id}
       <span class="status ${job.status}">${job.status}</span>
       ${timingPill}
+      ${livenessPill}
     </h3>
     <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}${modelInfo}</small></div>
     ${timeoutBlock}
