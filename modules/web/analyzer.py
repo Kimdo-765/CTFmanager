@@ -21,6 +21,7 @@ from claude_agent_sdk import (
 
 from modules._common import (
     budget_exceeded,
+    build_recon_agents,
     capture_session_id,
     classify_agent_error,
     collect_outputs,
@@ -57,11 +58,12 @@ async def _run_agent(
         system_prompt=SYSTEM_PROMPT,
         model=model,
         cwd=str(work_dir),
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task"],
         permission_mode="bypassPermissions",
         add_dirs=add_dirs,
         resume=resume_sid,
         fork_session=bool(resume_sid),
+        agents=build_recon_agents(model),
     )
     if resume_sid:
         log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")

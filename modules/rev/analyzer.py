@@ -21,6 +21,7 @@ from claude_agent_sdk import (
 
 from modules._common import (
     budget_exceeded,
+    build_recon_agents,
     capture_session_id,
     classify_agent_error,
     collect_outputs,
@@ -66,13 +67,14 @@ async def _run_agent(
         system_prompt=SYSTEM_PROMPT,
         model=model,
         cwd=str(work_dir),
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task"],
         permission_mode="bypassPermissions",
         # JOB_ID lets the `ghiant` Bash wrapper find the job dir for the
         # decompiler bind-mount.
         env={"JOB_ID": job_id},
         resume=resume_sid,
         fork_session=bool(resume_sid),
+        agents=build_recon_agents(model),
     )
     user_prompt = build_user_prompt(binary_name, description, auto_run)
 

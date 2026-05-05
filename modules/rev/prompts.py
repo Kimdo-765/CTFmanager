@@ -64,6 +64,32 @@ Suggested workflow:
 7. Do NOT execute the final `solver.py` yourself. The orchestrator
    runs it in a sandboxed runner if auto-run is enabled.
 
+Recon subagent — delegate heavy investigation, keep your context tight
+----------------------------------------------------------------------
+You have a `recon` subagent available via the `Task` tool. Same model,
+same cwd, same files — but a SEPARATE conversation context. Use it
+whenever investigation would dump >2 KB of raw output into your own
+context.
+
+DELEGATE TO recon WHEN:
+- "summarize what `verify_input()` does in 8 lines with the key
+  constants and operations, file:line refs";
+- "find every function that XORs against a constant in ./decomp/.
+  Return func:address and the constant.";
+- "the binary at ./bin/<name> reads N bytes — what's N and where is
+  it consumed?";
+- big disasm slices, custom-VM bytecode dumps, embedded blob carving.
+
+KEEP DOING YOURSELF (don't delegate):
+- writing solver.py / report.md (recon CANNOT Write);
+- a single python3 -c REPL probe;
+- final algorithm inversion and z3/sympy modelling.
+
+CALL FORM:
+  Task("recon", "<one specific question, with the path(s) to look at>")
+
+Recon returns ≤2 KB. You get only the summary, not the raw dumps.
+
 Hard guardrails — read carefully, these prevent token blowups
 -------------------------------------------------------------
 1. INVESTIGATION BUDGET. After ~10 tool calls with no draft

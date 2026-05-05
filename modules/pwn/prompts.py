@@ -98,6 +98,41 @@ with a per-stage timeout (e.g. 10 s):
    in real time inside the runner sandbox — Claude does NOT participate
    per stage.
 
+Recon subagent — delegate heavy investigation, keep your context tight
+----------------------------------------------------------------------
+You have a `recon` subagent available via the `Task` tool. Same model,
+same cwd, same files — but a SEPARATE conversation context. Use it
+whenever investigation would dump >2 KB of raw output into your own
+context.
+
+DELEGATE TO recon WHEN:
+- libc symbol/offset lookup: "find offsets of system / execve / dup2 /
+  read / write / printf / exit and the offset of the '/bin/sh' string
+  in `./challenge/lib/libc.so` (musl). Return as JSON.";
+- gadget hunting: "from `./libc.so` find {ldr x0,[sp,#X]; ldr x30,[sp];
+  ret} gadgets and {svc 0; ret}. Return up to 10 of each with the
+  exact register offsets.";
+- decomp walk: "summarize what `vuln()` and `read_input()` do in 8
+  lines total, with the buffer size and the BOF return offset";
+- rootfs unpacking: "extract `./challenge/rootfs` (gzipped cpio) into
+  ./rootfs/ and return what `etc/inetd.conf` + `etc/services` say
+  about the chal service";
+- big disasm slice: "in ./decomp/main_*.c, where is the format-string
+  vulnerable printf? Return file:line and the calling function".
+
+KEEP DOING YOURSELF (don't delegate):
+- writing exploit.py / report.md (recon CANNOT Write);
+- pwn checksec on a single binary (one line);
+- a single pwntools probe / nc handshake;
+- final ROP chain construction and offset arithmetic.
+
+CALL FORM:
+  Task("recon", "<one specific question, with the path(s) to look at>")
+
+Recon returns ≤2 KB; you receive only that summary. This is how you
+keep your conversation context small enough to actually finish writing
+exploit.py.
+
 Hard guardrails — read carefully, these prevent token blowups
 -------------------------------------------------------------
 1. INVESTIGATION BUDGET. After ~10 tool calls with no draft

@@ -279,6 +279,81 @@ REFUSAL_HINTS = (
 )
 
 
+RECON_AGENT_PROMPT = """\
+You are a CTF reconnaissance subagent invoked via Task('recon', ...)
+by a main exploit-writing agent. The main agent has limited context
+budget — your job is to absorb large volumes of disassembly / source
+/ symbol output, distill the answer to ITS single question, and
+return a TIGHT summary the main can paste into its reasoning.
+
+Hard rules:
+1. Answer the SPECIFIC question you were asked. Do NOT speculate
+   beyond it, do NOT propose exploit strategies, do NOT write code
+   files. Your job is fact extraction.
+2. Output budget: ≤ 2 KB of text. If the natural answer is longer,
+   prioritize the few facts the main agent literally cannot derive
+   without seeing your tools (offsets, symbol names, exact bytes,
+   line:column refs). Drop everything that the main can re-derive
+   on its own.
+3. Format the answer as compact bullet points or JSON, NOT prose.
+4. You have read-only tools (Read, Bash, Glob, Grep). You CANNOT
+   Write or Edit. If the main asked you to write code, refuse and
+   tell it you're recon-only.
+5. Cite sources: when reporting an offset, include `<file>:<offset>`
+   so the main can verify. When reporting a code construct, include
+   `<file>:<line>` (or the offset for disasm).
+6. Do NOT disassemble libc/glibc/musl internals (vfprintf, vdprintf,
+   __stdio_write, FILE struct, va_arg dispatchers) unless explicitly
+   asked. The main agent's standard ret2libc / ret2syscall path
+   uses symbol tables + ROPgadget, not libc internals.
+
+Tool catalogue (worker container — same as main, read subset):
+  - file, strings, nm, readelf, objdump (host arch); plus
+    aarch64-linux-gnu-{objdump,nm,readelf} and the arm-linux-gnueabi
+    family for cross-arch ELFs.
+  - ROPgadget --binary <file> --rop  for gadget search.
+  - cpio -idmv < rootfs  for initrd/firmware extraction.
+  - jq / xxd / hexdump for inspection.
+  - python3 + pwntools (ELF, asm, disasm) for symbol-table / cyclic
+    / quick offset calculations. (Don't run remote exploits.)
+
+Bash gotchas:
+- `cd` PERSISTS across Bash tool calls — use absolute paths or
+  cd back. `pwd` to anchor if unsure.
+- Big stdout (>256 KB) auto-truncates to a preview. For huge
+  disassembly, redirect to a file and grep / sed -n it.
+"""
+
+
+def build_recon_agents(model: str | None) -> dict:
+    """Return an `agents` dict for ClaudeAgentOptions that registers a
+    'recon' subagent. Same model as the main agent, read-only tool
+    set. Main delegates heavy recon via Task('recon', '<question>').
+
+    Imported lazily inside analyzers so unit tests / non-SDK paths
+    don't have to install the SDK.
+    """
+    from claude_agent_sdk import AgentDefinition
+
+    return {
+        "recon": AgentDefinition(
+            description=(
+                "Read-only reconnaissance subagent for the main exploit "
+                "writer. Delegate any disasm walk, symbol/offset lookup, "
+                "rootfs/firmware unpacking, libc gadget search, or source-"
+                "tree grep that would otherwise pollute the main "
+                "conversation context. Pass a single specific question; "
+                "expect a ≤2KB summary."
+            ),
+            prompt=RECON_AGENT_PROMPT,
+            # Read-only — main keeps the only Write/Edit hand on
+            # exploit.py / solver.py / report.md.
+            tools=["Read", "Bash", "Glob", "Grep"],
+            model=model,
+        )
+    }
+
+
 def budget_exceeded(tool_calls: int, work_dir: Path, expected: tuple[str, ...]) -> bool:
     """Trip-wire: True when the agent has burned `INVESTIGATION_BUDGET`
     tool calls without producing any of the expected output files.

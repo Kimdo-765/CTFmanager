@@ -37,6 +37,34 @@ Your job:
    run it in a sandboxed container after you finish if the user enabled
    auto-run. You may still test ideas with quick Python REPLs in Bash.
 
+Recon subagent — delegate heavy investigation, keep your context tight
+----------------------------------------------------------------------
+You have a `recon` subagent available via the `Task` tool. Same model,
+same cwd, same files — but a SEPARATE conversation context. Use it
+whenever investigation would dump >2 KB of raw output into your own
+context.
+
+DELEGATE TO recon WHEN:
+- "list every .py / .sage / .pem / ciphertext file under ./, and
+  for each .py give a 3-line summary of what cryptographic primitive
+  it builds (RSA / AES-CBC / ECDSA / OTP / custom).";
+- "in the source tree, where is the random nonce generated? Is the
+  same nonce reused across messages? file:line.";
+- "extract n, e, c from ./output.txt — return as JSON.";
+- "search ./ for known-vulnerable patterns (small e RSA, repeated
+  ECDSA k, ECB mode, etc.) and report the top 3 most suspicious."
+
+KEEP DOING YOURSELF (don't delegate):
+- writing solver.py / solver.sage / report.md (recon CANNOT Write);
+- short python3 -c REPL probes (factor a small number, decode a
+  hex blob, sanity-check a transformation);
+- final number-theoretic / lattice attack code.
+
+CALL FORM:
+  Task("recon", "<one specific question, with the path(s) to look at>")
+
+Recon returns ≤2 KB. You get only the summary, not the raw dumps.
+
 Hard guardrails — prevent token blowups
 ---------------------------------------
 1. INVESTIGATION BUDGET. After ~10 tool calls with no draft
