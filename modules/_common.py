@@ -627,8 +627,19 @@ def format_tool_result(content: Any, is_error: bool | None = None) -> str:
     text = text.replace("\n", " | ")
     text = text.strip()
     cap = 300
-    if len(text) > cap:
-        text = text[:cap] + "…"
+    full_len = len(text)
+    if full_len > cap:
+        # Mark truncation with the actual byte counts so a downstream
+        # reader (notably the retry reviewer) can tell that the chars
+        # right before the marker are mid-cut, not a real terminal
+        # token from the tool's output. A bare "…" was previously
+        # being mistaken for evidence of a real short string in the
+        # target binary (e.g. "yo…" when the truth was "your name >").
+        text = (
+            text[:cap]
+            + f" …(preview cut: showing {cap}/{full_len} bytes; "
+            "trailing chars are mid-cut, not a complete token)"
+        )
     prefix = "TOOL_RESULT"
     if is_error:
         prefix = "TOOL_ERROR"
