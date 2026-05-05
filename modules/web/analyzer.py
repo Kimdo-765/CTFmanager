@@ -81,7 +81,7 @@ async def _run_agent(
     try:
         async for msg in query(prompt=user_prompt, options=options):
             capture_session_id(msg, job_id)
-            agent_heartbeat(job_id, type(msg).__name__)
+            agent_heartbeat(job_id, msg)
             if isinstance(msg, AssistantMessage):
                 summary["messages"] += 1
                 tag = agent_tag(msg)

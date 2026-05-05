@@ -456,6 +456,24 @@ button[type="submit"], #refresh-jobs {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.55; }
 }
+
+/* Token + cost meter pill — populated from meta.agent_tokens (SDK
+   AssistantMessage.usage merged) and meta.cost_usd. Only renders
+   once at least one input/output token has been observed. */
+.tokens-pill {
+  display: inline-flex; align-items: center;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #0d1d26;
+  color: #79c0ff;
+  border: 1px solid #1f6feb55;
+  vertical-align: middle;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+}
 #job-detail pre {
   background: #161b22;
   padding: 0.75rem;

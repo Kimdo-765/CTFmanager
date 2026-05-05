@@ -512,30 +512,73 @@ def budget_exceeded(tool_calls: int, work_dir: Path, expected: tuple[str, ...]) 
 
 _HEARTBEAT_MIN_INTERVAL_S = 5.0
 _heartbeat_state: dict[str, float] = {}
+_token_state: dict[str, dict[str, int]] = {}
 
 
-def agent_heartbeat(job_id: str, kind: str = "msg") -> None:
-    """Throttled write of `last_agent_event_at` / `last_event_kind` to
-    meta.json. Called from each analyzer's SDK message loop so every
-    received message (Assistant/User/Result/etc.) refreshes the stamp.
+def _accumulate_tokens(job_id: str, usage: dict | None) -> dict[str, int]:
+    """Merge the SDK's per-turn usage dict into a job-scoped running
+    max. Anthropic's usage is cumulative within a request, so the
+    safe accumulator is element-wise max(prev, new) — never regress.
+    Returns the merged dict.
+    """
+    if not isinstance(usage, dict):
+        return _token_state.get(job_id, {})
+    cur = _token_state.setdefault(job_id, {})
+    for k in (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ):
+        v = usage.get(k)
+        if isinstance(v, (int, float)) and v > cur.get(k, 0):
+            cur[k] = int(v)
+    return cur
 
-    Throttled to one disk write per `_HEARTBEAT_MIN_INTERVAL_S` per
-    job to avoid hammering meta.json. Even with throttling the stamp
-    is good enough to tell:
-      - last_agent_event_at within 30s   → agent stream alive
-      - last_agent_event_at > 30s old    → first-token / thinking wait
-        (cross-check against RQ worker heartbeat for true 'dead')
+
+def agent_heartbeat(job_id: str, msg) -> None:
+    """Throttled write of agent liveness + token/cost tracking to
+    meta.json. Called from each analyzer's SDK message loop on every
+    received message (Assistant/User/System/Result/etc.).
+
+    Liveness: meta.last_agent_event_at + last_event_kind refreshed
+    on a 5-second throttle so disk I/O stays bounded.
+
+    Tokens: AssistantMessage.usage cumulative-by-turn maxes are
+    merged into meta.agent_tokens. ResultMessage.total_cost_usd is
+    merged into meta.cost_usd.
+
+    Result messages always flush (never throttled) so the final
+    numbers are accurate the moment the run ends.
     """
     import time as _time
+    kind = type(msg).__name__
+    is_result = kind == "ResultMessage"
+
+    # Token accumulation (lock-free per-process dict). Always update
+    # in-memory; flush at most once per 5s except on Result.
+    updates: dict = {}
+    usage = getattr(msg, "usage", None)
+    tokens = _accumulate_tokens(job_id, usage)
+
+    if is_result:
+        cost = getattr(msg, "total_cost_usd", None)
+        if isinstance(cost, (int, float)):
+            updates["cost_usd"] = float(cost)
+
     now = _time.monotonic()
     last = _heartbeat_state.get(job_id, 0.0)
-    if now - last < _HEARTBEAT_MIN_INTERVAL_S:
+    throttled = (not is_result) and (now - last < _HEARTBEAT_MIN_INTERVAL_S)
+    if throttled:
         return
     _heartbeat_state[job_id] = now
+
     write_meta(
         job_id,
         last_agent_event_at=datetime.now(timezone.utc).isoformat(),
         last_event_kind=kind,
+        agent_tokens=tokens or None,
+        **updates,
     )
 
 

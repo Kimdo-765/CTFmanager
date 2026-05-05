@@ -872,6 +872,31 @@ async function renderJob(id, opts = {}) {
     }
   }
 
+  // Live token meter — reflects meta.agent_tokens (Anthropic usage,
+  // accumulated turn-by-turn) and meta.cost_usd. Hidden until at
+  // least one token has been observed.
+  let tokensPill = "";
+  const tk = job.agent_tokens || {};
+  const ti = +tk.input_tokens || 0;
+  const to = +tk.output_tokens || 0;
+  const tcc = +tk.cache_creation_input_tokens || 0;
+  const tcr = +tk.cache_read_input_tokens || 0;
+  const tTotal = ti + to + tcc + tcr;
+  if (tTotal > 0) {
+    const fmtN = (n) => {
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
+      if (n >= 1_000)     return (n / 1_000).toFixed(1) + "k";
+      return String(n);
+    };
+    const cost = typeof job.cost_usd === "number"
+      ? `· $${job.cost_usd.toFixed(4)}` : "";
+    const fullTitle =
+      `input: ${ti.toLocaleString()}  ·  output: ${to.toLocaleString()}` +
+      `\ncache create: ${tcc.toLocaleString()}  ·  cache read: ${tcr.toLocaleString()}` +
+      (typeof job.cost_usd === "number" ? `\ncost: $${job.cost_usd.toFixed(6)}` : "");
+    tokensPill = `<span class="tokens-pill" title="${escapeHtml(fullTitle)}">📊 in ${fmtN(ti)} · out ${fmtN(to)}${tcr > 0 ? ` · cache ${fmtN(tcr)}` : ""} ${cost}</span>`;
+  }
+
   // Soft-timeout decision banner. Fires when the worker's wall-clock
   // watchdog sets meta.awaiting_decision=true. The agent is still running
   // — the user picks Continue (let it run) or Stop (hard-kill).
@@ -1026,6 +1051,7 @@ async function renderJob(id, opts = {}) {
       <span class="status ${job.status}">${job.status}</span>
       ${timingPill}
       ${livenessPill}
+      ${tokensPill}
     </h3>
     <div><small>module: ${job.module} · file: ${escapeHtml(job.filename || "")} · target: ${escapeHtml(job.target_url || "(none)")}${stage}${cost}${timeout}${modelInfo}</small></div>
     ${timeoutBlock}
