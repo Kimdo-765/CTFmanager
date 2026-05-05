@@ -913,7 +913,15 @@ async function renderJob(id, opts = {}) {
     ${logFindingsBlock}
     ${resultBlock}
     <h4>Run log <small style="color:#8b949e;font-weight:normal">(auto-follows when scrolled to bottom)</small></h4>
-    <pre class="run-log" data-job-id="${id}">${log ? colorizeRunLog(log) : "(empty)"}</pre>
+    <div class="run-log-window">
+      <div class="run-log-titlebar">
+        <span class="run-log-dot run-log-dot-r"></span>
+        <span class="run-log-dot run-log-dot-y"></span>
+        <span class="run-log-dot run-log-dot-g"></span>
+        <span class="run-log-title">job ${escapeHtml(id)} — ${escapeHtml(job.module || "?")}</span>
+      </div>
+      <pre class="run-log" data-job-id="${id}" data-status="${escapeHtml(job.status || "")}">${log ? colorizeRunLog(log) : "(empty)"}</pre>
+    </div>
   `;
 
   const newPre = detail.querySelector("pre.run-log");

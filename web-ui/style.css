@@ -508,6 +508,69 @@ button[type="submit"], #refresh-jobs {
   border: 0; border-top: 1px solid #30363d; margin: 1rem 0;
 }
 
+/* Run log "terminal" chrome: a window frame around the <pre>, with a
+   macOS-style traffic-light header. Plain visual upgrade — does not
+   change semantics or selection behavior. */
+.run-log-window {
+  background: #0b0d12;
+  border: 1px solid #1f2933;
+  border-radius: 8px;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset,
+              0 8px 24px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+  margin: 0;
+}
+.run-log-titlebar {
+  display: flex; align-items: center; gap: 0.45rem;
+  background: linear-gradient(#1d232c, #14181f);
+  border-bottom: 1px solid #1f2933;
+  padding: 0.35rem 0.65rem;
+  font-size: 0.75rem;
+  color: #8b949e;
+  user-select: none;
+}
+.run-log-dot {
+  display: inline-block; width: 0.7rem; height: 0.7rem;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+.run-log-dot-r { background: #ff5f57; }
+.run-log-dot-y { background: #febc2e; }
+.run-log-dot-g { background: #28c840; }
+.run-log-title {
+  margin-left: 0.45rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* The <pre.run-log> sitting inside the window frame */
+.run-log-window .run-log {
+  background: #0b0d12;
+  color: #d6d3c0;
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", SFMono-Regular,
+               Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  padding: 0.7rem 0.85rem 1.2rem;
+  border: 0; border-radius: 0;
+  margin: 0;
+  /* honor existing max-height + tail-follow behavior elsewhere */
+}
+/* Blinking caret at the very end of the <pre>, only while the job is
+   live (running or queued — i.e. the log will keep growing). */
+.run-log-window .run-log[data-status="running"]::after,
+.run-log-window .run-log[data-status="queued"]::after {
+  content: "▍";
+  color: #56d364;
+  animation: run-log-caret 1.05s steps(2, end) infinite;
+  margin-left: 0.15rem;
+}
+@keyframes run-log-caret {
+  0%, 49%   { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
 /* Run log: colorize timestamp + label + body produced by colorizeRunLog().
    The base <pre.run-log> already has font + scrolling from the global
    <pre> rule; these classes only add semantic colors. */
