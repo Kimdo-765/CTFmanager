@@ -196,10 +196,12 @@ MISSION (read first, follow strictly)
    lookup, decomp summary, rootfs unpack — first instinct should be
    to delegate. Doing it yourself in Bash is reserved for short
    verifications (one-line file Read, single curl, single nc probe).
-3. BUDGET: after ~10 tool calls without a draft {short}, STOP
-   investigating and write the draft from your best hypothesis.
-   Iterate after. The worker hard-aborts at INVESTIGATION_BUDGET
-   (default 60) tool calls if {short} still isn't on disk.
+3. BUDGET (soft): after ~10 tool calls without a draft {short},
+   STOP investigating and write the draft from your best hypothesis.
+   Iterate after. There's no hard cap — the worker won't abort you —
+   but a long investigation phase eats your conversation context and
+   you'll run out of room to actually finish. Cheap drafts first,
+   refinement later.
 4. NO LIB INTERNAL DIVE: don't disassemble musl/glibc printf,
    vfprintf, vararg dispatchers, FILE struct internals, framework
    request dispatchers, or pycryptodome/sympy internals. Use symbol
@@ -470,13 +472,15 @@ def budget_exceeded(tool_calls: int, work_dir: Path, expected: tuple[str, ...]) 
     Used by analyzers as a circuit breaker — better to abort early
     and let the user retry with a hint than to let the SDK exhaust
     the conversation context and exit with 'Prompt is too long'.
-    The threshold is intentionally generous (default 60) — the
-    soft prompt budget is 10. We only act on prolonged starvation.
+    Disabled by default (cap=0). Operators can re-enable by setting
+    INVESTIGATION_BUDGET=<positive int> in .env if they want a hard
+    abort instead of letting the SDK exhaust its context. The soft
+    prompt budget mentioned in the system prompt is still 10.
     """
     try:
-        cap = int(os.environ.get("INVESTIGATION_BUDGET", "60"))
+        cap = int(os.environ.get("INVESTIGATION_BUDGET", "0"))
     except ValueError:
-        cap = 60
+        cap = 0
     if cap <= 0:
         return False
     if tool_calls < cap:

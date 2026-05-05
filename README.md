@@ -113,12 +113,12 @@ the prior `~/.claude/projects/<project_key>/<sid>.jsonl` (and any
 `subagents/`) into the new job's project-key directory, so SDK
 `fork_session=True` actually finds the prior conversation.
 
-A **trip-wire** in each analyzer (`INVESTIGATION_BUDGET`, default 60
-tool calls) aborts a job cleanly if the agent has burned that many
-tool calls without producing `exploit.py` / `solver.py` — better than
-letting the SDK exhaust its context window with `Prompt is too long`.
-Override or disable via `INVESTIGATION_BUDGET=<n>` in `.env` (`0` =
-off).
+An optional **trip-wire** in each analyzer (`INVESTIGATION_BUDGET`,
+default `0` = disabled) can abort a job cleanly if the agent has burned
+that many tool calls without producing `exploit.py` / `solver.py` —
+useful when you want a hard ceiling instead of letting the SDK exhaust
+its context window with `Prompt is too long`. Set
+`INVESTIGATION_BUDGET=<positive int>` in `.env` to enable.
 
 Each module's SYSTEM_PROMPT opens with a 5-line **MISSION** stanza
 (`mission_block()` in `modules/_common.py`) that tells the model up
@@ -177,7 +177,7 @@ All knobs live in two places:
    | `AUTH_TOKEN` | empty | shared token; empty = no auth (dev) |
    | `HOST_CLAUDE_HOME` | `${HOME}/.claude` | host path of Claude Code config |
    | `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `999999` | per-turn SDK output cap (the model's own ceiling, ~64k for Sonnet/Opus, becomes the effective limit) |
-   | `INVESTIGATION_BUDGET` | `60` | tool-call budget after which a web/pwn/crypto/rev job aborts cleanly if no `exploit.py` / `solver.py` was produced (`0` = disabled) |
+   | `INVESTIGATION_BUDGET` | `0` | tool-call budget after which a web/pwn/crypto/rev job aborts cleanly if no `exploit.py` / `solver.py` was produced. `0` (default) disables the trip-wire; set to a positive int to enable. |
 
 2. **Settings tab** in the UI — writes to `/data/settings.json`, overrides `.env`
    without restart for: Anthropic API key, Claude model, Auth token, Job TTL,

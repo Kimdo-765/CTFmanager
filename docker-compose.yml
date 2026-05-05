@@ -56,7 +56,7 @@ services:
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: ${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-999999}
       # Trip-wire: kill investigation-loop runaway before the SDK
       # exhausts its conversation context. 0 disables.
-      INVESTIGATION_BUDGET: ${INVESTIGATION_BUDGET:-60}
+      INVESTIGATION_BUDGET: ${INVESTIGATION_BUDGET:-0}
     volumes:
       - ./data:/data
       - ./modules:/app/modules:ro
