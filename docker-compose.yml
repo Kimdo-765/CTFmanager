@@ -16,6 +16,11 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Lift the SDK's per-turn output cap. The model still has its
+      # own hard ceiling (Sonnet/Opus ~64k), so the agent picks
+      # whatever its model supports rather than getting truncated
+      # at the SDK default. Override in .env if you want it lower.
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: ${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-999999}
     volumes:
       - ./data:/data
       - ./modules:/app/modules:ro
@@ -40,6 +45,10 @@ services:
       # Tell the bundled `claude` CLI it is running in a sandbox so it allows
       # --dangerously-skip-permissions even though the container runs as root.
       IS_SANDBOX: "1"
+      # Lift the SDK's per-turn output cap. The model's own ceiling
+      # (Sonnet/Opus ~64k) becomes the effective limit. Override in
+      # .env to throttle if needed.
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: ${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-999999}
     volumes:
       - ./data:/data
       - ./modules:/app/modules:ro
