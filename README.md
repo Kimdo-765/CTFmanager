@@ -5,6 +5,17 @@ Forensic, Misc, Crypto, and Reversing — each combines automated tooling with a
 Claude Code agent that reads the challenge, identifies the vulnerability or
 flag, and generates a runnable exploit/solver script.
 
+For exploitable modules (web/pwn/crypto/rev) the agent runs as a **two-tier
+team**: a `main` writer that drives reasoning + writes `exploit.py` /
+`solver.py` / `report.md`, and a read-only `recon` subagent it can delegate
+heavy investigation to via `Task('recon', '<question>')`. See [Agent
+architecture](#agent-architecture).
+
+Failed jobs (or finished-without-flag) can be **retried** with an automatic
+reviewer-written hint, a hand-written hint, or stop-and-resume mid-run —
+all four paths fork the prior Claude SDK conversation and carry over the
+working directory. See [Retry / Resume](#retry--resume).
+
 ## Modules
 
 | Module | Pipeline | Output |
@@ -49,6 +60,44 @@ target is given).
 - **redis**: job queue.
 - **decompiler / forensic / misc / runner / sage**: built but not started.
   The worker `docker run`s them per job, then removes them.
+
+## Agent architecture
+
+For web / pwn / crypto / rev jobs, each job spins up a two-tier Claude
+agent team in the worker:
+
+```
+   main agent (writer)                  recon subagent (read-only)
+   ──────────────────                   ──────────────────────────
+   • drives reasoning                   • answers ONE specific
+   • writes exploit.py /                  question per Task call
+     solver.py / report.md              • Read / Bash / Glob / Grep
+   • Read / Write / Edit /              • CANNOT Write / Edit
+     Bash / Glob / Grep / Task          • returns ≤2 KB summary
+              │                                    ▲
+              │  Task("recon", "<q>") ─────────────┘
+              ▼
+        compact summary
+```
+
+Same model on both sides — `recon` exists purely so heavy disasm / symbol
+walks / source-tree greps don't pollute the main agent's conversation
+context. The main agent keeps the only Write/Edit hand on the produced
+files, and only the subagent's compact summary lands in main's context.
+
+Each turn the main agent emits an `init` SystemMessage whose `session_id`
+the worker captures into `meta.claude_session_id`. On retry / resume
+`_resubmit()` propagates that into `meta.resume_session_id` and copies
+the prior `~/.claude/projects/<project_key>/<sid>.jsonl` (and any
+`subagents/`) into the new job's project-key directory, so SDK
+`fork_session=True` actually finds the prior conversation.
+
+A **trip-wire** in each analyzer (`INVESTIGATION_BUDGET`, default 60
+tool calls) aborts a job cleanly if the agent has burned that many
+tool calls without producing `exploit.py` / `solver.py` — better than
+letting the SDK exhaust its context window with `Prompt is too long`.
+Override or disable via `INVESTIGATION_BUDGET=<n>` in `.env` (`0` =
+off).
 
 ## Prerequisites
 
@@ -97,6 +146,8 @@ All knobs live in two places:
    | `ANTHROPIC_API_KEY` | empty | leave empty for OAuth |
    | `AUTH_TOKEN` | empty | shared token; empty = no auth (dev) |
    | `HOST_CLAUDE_HOME` | `${HOME}/.claude` | host path of Claude Code config |
+   | `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `999999` | per-turn SDK output cap (the model's own ceiling, ~64k for Sonnet/Opus, becomes the effective limit) |
+   | `INVESTIGATION_BUDGET` | `60` | tool-call budget after which a web/pwn/crypto/rev job aborts cleanly if no `exploit.py` / `solver.py` was produced (`0` = disabled) |
 
 2. **Settings tab** in the UI — writes to `/data/settings.json`, overrides `.env`
    without restart for: Anthropic API key, Claude model, Auth token, Job TTL,
@@ -160,7 +211,7 @@ upload ──► /data/jobs/<id>/         ─► RQ enqueue
 | GET | `/api/modules` | module catalog |
 | GET | `/api/jobs` | list all jobs |
 | GET | `/api/jobs/{id}` | job meta |
-| GET | `/api/jobs/{id}/log` | run log (text) |
+| GET | `/api/jobs/{id}/log[?tail=N]` | run log (text). `?tail=N` returns only the trailing N bytes (newline-aligned, used by the polling UI). |
 | GET | `/api/jobs/{id}/result` | result JSON |
 | GET | `/api/jobs/{id}/file/{name}` | any artifact under the job dir |
 | DELETE | `/api/jobs/{id}` | delete one job (cancels queued/running) |
@@ -175,10 +226,10 @@ upload ──► /data/jobs/<id>/         ─► RQ enqueue
 | POST | `/api/modules/crypto/analyze` | upload zip → enqueue |
 | POST | `/api/modules/rev/analyze` | upload binary → enqueue |
 | POST | `/api/jobs/{id}/run` | re-run produced exploit/solver in a fresh sandbox |
-| POST | `/api/jobs/{id}/retry` | regenerate the job with a hint (body: `{"hint":"…"}` for manual hint, empty body = auto reviewer) |
-| POST | `/api/jobs/{id}/retry/stream` | same as `/retry` but returns Server-Sent Events with reviewer progress |
-| POST | `/api/jobs/{id}/resume` | hard-stop the job (if still queued/running), then enqueue a fresh one with `{"hint":"…"}` appended as `[retry-hint]` |
-| POST | `/api/jobs/{id}/resume/stream` | SSE-streamed resume. With `{"hint":"…"}` body works exactly like `/resume`. With an empty body, calls the latest reviewer to write the hint (same flow as `/retry/stream`) before submitting. Both modes carry `./work/` and prepend the `[RESUMING]` preamble. |
+| POST | `/api/jobs/{id}/retry` | regenerate the job. JSON body fields all optional: `hint` (skip reviewer if present), `target` (override prior target_url; sentinel `(none)` clears it). Empty body = auto reviewer + keep prior target. |
+| POST | `/api/jobs/{id}/retry/stream` | same as `/retry` but Server-Sent Events stream the reviewer text live |
+| POST | `/api/jobs/{id}/resume` | hard-stop a queued/running job, then enqueue a fresh one with the same body shape as `/retry`; `hint` required here. Carries `./work/` + forks the prior SDK session. |
+| POST | `/api/jobs/{id}/resume/stream` | SSE-streamed resume. With `{"hint":"…"}` works exactly like `/resume`. With an empty body, calls the reviewer to write the hint first. Both modes carry `./work/`, fork the prior session, and prepend the `[RESUMING]` preamble. |
 | POST | `/api/jobs/{id}/timeout/continue` | acknowledge the soft timeout — let the agent keep running |
 | POST | `/api/jobs/{id}/timeout/kill` | acknowledge the soft timeout — hard-stop the job |
 
@@ -227,6 +278,11 @@ HexTech_CTF_TOOL/
 - Requires the `decompiler` image (Ghidra 12.0.4 by default; override
   `GHIDRA_VERSION`/`GHIDRA_BUILD_DATE` in `.env`).
 - Per-job timeline: ~2–3 min decompile + Claude analysis time.
+- Worker container ships cross-arch CLIs the agent expects from Bash:
+  `aarch64-linux-gnu-{objdump,nm,readelf}`, `arm-linux-gnueabi-*`,
+  `qemu-aarch64-static` / `qemu-arm-static`, `gdb`, `strace`,
+  `ltrace`, `patchelf`, `cpio`, `ROPgadget` (with `capstone>=5` so
+  ARM64 gadget search actually returns hits), `pwn checksec`.
 
 ### Forensic
 - Auto-detects qcow2 / vmdk / vhd / vhdx / e01 / raw / memory / **log**.
@@ -313,27 +369,83 @@ Internally:
 - If the agent finishes naturally before the soft timeout, the watchdog is
   cancelled silently and no banner ever appears.
 
-## Retry with hint
+## Retry / Resume
 
-When a Web/Pwn/Crypto/Rev job ends in `failed`, `no_flag`, or `finished
-without a flag`, the job detail panel shows two retry buttons:
+Web / Pwn / Crypto / Rev jobs can be re-issued at any terminal status
+(`failed`, `no_flag`, `finished`, `stopped`) — and Stop&resume can also
+fire while the job is still `queued` / `running`. Four buttons:
 
 | Button | What happens |
 |---|---|
 | **↻ Retry with reviewer hint** | A separate Claude (Opus 4.7 by default) reads the prior job's `run.log`, exploit/solver, stdout/stderr, and key source files, then writes a one-paragraph diagnosis. That hint is appended to the original description as `[retry-hint] …` and a fresh job is enqueued. Reviewer output streams into the UI live (SSE). |
-| **✏ Retry with my hint** | Opens an inline textarea. Whatever you type is appended verbatim as `[retry-hint]` — the reviewer is **not** called and no Claude credit is spent. Useful when you've already spotted the bug and just want the agent to focus on a specific lead. |
-| **↻ Stop & resume with reviewer hint** | Only visible while the job is `queued`/`running`. Halts the in-flight job, then asks the latest Claude (Opus 4.7) to read the partial run.log + work/ + sources and write a one-paragraph diagnosis. That hint becomes the next job's `[retry-hint]`. SSE-streamed, so reviewer output appears live in the same purple panel used by `/retry/stream`. **Resume preserves context**: the previous agent's `./work/` (partial `exploit.py` / `solver.py` / `report.md` / notes) is copied into the new job and the agent is told to read those first. |
-| **✋ Stop & resume with my hint** | Same as the reviewer variant, but you write the hint yourself in an inline textarea — no Claude credit spent. Use this when you've already spotted the wrong turn and want to redirect without paying for a reviewer pass. |
+| **✏ Retry with my hint** | Inline textarea. Whatever you type is appended as `[retry-hint]` — the reviewer is **not** called. |
+| **↻ Stop & resume with reviewer hint** | Only visible while the job is `queued`/`running`. Halts the in-flight job, asks the reviewer to write a diagnosis from the partial run, and submits the new job with that hint. SSE streams progress. |
+| **✋ Stop & resume with my hint** | Same as the reviewer variant but you write the hint yourself. |
 
-The new job inherits the previous module, target, model, timeout, source/binary
-upload, and `auto_run` setting — you don't re-upload anything. The retry
-chain is recorded as `meta.retry_of` on the new job so you can trace lineage.
+**What carries forward** (all four paths):
 
-Errors from the reviewer (Claude API auth/rate-limit/credit failures, policy
-refusals, empty responses) are surfaced in the panel with a red "no new job
-created" header and the error body. The new job is **not** enqueued in that
-case — fix the underlying issue (or use the manual-hint button) and try
-again.
+- the previous job's `./work/` directory (partial `exploit.py` / `solver.py`
+  / `report.md` / notes / decomp output) is copied into the new job, so
+  the new agent literally sees the files the prior agent wrote;
+- the prior Claude SDK conversation: `meta.claude_session_id` is captured
+  by `capture_session_id()` whenever the SDK emits an `init` SystemMessage,
+  propagated to `meta.resume_session_id` of the new job, and the prior
+  session's transcript jsonl (plus any `subagents/`) is copied into the
+  new cwd's project-key directory. The new analyzer launches with
+  `ClaudeAgentOptions(resume=<sid>, fork_session=True)`, so the new agent
+  inherits the prior reasoning, thinking, and tool history — not just
+  the work tree;
+- the user-supplied (or reviewer-written) hint is hoisted to the **top**
+  of the new agent's user prompt as `⚠ PRIORITY GUIDANCE` so it isn't
+  buried under the original challenge description;
+- module / target / model / timeout / source-or-binary upload / auto_run
+  are inherited automatically. The retry chain is recorded as
+  `meta.retry_of`; resume additionally records `meta.resumed_from`.
+
+**Optional target override**: every retry/resume button accepts an optional
+new target. Reviewer-mode buttons prompt via `window.prompt()` (prefilled
+with the prior target); inline-form buttons add a one-line input under the
+hint textarea. Empty input keeps the prior target; the sentinel `(none)`
+clears it.
+
+If the SDK can't locate the prior session for any reason, the new agent
+boots fresh — `./work/` + the priority-guidance hint are still sufficient
+context. The fallback is documented inside the preamble itself.
+
+Errors from the reviewer (Claude API auth/rate-limit/credit failures,
+policy refusals, empty responses) are surfaced in the panel with a red
+"no new job created" header and the error body. The new job is **not**
+enqueued in that case.
+
+## UI niceties
+
+- **Job detail modal**. Clicking a job opens a centered overlay (~96vw),
+  not an inline panel. Esc / backdrop / ✕ closes; background scroll is
+  locked while open.
+- **Run log frame**. The run log lives in a macOS-style terminal window
+  with traffic-light buttons and a green block caret that blinks while
+  the job is `running` / `queued` (steady when terminal). Each line is
+  classified by prefix and colored:
+  `AGENT` (lavender) · `TOOL <name>` (blue + orange tool name) ·
+  `TOOL_RESULT` (green) · `TOOL_ERROR` (red) · `THINK` (yellow italic) ·
+  `DONE` (light blue) · `AGENT_ERROR` / `ERROR` (red bold) · system
+  notes (dim italic).
+- **Live elapsed timer**. While `running` the meta line shows
+  `elapsed: <h>m <s>s (running)` ticking every 2 s; on terminal it
+  switches to `duration: <…>`. Auto-stamped by the backend the first
+  time status flips to `running` / terminal.
+- **File preview modal**. Clicking `result.json` / `report.md` /
+  `exploit.py` / `solver.py` / `summary.json` / `findings.json` /
+  `log_findings.json` etc. opens a syntax-highlighted overlay
+  (highlight.js + marked from jsDelivr CDN). JSON is pretty-printed,
+  Markdown is rendered with embedded code blocks highlighted, source
+  files (`.py` / `.sage` / `.sh` / `.c` / …) are highlighted by
+  extension, logs are plain text. `Open raw` / `Copy` / Esc / backdrop.
+  Modifier-clicks (`Ctrl/Cmd/Shift/middle`) skip the modal.
+- **Polling that respects user input**. The 2-second poll re-render
+  is suppressed while you have an inline retry/resume form open OR
+  while you have a non-collapsed selection inside the run log — so
+  a copy-paste mid-run isn't clobbered by an incoming line.
 
 ## Out-of-band callbacks (XSS / SSRF / blind RCE)
 
