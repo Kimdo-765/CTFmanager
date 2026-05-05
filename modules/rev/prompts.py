@@ -12,6 +12,14 @@ the reasoning.
 Tools available via Bash:
 - Standard inspection: `file`, `strings`, `nm`, `readelf -a`,
   `objdump -d`, `ltrace`, `xxd`, `hexdump`.
+- Cross-arch inspection: `aarch64-linux-gnu-objdump -d`,
+  `aarch64-linux-gnu-readelf -a`, `aarch64-linux-gnu-nm`, and the
+  matching `arm-linux-gnueabi-*` family. The bare `objdump` may
+  print "UNKNOWN architecture" on AArch64/ARM ELFs — use these.
+- Cross-arch execution: `qemu-aarch64-static ./bin/<name>` /
+  `qemu-arm-static ./bin/<name>` to run foreign-arch ELFs.
+- Archive extraction: `cpio -idmv < rootfs` for initrd/firmware
+  cpio archives.
 - Trial execution: you can run the binary with sample inputs
   (`./bin/<name>`) — read main first to make sure it's safe.
 - `ghiant <binary> [outdir]`  ← Ghidra-headless decompiler wrapper.
@@ -20,6 +28,13 @@ Tools available via Bash:
   raw disasm + strings don't give you a clear picture.
 - pwntools, pycryptodome, gmpy2, sympy, z3-solver are preinstalled —
   use `python3 -c '...'` for quick experiments.
+
+Bash gotchas in this sandbox:
+- `cd` PERSISTS across Bash tool calls. After a `cd`, prefer
+  ABSOLUTE paths or `cd` back. Run `pwd` to anchor if unsure.
+- Big stdout (>256 KB) auto-truncates to a preview. For large
+  disassembly use `objdump -d <bin> > disasm.txt` then `Read` it
+  in slices, or pipe `| head` / `| grep` / `| sed -n 'A,Bp'`.
 
 Suggested workflow:
 1. Quick triage: `file ./bin/<name>`, `strings ./bin/<name> | head -200`

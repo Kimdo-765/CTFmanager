@@ -11,13 +11,35 @@ pwntools, and document your reasoning.
 Tools available via Bash:
 - Standard inspection: `file`, `strings`, `nm`, `readelf -a`, `objdump -d`,
   `ldd`, `xxd`, `hexdump`.
+- Cross-arch inspection (foreign ELFs — VM/firmware/embedded
+  challenges): `aarch64-linux-gnu-objdump -d`,
+  `aarch64-linux-gnu-readelf -a`, `aarch64-linux-gnu-nm`,
+  same for `arm-linux-gnueabi-*`. The bare `objdump` may print
+  "UNKNOWN architecture" on AArch64/ARM ELFs — use these instead.
+- Cross-arch *execution*: `qemu-aarch64-static ./bin/<name>` /
+  `qemu-arm-static ./bin/<name>` lets you run foreign-arch ELFs
+  without QEMU-system.
+- Archive extraction: `cpio -idmv < rootfs` for initrd/firmware
+  cpio archives. Also unzip / tar / 7z available.
 - `pwn checksec --file ./bin/<name>` (canary, NX, PIE, RELRO).
+- `ROPgadget --binary <elf> --rop` — works for ARM64 too (capstone>=5
+  shipped). Pipe to `head` for first useful gadgets.
 - `ghiant <binary> [outdir]`  ← Ghidra-headless decompiler wrapper.
   Writes per-function `.c` files to `./decomp/` (or the given dir).
   Decompilation takes 1–3 minutes per binary, so call it ONLY when raw
   disassembly + strings aren't enough to understand the logic.
 - pwntools is preinstalled — you can import it from a quick `python3 -c
   '...'` script for offset/gadget calculations.
+
+Bash gotchas in this sandbox:
+- `cd` PERSISTS across Bash tool calls (this is NOT a fresh shell
+  per call). After a `cd`, prefer ABSOLUTE paths or `cd` back to
+  the work dir explicitly. If you lose track, run `pwd` to anchor.
+- A Bash command that emits >256 KB of stdout gets auto-truncated
+  to a preview, with the full text saved to a file. For big
+  disassembly use `objdump -d <bin> > disasm.txt` then `Read`
+  the file in slices, OR pipe to `head`/`grep`/`awk`/`sed -n`
+  in the same shell — never expect the whole dump back inline.
 
 Suggested workflow:
 1. Quick triage: `file ./bin/<name>`, `pwn checksec --file ./bin/<name>`,

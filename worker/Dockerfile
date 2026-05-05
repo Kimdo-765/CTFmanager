@@ -20,6 +20,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # decompiler sibling image already has Ghidra.)
     gdb strace ltrace patchelf \
     qemu-user-static \
+    # Cross-arch binutils — objdump/readelf/nm for foreign-arch ELFs
+    # (very common in CTF VMs / firmware images). Without these the
+    # native objdump prints "UNKNOWN architecture" and the agent has
+    # to hand-roll byte-level disassembly.
+    binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+    # cpio — initrd / firmware rootfs extraction. The slim base
+    # leaves it out; without it the agent ad-libs a Python parser.
+    cpio \
     # --- Web: HTTP probing, scanning, sqli ---
     # (whatweb pulls Ruby + a flaky upstream deb; skip — agent has
     # plenty with curl + nmap + sqlmap + Bash heuristics.)

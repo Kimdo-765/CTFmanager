@@ -14,6 +14,10 @@ pycryptodome==3.21.0
 ecdsa==0.19.0
 # pwn / rev — gadget hunting
 ROPgadget==7.5
+# capstone>=5 unlocks CS_ARCH_AARCH64 (the 4.x line lacks ARM64);
+# without it ROPgadget --binary <aarch64.so> silently produces 0
+# gadgets and the agent falls back to byte-level hand search.
+capstone>=5.0,<6
 # web — request shaping + parsing
 requests==2.32.3
 beautifulsoup4==4.12.3
