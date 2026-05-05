@@ -310,9 +310,15 @@ HexTech_CTF_TOOL/
 - Per-job timeline: ~2–3 min decompile + Claude analysis time.
 - Worker container ships cross-arch CLIs the agent expects from Bash:
   `aarch64-linux-gnu-{objdump,nm,readelf}`, `arm-linux-gnueabi-*`,
-  `qemu-aarch64-static` / `qemu-arm-static`, `gdb`, `strace`,
-  `ltrace`, `patchelf`, `cpio`, `ROPgadget` (with `capstone>=5` so
-  ARM64 gadget search actually returns hits), `pwn checksec`.
+  `qemu-aarch64-static` / `qemu-arm-static`, `gdb`, `gdb-multiarch`,
+  `strace`, `ltrace`, `patchelf`, `cpio`, `ROPgadget` (with
+  `capstone>=5` so ARM64 gadget search actually returns hits),
+  `one_gadget`, `pwn checksec`.
+- Dynamic analysis is reachable for foreign-arch ELFs too:
+  `qemu-aarch64-static -g 1234 ./bin/x &` followed by
+  `gdb-multiarch -batch -ex 'set arch aarch64' -ex 'target remote
+  :1234' -ex 'b *0x...' -ex 'continue' …` lets the recon subagent
+  break/inspect inside QEMU-user without needing a full system VM.
 
 ### Forensic
 - Auto-detects qcow2 / vmdk / vhd / vhdx / e01 / raw / memory / **log**.

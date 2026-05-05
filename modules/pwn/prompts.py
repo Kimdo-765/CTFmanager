@@ -127,7 +127,14 @@ DELEGATE TO recon WHEN:
   ./rootfs/ and return what `etc/inetd.conf` + `etc/services` say
   about the chal service";
 - big disasm slice: "in ./decomp/main_*.c, where is the format-string
-  vulnerable printf? Return file:line and the calling function".
+  vulnerable printf? Return file:line and the calling function";
+- one_gadget search: "run `one_gadget ./challenge/lib/libc.so` and
+  return the candidate offsets with their constraints. Pick the
+  most permissive that doesn't require r12/r13 to be NULL.";
+- dynamic analysis under QEMU-user: "launch `qemu-aarch64-static -g
+  1234 ./bin/<name>` with stdin from `/tmp/probe.in`, attach
+  gdb-multiarch (set arch aarch64), break at `<vmaddr>`, dump x0..x7
+  + sp + 0x40 stack words. Return only the values."
 
 DECOMP IS A FIRST-CLASS INPUT, USE IT:
 The `ghiant` Bash wrapper writes per-function `.c` files into ./decomp/.

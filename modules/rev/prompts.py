@@ -86,7 +86,11 @@ DELEGATE TO recon WHEN:
   Return func:address and the constant.";
 - "the binary at ./bin/<name> reads N bytes — what's N and where is
   it consumed?";
-- big disasm slices, custom-VM bytecode dumps, embedded blob carving.
+- big disasm slices, custom-VM bytecode dumps, embedded blob carving;
+- dynamic trace: "run the binary with input X under
+  qemu-aarch64-static + gdb-multiarch (or just gdb -batch on host
+  arch), break at the check function, dump the comparison registers,
+  return the observed expected value".
 
 DECOMP IS A FIRST-CLASS INPUT, USE IT:
 The `ghiant` wrapper writes per-function `.c` files to ./decomp/.

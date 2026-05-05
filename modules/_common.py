@@ -373,20 +373,39 @@ will answer.
     ROPgadget --binary <libc> --only "pop|ret" | head
     ROPgadget --binary <libc> --string '/bin/sh'
 
+  one_gadget — libc one-shot RCE finder (use after libc is identified):
+    one_gadget <libc.so>                       # all candidates + constraints
+    one_gadget -l 1 <libc.so>                  # show only most-permissive level
+    # Returns hex offsets you add to libc base. Each gadget has a
+    # constraint set (e.g. "[rsp+0x40] == NULL"); pick whichever
+    # the agent's leak/overwrite primitive can satisfy. Pairs well
+    # with ROPgadget when one_gadget's constraints don't fit.
+
   Decompilation (heavy — call ONLY if disasm is too dense):
     ghiant <bin> [outdir]                      # Ghidra headless, 1-3 min
     # produces ./decomp/<func>_<addr>.c — read main_*.c then follow
     # the call graph by symbol name. Don't dump the whole tree;
     # grep for the suspicious call sites.
 
-  Cross-arch execution (sample inputs without QEMU-system):
-    qemu-aarch64-static ./bin/<name>           # foreign ELF runs natively
+  Cross-arch execution + dynamic analysis with QEMU-user (foreign ELFs):
+    qemu-aarch64-static ./bin/<name>           # run native, no kernel
     qemu-aarch64-static -strace ./bin/<name>   # syscall trace
-    qemu-aarch64-static -g 1234 ./bin/<name> & # gdbserver on :1234
-    aarch64-linux-gnu-gdb -ex 'target remote :1234' ...
+    # gdbserver mode — let gdb attach and step through:
+    qemu-aarch64-static -g 1234 ./bin/<name> </tmp/in &
+    gdb-multiarch -nx -batch \\
+        -ex 'set architecture aarch64' \\
+        -ex 'target remote :1234' \\
+        -ex 'b *<vmaddr>' -ex 'continue' \\
+        -ex 'info registers' -ex 'x/40gx $sp' \\
+        -ex 'detach'
+    # use this to verify offsets, observe heap layout, dump
+    # post-leak register state, etc. Send the binary's stdin via
+    # the shell redirection (`</tmp/in`) since you can't type into
+    # a backgrounded qemu instance.
 
-  Dynamic analysis (host arch):
+  Dynamic analysis (host arch — x86_64 / native):
     gdb -batch -ex 'b *0x400500' -ex 'r' -ex 'info reg' ./bin
+    gdb-multiarch -batch -ex 'set arch i386' …  # 32-bit on 64-bit host
     strace -f -e openat ./bin <input>
     ltrace -f ./bin <input>
 

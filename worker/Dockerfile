@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # --- Pwn / Rev: dynamic analysis + reverse engineering ---
     # (radare2 isn't in the slim base's apt; for full reversing the
     # decompiler sibling image already has Ghidra.)
-    gdb strace ltrace patchelf \
+    gdb gdb-multiarch strace ltrace patchelf \
     qemu-user-static \
     # Cross-arch binutils — objdump/readelf/nm for foreign-arch ELFs
     # (very common in CTF VMs / firmware images). Without these the
@@ -28,6 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # cpio — initrd / firmware rootfs extraction. The slim base
     # leaves it out; without it the agent ad-libs a Python parser.
     cpio \
+    # Ruby is here only to provide the `one_gadget` gem (the standard
+    # libc one-gadget RCE finder used in nearly every modern pwn
+    # writeup). gem install runs in the next RUN.
+    ruby ruby-dev \
     # --- Web: HTTP probing, scanning, sqli ---
     # (whatweb pulls Ruby + a flaky upstream deb; skip — agent has
     # plenty with curl + nmap + sqlmap + Bash heuristics.)
@@ -59,6 +63,11 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 
 COPY worker/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# one_gadget — finds libc one-shot RCE gadgets (constraints + offset).
+# Standard tool the pwn agent reaches for after locating libc; cheaper
+# than building a full ROP chain when one_gadget conditions hold.
+RUN gem install --no-document one_gadget
 
 COPY worker /app/worker
 
