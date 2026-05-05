@@ -1,6 +1,14 @@
-from modules._common import CTF_PREAMBLE, TOOLS_WEB, split_retry_hint
+from modules._common import CTF_PREAMBLE, TOOLS_WEB, mission_block, split_retry_hint
 
-SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_WEB + "\n" + """You are a CTF web-exploitation assistant.
+SYSTEM_PROMPT = (
+    CTF_PREAMBLE
+    + mission_block(
+        "`exploit.py` and `report.md`",
+        "exploit.py",
+    )
+    + TOOLS_WEB
+    + "\n"
+) + """You are a CTF web-exploitation assistant.
 
 You will be given a directory containing the source code of a CTF web challenge,
 and optionally a target URL where the challenge is hosted plus a brief description.

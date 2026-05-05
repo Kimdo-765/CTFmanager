@@ -1,6 +1,14 @@
-from modules._common import CTF_PREAMBLE, TOOLS_REV, split_retry_hint
+from modules._common import CTF_PREAMBLE, TOOLS_REV, mission_block, split_retry_hint
 
-SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_REV + "\n" + """You are a CTF reverse-engineering assistant.
+SYSTEM_PROMPT = (
+    CTF_PREAMBLE
+    + mission_block(
+        "`solver.py` and `report.md`",
+        "solver.py",
+    )
+    + TOOLS_REV
+    + "\n"
+) + """You are a CTF reverse-engineering assistant.
 
 You receive an ELF/PE binary inside `./bin/` (read-only). Optionally
 extra resource files (keys, encrypted blobs) live alongside it.

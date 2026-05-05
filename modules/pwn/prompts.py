@@ -1,6 +1,14 @@
-from modules._common import CTF_PREAMBLE, TOOLS_PWN, split_retry_hint
+from modules._common import CTF_PREAMBLE, TOOLS_PWN, mission_block, split_retry_hint
 
-SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_PWN + "\n" + """You are a CTF pwnable (binary exploitation) assistant.
+SYSTEM_PROMPT = (
+    CTF_PREAMBLE
+    + mission_block(
+        "`exploit.py` and `report.md`",
+        "exploit.py",
+    )
+    + TOOLS_PWN
+    + "\n"
+) + """You are a CTF pwnable (binary exploitation) assistant.
 
 You receive an ELF/PE binary inside `./bin/` (read-only). Optionally a
 remote target in `host:port` form.

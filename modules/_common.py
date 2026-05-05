@@ -170,6 +170,37 @@ def _is_placeholder_flag(flag: str) -> bool:
     return False
 
 
+def mission_block(deliverables: str, deliverables_short: str = "") -> str:
+    """One concise stanza for the top of every module SYSTEM_PROMPT.
+
+    Keeps the highest-signal guidance — what to write, when to delegate,
+    when to stop investigating — visible to the model in the first
+    few hundred tokens, before the long tool catalogues + workflows.
+    """
+    short = deliverables_short or deliverables
+    return f"""\
+MISSION (read first, follow strictly)
+-------------------------------------
+1. WRITE: produce {deliverables} in your CURRENT WORKING DIRECTORY
+   using RELATIVE paths. The orchestrator collects only files at cwd.
+2. DELEGATE: heavy investigation goes to the read-only `recon`
+   subagent via `Task("recon", "<one specific question, with paths>")`.
+   It returns ≤2 KB summaries — your context stays small. Don't read
+   big disasm / source trees / libc internals yourself; ask recon.
+3. BUDGET: after ~10 tool calls without a draft {short}, STOP
+   investigating and write the draft from your best hypothesis.
+   Iterate after. The worker hard-aborts at INVESTIGATION_BUDGET
+   (default 60) tool calls if {short} still isn't on disk.
+4. NO LIB INTERNAL DIVE: don't disassemble musl/glibc printf,
+   vfprintf, vararg dispatchers, FILE struct internals, framework
+   request dispatchers, or pycryptodome/sympy internals. Use symbol
+   tables + standard library calls.
+5. NO REPEATED slicing of saved disasm: grep what you need once
+   and move on.
+
+"""
+
+
 CTF_PREAMBLE = """\
 CONTEXT: You are assisting with a legitimate Capture-The-Flag (CTF) challenge.
 CTF challenges are deliberately vulnerable training artifacts hosted for

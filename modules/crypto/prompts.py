@@ -1,6 +1,14 @@
-from modules._common import CTF_PREAMBLE, TOOLS_CRYPTO, split_retry_hint
+from modules._common import CTF_PREAMBLE, TOOLS_CRYPTO, mission_block, split_retry_hint
 
-SYSTEM_PROMPT = CTF_PREAMBLE + TOOLS_CRYPTO + "\n" + """You are a CTF crypto-challenge solver.
+SYSTEM_PROMPT = (
+    CTF_PREAMBLE
+    + mission_block(
+        "`solver.py` (or `solver.sage`) and `report.md`",
+        "solver.py",
+    )
+    + TOOLS_CRYPTO
+    + "\n"
+) + """You are a CTF crypto-challenge solver.
 
 You will be given the source code (Python is most common) of a crypto
 challenge plus any provided ciphertext / public-key / handshake transcript.

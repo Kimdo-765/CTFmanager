@@ -85,6 +85,27 @@ walks / source-tree greps don't pollute the main agent's conversation
 context. The main agent keeps the only Write/Edit hand on the produced
 files, and only the subagent's compact summary lands in main's context.
 
+`recon` shares the same Bash environment as `main`, so anything in the
+worker image is reachable: cross-arch binutils (`aarch64-linux-gnu-objdump`,
+`-readelf`, `-nm`, plus the `arm-linux-gnueabi-*` family), `qemu-aarch64-
+static` / `qemu-arm-static` (for running foreign-arch ELFs and
+`qemu-aarch64-static -g 1234` gdbserver), `gdb -batch`, `strace`,
+`ltrace`, `patchelf`, `cpio`, `ROPgadget` with `capstone>=5` (ARM64
+gadgets work), `pwntools` (`ELF`, `cyclic`, `asm`, `ROP`), `ghiant`
+(Ghidra-headless wrapper that writes `./decomp/<func>_<addr>.c`), plus
+`jq` / `xxd` / `7z`. The `recon` system prompt ships a copy-pasteable
+invocation guide grouped by intent (ELF/disasm, symbol/offset lookup,
+gadgets, decompilation, cross-arch execution, dynamic analysis, archive
+unpack, source triage), with two end-to-end Q/A format examples so the
+return shape is consistent.
+
+Decompiler output is treated as a first-class input: when `./decomp/`
+is empty and raw disasm is dense, the main agent delegates a single
+`Task("recon", "run ghiant on ./bin/<name> and summarize main / vuln /
+read_input / proc_init in ≤12 lines with file:line + key constants")`,
+and re-greps `./decomp/*.c` itself only for the call site recon points
+at — never opening the whole tree.
+
 Each turn the main agent emits an `init` SystemMessage whose `session_id`
 the worker captures into `meta.claude_session_id`. On retry / resume
 `_resubmit()` propagates that into `meta.resume_session_id` and copies
@@ -98,6 +119,15 @@ tool calls without producing `exploit.py` / `solver.py` — better than
 letting the SDK exhaust its context window with `Prompt is too long`.
 Override or disable via `INVESTIGATION_BUDGET=<n>` in `.env` (`0` =
 off).
+
+Each module's SYSTEM_PROMPT opens with a 5-line **MISSION** stanza
+(`mission_block()` in `modules/_common.py`) that tells the model up
+front: write the deliverables to cwd, delegate heavy investigation
+to recon, write a draft within ~10 tool calls, never disassemble
+libc/framework internals, never re-slice saved disasm. Long tool
+catalogues and module-specific workflows follow the mission stanza,
+so the highest-signal guidance lands in the first few hundred
+tokens of context.
 
 ## Prerequisites
 
@@ -430,10 +460,16 @@ enqueued in that case.
   `TOOL_RESULT` (green) · `TOOL_ERROR` (red) · `THINK` (yellow italic) ·
   `DONE` (light blue) · `AGENT_ERROR` / `ERROR` (red bold) · system
   notes (dim italic).
-- **Live elapsed timer**. While `running` the meta line shows
-  `elapsed: <h>m <s>s (running)` ticking every 2 s; on terminal it
-  switches to `duration: <…>`. Auto-stamped by the backend the first
-  time status flips to `running` / terminal.
+- **Live elapsed / duration pill**. Right next to the status badge the
+  job header carries a colored pill (`⏱ 12m 45s`):
+    - yellow with a soft pulse + `running` tag while live (ticks every
+      second from a dedicated 1 s timer that ignores the polling
+      pause used by selection / open forms — so the counter stays
+      smooth while you're copying log text or typing a hint),
+    - green when finished, red when failed, etc.,
+    - dim gray `⏱ queued` before the worker picks the job up.
+  Auto-stamped by the backend the first time status flips to running
+  / a terminal value.
 - **File preview modal**. Clicking `result.json` / `report.md` /
   `exploit.py` / `solver.py` / `summary.json` / `findings.json` /
   `log_findings.json` etc. opens a syntax-highlighted overlay
