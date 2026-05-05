@@ -636,6 +636,24 @@ button[type="submit"], #refresh-jobs {
 .run-log .rl-done-body    { color: #a5d6ff; }
 .run-log .rl-error-body   { color: #ffd5d3; }
 
+/* Lifecycle / system events emitted by the analyzer or watchdog
+   (not by the SDK message stream). Distinct accent colors so the
+   user can spot agent boot, session fork, soft-timeout warning,
+   budget abort, manual sandbox runs, etc. at a glance. */
+.run-log .rl-lifecycle {
+  font-weight: 500;
+}
+.run-log .rl-info     { color: #a5d6ff; }   /* boot / fork / spawn */
+.run-log .rl-warn     { color: #f5d062; font-weight: 600; }
+.run-log .rl-decision { color: #d2a8ff; font-weight: 600; }
+.run-log .rl-cyan     { color: #79c0ff; }
+.run-log .rl-budget {
+  color: #ff7b72; background: #2a0e0e;
+  padding: 0 0.35rem; border-radius: 4px;
+  font-weight: 700; letter-spacing: 0.3px;
+}
+.run-log .rl-budget-body { color: #ffd5d3; }
+
 /* Agent identity chip — distinguishes main writer vs recon subagent.
    Lines from `recon` also get a small ↳ indent marker so a Task
    delegation reads visually like a nested call. */

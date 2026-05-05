@@ -1127,6 +1127,33 @@ const _RUNLOG_PATTERNS = [
   // ERROR: body  (catastrophic — exception in run_job etc.)
   { re: /^(ERROR)\s*:\s*([\s\S]*)$/,
     render: (m) => `<span class="rl-label rl-error">${escapeHtml(m[1])}</span>: <span class="rl-body rl-error-body">${escapeHtml(m[2])}</span>` },
+  // BUDGET_ABORT: body  — investigation budget tripwire fired
+  { re: /^(BUDGET_ABORT)\s*:\s*([\s\S]*)$/,
+    render: (m) => `<span class="rl-label rl-budget">${escapeHtml(m[1])}</span>: <span class="rl-body rl-budget-body">${escapeHtml(m[2])}</span>` },
+  // Lifecycle: ⏰ Soft timeout reached … (watchdog warning)
+  { re: /^(⏰\s+Soft timeout reached[\s\S]*)$/,
+    render: (m) => `<span class="rl-lifecycle rl-warn">${escapeHtml(m[1])}</span>` },
+  // Lifecycle: Launching Claude agent (model=...)
+  { re: /^(Launching Claude (?:agent|summary agent)[\s\S]*)$/,
+    render: (m) => `<span class="rl-lifecycle rl-info">▸ ${escapeHtml(m[1])}</span>` },
+  // Lifecycle: Forking prior Claude session abc12345…
+  { re: /^(Forking prior Claude session[\s\S]*)$/,
+    render: (m) => `<span class="rl-lifecycle rl-info">↻ ${escapeHtml(m[1])}</span>` },
+  // Lifecycle: User chose CONTINUE / STOP — soft-timeout decision
+  { re: /^(User chose (?:CONTINUE|STOP)[\s\S]*)$/,
+    render: (m) => `<span class="rl-lifecycle rl-decision">⚑ ${escapeHtml(m[1])}</span>` },
+  // Lifecycle: Source root: ... (web/crypto)
+  { re: /^(Source root)\s*:\s*([\s\S]*)$/,
+    render: (m) => `<span class="rl-lifecycle rl-info">${escapeHtml(m[1])}</span>: <span class="rl-body">${escapeHtml(m[2])}</span>` },
+  // Lifecycle: [manual-run] executing exploit.py ...
+  { re: /^(\[manual-run\])\s*([\s\S]*)$/,
+    render: (m) => `<span class="rl-lifecycle rl-cyan">${escapeHtml(m[1])}</span> <span class="rl-body">${escapeHtml(m[2])}</span>` },
+  // Lifecycle: Spawning forensic|misc … sibling-container start
+  { re: /^(Spawning [a-z]+[\s\S]*)$/,
+    render: (m) => `<span class="rl-lifecycle rl-info">▸ ${escapeHtml(m[1])}</span>` },
+  // Lifecycle: Skipping Claude summary (forensic/misc)
+  { re: /^(Skipping Claude summary[\s\S]*)$/,
+    render: (m) => `<span class="rl-lifecycle rl-system">${escapeHtml(m[1])}</span>` },
 ];
 
 function _colorizeRunLogLine(line) {
