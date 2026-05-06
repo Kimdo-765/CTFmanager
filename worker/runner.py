@@ -68,9 +68,49 @@ def run_one_worker(idx: int, scheduler: bool) -> None:
     Worker([q], connection=conn, name=name).work(with_scheduler=scheduler)
 
 
+def _sweep_stale_workers() -> None:
+    """Wipe leftover `rq:worker:htct-w*` registrations from a prior
+    container life.
+
+    Worker names are fixed (htct-w0..N) and there is exactly one worker
+    container, so on every boot any pre-existing `rq:worker:htct-w*` in
+    redis is a corpse from a SIGKILL'd previous life. RQ's
+    `register_birth()` refuses to start when the key still exists,
+    sending the parent into an infinite "exited code=1; respawning"
+    loop. Best-effort delete; don't fail boot if redis is unreachable.
+    """
+    try:
+        from redis import Redis
+
+        conn = Redis.from_url(REDIS_URL)
+        keys = list(conn.scan_iter(match="rq:worker:htct-w*"))
+        if not keys:
+            return
+        names = [k.decode().rsplit(":", 1)[1] for k in keys]
+        pipe = conn.pipeline()
+        for k in keys:
+            pipe.delete(k)
+        for n in names:
+            pipe.srem("rq:workers", n)
+        pipe.execute()
+        print(
+            f"[worker] swept {len(names)} stale RQ registration(s): "
+            f"{','.join(names)}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[worker] sweep failed (non-fatal): {e}", flush=True)
+
+
 def main() -> int:
     n = _resolve_concurrency()
     print(f"[worker] launching {n} worker process(es)", flush=True)
+
+    # Clear any stale `rq:worker:htct-w*` from a SIGKILL'd previous boot
+    # before children try to register their birth — otherwise RQ throws
+    # "There exists an active worker named ... already" and the parent
+    # respawns forever.
+    _sweep_stale_workers()
 
     # Cleanup thread runs in the parent only.
     threading.Thread(target=cleanup_loop, daemon=True).start()
@@ -93,6 +133,17 @@ def main() -> int:
         for p in procs:
             try:
                 p.terminate()
+            except Exception:
+                pass
+        # Give children up to 10s to call RQ's register_death() —
+        # without this the parent exits, container teardown SIGKILLs
+        # the children, and `rq:worker:htct-w*` keys leak into redis;
+        # next boot then loops on "name already exists".
+        deadline = time.time() + 10
+        for p in procs:
+            remaining = max(0.0, deadline - time.time())
+            try:
+                p.join(timeout=remaining)
             except Exception:
                 pass
         sys.exit(0)
