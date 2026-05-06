@@ -975,9 +975,12 @@ async function renderJob(id, opts = {}) {
   const showStopResume = isExploitableModule && (
     job.status === "queued" || job.status === "running"
   );
+  // "Change target" only makes sense for modules that take a target
+  // (web/pwn/crypto/rev) — same set as retry. Visible at any status.
+  const showChangeTarget = isExploitableModule;
   if (
     job.runnable_script || job.exploit_present || job.solver_present
-    || showRetry || showStopResume
+    || showRetry || showStopResume || showChangeTarget
   ) {
     const scriptName = job.runnable_script || (job.exploit_present ? "exploit.py" : "solver.py");
     const runHtml = (job.runnable_script || job.exploit_present || job.solver_present)
@@ -989,12 +992,15 @@ async function renderJob(id, opts = {}) {
     const stopResumeHtml = showStopResume
       ? `<button class="retry-btn retry-stop-resume-btn" data-action="stop-resume-reviewer">↻ Stop &amp; resume with reviewer hint</button>
          <button class="retry-btn retry-stop-resume-btn" data-action="stop-resume">✋ Stop &amp; resume with my hint</button>` : "";
+    const targetHtml = showChangeTarget
+      ? `<button class="retry-btn change-target-btn" data-action="change-target">✎ Change target</button>` : "";
     const helperBits = [];
     if (runHtml) helperBits.push("re-runs the produced script");
     if (retryHtml) helperBits.push("reviewer hint = Claude diagnoses the failure · my hint = you write the hint yourself");
     if (stopResumeHtml) helperBits.push("stop & resume = halt this job, carry over ./work/, and start fresh with a reviewer-written or hand-written hint");
+    if (targetHtml) helperBits.push("change target = update only meta.target_url; no retry, no resume");
     runBlock = `<div class="retry-row" style="margin:0.5rem 0">
-      ${runHtml} ${retryHtml} ${stopResumeHtml}
+      ${runHtml} ${targetHtml} ${retryHtml} ${stopResumeHtml}
       <small style="color:#8b949e">${helperBits.join(" · ")}</small>
     </div>`;
   }
@@ -1153,6 +1159,63 @@ async function renderJob(id, opts = {}) {
   const killBtn = detail.querySelector('.timeout-kill-btn[data-action="kill"]');
   if (killBtn) {
     killBtn.addEventListener("click", () => decideTimeout(id, "kill", killBtn));
+  }
+
+  const changeTargetBtn = detail.querySelector('.change-target-btn[data-action="change-target"]');
+  if (changeTargetBtn) {
+    changeTargetBtn.addEventListener("click", () => {
+      const cur = job.target_url || "";
+      // Inline form anchored right after the button row, mirroring
+      // the retry-manual-form layout.
+      if (changeTargetBtn.dataset.openForm === "1") return;
+      changeTargetBtn.dataset.openForm = "1";
+      const form = document.createElement("div");
+      form.className = "retry-manual-form";
+      form.innerHTML = `
+        <label class="retry-manual-label">New target
+          <input type="text" class="retry-manual-target change-target-input"
+                 placeholder="http://challenge.example.com:8080  (or "(none)" to clear)"
+                 value="${escapeHtml(cur)}" />
+        </label>
+        <div style="display:flex;gap:0.5rem;align-items:center">
+          <button class="retry-manual-submit change-target-save" type="button">Save target</button>
+          <button class="retry-manual-cancel change-target-cancel" type="button">Cancel</button>
+          <small style="color:#8b949e">updates meta only · run / retry afterwards picks up the new value</small>
+        </div>
+      `;
+      changeTargetBtn.parentNode.insertBefore(form, changeTargetBtn.nextSibling);
+      const input = form.querySelector(".change-target-input");
+      input.focus();
+      input.select();
+      const close = () => {
+        form.remove();
+        delete changeTargetBtn.dataset.openForm;
+      };
+      form.querySelector(".change-target-cancel").addEventListener("click", close);
+      form.querySelector(".change-target-save").addEventListener("click", async () => {
+        const val = input.value;
+        try {
+          const res = await fetch(`${API}/jobs/${id}/target`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ target: val }),
+          });
+          const body = await res.json();
+          if (!res.ok) {
+            alert(`change-target failed: ${res.status} ${JSON.stringify(body)}`);
+            return;
+          }
+          close();
+          await renderJob(id, { force: true });
+        } catch (e) {
+          alert(`change-target error: ${e}`);
+        }
+      });
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") form.querySelector(".change-target-save").click();
+        if (e.key === "Escape") close();
+      });
+    });
   }
 
   const runBtn = detail.querySelector('.run-now-btn[data-action="run"]');

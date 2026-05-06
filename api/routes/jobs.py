@@ -1,8 +1,9 @@
 import json
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from api.queue import get_queue, get_redis
@@ -360,6 +361,63 @@ def post_run_script(job_id: str, target: str | None = None):
     new_status = "finished" if flags else "no_flag"
     write_meta(safe, status=new_status, flags=flags, manual_run=True)
     return {"sandbox": res, "flags": flags, "status": new_status}
+
+
+@router.patch("/{job_id}/target")
+async def patch_target(job_id: str, request: Request):
+    """Update only `target_url` on an existing job's meta — no retry,
+    no resume, no new job enqueued.
+
+    The next manual `/run` (and the default of any future `/retry` /
+    `/resume`) picks up the new value. Useful when the original target
+    was wrong / the challenge moved / you want to point a finished
+    job at a fresh remote without forking the conversation.
+
+    Body (JSON): {"target": "<new>"} — pass the literal string
+    "(none)" or an empty string to CLEAR the target.
+
+    Returns: {"ok": true, "target_url": <new>, "prior": <old>}.
+    """
+    safe = Path(job_id).name
+    meta = read_job_meta(safe)
+    if not meta:
+        raise HTTPException(status_code=404, detail="job not found")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if "target" not in body and "target_url" not in body:
+        raise HTTPException(
+            status_code=400,
+            detail='request body must include "target" (use "(none)" to clear)',
+        )
+    raw = body.get("target")
+    if raw is None:
+        raw = body.get("target_url")
+    clean = ("" if raw is None else str(raw)).strip()
+    if clean.lower() in ("(none)", "none", ""):
+        new_target: str | None = None
+    else:
+        new_target = clean
+
+    prior = meta.get("target_url")
+    meta["target_url"] = new_target
+    write_job_meta(safe, meta)
+
+    # Audit trail in run.log so the change is visible to the reviewer
+    # on a future retry and to anyone tailing the run.
+    log = JOBS_DIR / safe / "run.log"
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    try:
+        with log.open("a") as fp:
+            fp.write(
+                f"[{ts}] [meta] target_url updated by user: "
+                f"{prior!r} -> {new_target!r}\n"
+            )
+    except OSError:
+        pass
+
+    return {"ok": True, "target_url": new_target, "prior": prior}
 
 
 def _record_decision(safe: str, decision: str, log_msg: str) -> dict:

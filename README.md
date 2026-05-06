@@ -383,6 +383,7 @@ upload ──► /data/jobs/<id>/         ─► RQ enqueue
 | POST | `/api/modules/crypto/analyze` | upload zip → enqueue |
 | POST | `/api/modules/rev/analyze` | upload binary → enqueue |
 | POST | `/api/jobs/{id}/run` | re-run produced exploit/solver in a fresh sandbox |
+| PATCH | `/api/jobs/{id}/target` | update only `target_url` on the job's meta — no retry, no resume, no new job. Body `{"target": "<new>"}` (use `(none)` or `""` to clear). The next manual `/run` (and the default of any future `/retry`) picks up the new value. Audit-logged to `run.log`. |
 | POST | `/api/jobs/{id}/retry` | regenerate the job. JSON body fields all optional: `hint` (skip reviewer if present), `target` (override prior target_url; sentinel `(none)` clears it). Empty body = auto reviewer + keep prior target. |
 | POST | `/api/jobs/{id}/retry/stream` | same as `/retry` but Server-Sent Events stream the reviewer text live |
 | POST | `/api/jobs/{id}/resume` | hard-stop a queued/running job, then enqueue a fresh one with the same body shape as `/retry`; `hint` required here. Carries `./work/` + forks the prior SDK session. |
