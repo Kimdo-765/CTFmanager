@@ -315,7 +315,15 @@ def attempt_sandbox_run(
 
     enable_judge = _judge_enabled()
 
-    # ---------- Stage 1: prejudge ----------
+    # ---------- Stage 1: prejudge (advisory) ----------
+    # Decision power lives with the main agent — main is expected to
+    # have called the judge subagent itself before finalizing (see the
+    # JUDGE GATE block in mission_block). The orchestrator's prejudge
+    # here is a paper-trail backstop: findings get recorded into
+    # result.json so the retry reviewer can reference them, but the
+    # severity of those findings does NOT block the runner. Hangs /
+    # parse-error scripts are still caught by the supervise stall
+    # watchdog and surfaced by postjudge.
     prejudge: dict | None = None
     if enable_judge:
         try:
@@ -333,14 +341,11 @@ def attempt_sandbox_run(
             }
         if prejudge and not prejudge.get("ok") and prejudge.get("severity") == "high":
             log_fn(
-                f"[runner] prejudge blocked the run — "
-                f"severity=high, {len(prejudge.get('issues') or [])} issues"
+                f"[runner] prejudge advisory: severity=high, "
+                f"{len(prejudge.get('issues') or [])} issues — "
+                f"running anyway (main owns the gate; supervise + "
+                f"postjudge will backstop)"
             )
-            return {
-                "judge_aborted": True,
-                "error": "prejudge blocked the run",
-                "prejudge": prejudge,
-            }
 
     # ---------- Stage 2: actual run ----------
     args = [target] if target else []

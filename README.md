@@ -131,41 +131,50 @@ judge cannot patch the script.
                      └───────────────────────────┘
 ```
 
-Three orchestrator-driven stages, **all sharing one Claude session**
-(prejudge captures `session_id`; supervise + postjudge resume via
-`fork_session=False` — judge's verdict in post can reference what it
-flagged in pre):
+**Decision flow — main owns the gate, judge is the advisor**
 
-- **prejudge** — runs **before** the runner container starts. Judge
-  Reads the script directly, may run a quick `python3 -m py_compile`
-  via Bash, optionally delegates to recon for binary-protocol
-  verification. Returns `{ok, severity, issues}`. `severity=high`
-  aborts the run before spawning the container; the failure is
-  recorded as `judge_aborted: true` with the issue list.
-- **supervise** — runs **once** if the container has emitted no new
-  stdout/stderr for **60 s** while still alive. Same session, fast
-  path (no recon delegation): `{action: kill|continue, reason}`.
-  Single-shot per run so a legitimate slow operation never racks up
-  repeat judge calls.
-- **postjudge** — runs **after** the container exits (either naturally
-  or by supervise-kill). Categorizes the result as one of `success` /
-  `partial` / `hung` / `parse_error` / `network_error` / `crash` /
-  `timeout` / `unknown`, and produces a `retry_hint` paragraph the
-  existing /retry flow can pick up directly.
+The mission stanza in `mission_block()` makes a judge consult
+**mandatory before main finalizes**. After main writes its draft
+exploit/solver, it MUST call:
 
-Main can also invoke judge **proactively** mid-write via the standard
-`Agent` tool:
 ```python
 Agent(
     description="prejudge exploit",
     subagent_type="judge",
-    prompt="review ./exploit.py for hang/parse risks; list specific
-            line numbers + the fix in one short paragraph",
+    prompt="review ./exploit.py for hang/parse risks (recvuntil
+            without timeout, wrong prompt, wrong tube, missing
+            argv, infinite loop). Return: per-line FINDINGS,
+            SEVERITY, RECOMMEND patch|proceed|abort, REASON.",
 )
 ```
-This is a separate one-shot invocation independent of the
-orchestrator's pre/super/post lifecycle (different SDK session, same
-agent definition).
+
+Judge replies with structured findings (see `JUDGE_AGENT_PROMPT`).
+**Main reads them and decides**:
+
+| Main's choice | Action |
+|---|---|
+| **patch** | `Edit` exploit.py to fix HIGH findings → call judge again until clean. Up to ~3 rounds. |
+| **proceed** | Findings are LOW/MED, or main judges a HIGH to be a false positive. End the turn; orchestrator runs the script. |
+| **abort** | `Bash(rm -f ./exploit.py)` to delete the deliverable, write report.md explaining the block. Orchestrator detects the missing file and skips the runner. |
+
+The orchestrator does **not** override main's decision. Two
+backstops still run around the runner:
+
+- **prejudge (advisory)** — runs *before* the container. Findings
+  are recorded into `result.json` so the retry reviewer can
+  reference them. **Never blocks** the run — main already
+  owned the gate.
+- **supervise** — single one-shot when output stalls 60 s while
+  still alive. Same Claude session as prejudge (resumed via
+  `session_id`), so judge sees its earlier findings while making
+  the kill/continue call.
+- **postjudge** — categorize the finished run as one of `success` /
+  `partial` / `hung` / `parse_error` / `network_error` / `crash` /
+  `timeout` / `unknown` and emit a retry-ready hint.
+
+Three orchestrator stages share **one Claude session** (prejudge
+captures `session_id`; supervise + postjudge resume via
+`fork_session=False`).
 
 Each judge stage is best-effort: a judge auth/rate/empty failure
 degrades to permissive defaults (prejudge ok, supervise continue,
