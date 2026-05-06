@@ -42,87 +42,63 @@ target is given).
 
 ## Architecture
 
-Three Claude-driven roles — **reviewer**, **main worker**, **sub
-worker** — each owns a distinct context window. Reviewer is purely
-diagnostic and runs in the api container on retry/resume. Main worker
-is the writer. Sub worker absorbs heavy investigation (disasm walks,
-ghiant decompilation, source greps) and tool sandboxes so the main
-worker's reasoning context stays clean.
+Three Claude-driven roles, each with its own context window:
+
+| Role | Where it runs | Tools | Purpose |
+|---|---|---|---|
+| **reviewer** | `api` container, inline in `/retry` & `/resume` handlers | none (diagnostic only) | Reads the failed prior job and writes a 1-paragraph hint, streamed to the browser |
+| **main worker** | `worker` container, one RQ process per concurrency slot | `Read` `Write` `Edit` `Bash` `Glob` `Grep` `Agent` | Runs the module pipeline; writes `exploit.py` / `solver.py` / `report.md` |
+| **sub worker** | in-process under main (recon) **or** sibling docker container (sandbox) | recon: `Read` `Bash` `Glob` `Grep` (read-only) · sandboxes: shell | Heavy investigation + isolated tool execution |
 
 ```
-        browser :8000
-             │  HTTP + SSE   (run-log, liveness, tokens/cost, reviewer stream)
-             ▼
-   ┌──────────────── API  (FastAPI, container `api`) ────────────────┐
-   │  uploads → /data/jobs/<id>/    RQ enqueue → redis               │
-   │  /retry  /resume  /timeout/{continue,kill}                      │
-   │  /api/collector/<id>   settings.json (live UI edits)            │
-   │                                                                 │
-   │  ┌──────────────────── REVIEWER ──────────────────────────────┐ │
-   │  │  Claude Opus 4.7, allowed_tools=[] (no Read/Bash)          │ │
-   │  │  Triggered by /retry/stream and /resume/stream when no     │ │
-   │  │  manual hint is given. _gather_context() bundles the       │ │
-   │  │  prior job's meta.json / run.log / report.md / exploit.py  │ │
-   │  │  / solver.py / std{out,err} / callbacks.jsonl + 2-3 entry  │ │
-   │  │  source files. Replies with ONE ≤1500-char paragraph       │ │
-   │  │  diagnosing the failure — streamed over SSE to the         │ │
-   │  │  browser, then hoisted into the next job's prompt as       │ │
-   │  │  `⚠ PRIORITY GUIDANCE`. Auth/rate/credit/policy errors     │ │
-   │  │  surface in the panel and BLOCK the new job.               │ │
-   │  └────────────────────────────────────────────────────────────┘ │
-   └──────────────────┬───────────────────────────┬──────────────────┘
-                      │ RQ over Redis             │ docker.sock
-                      ▼                           │  (kill running jobs)
-   ┌──────────── MAIN WORKER  (container `worker`, N RQ procs) ──────┐
-   │  one Python process per concurrency slot. Picks a job, runs    │
-   │  the module pipeline, drives the **main Claude agent**         │
-   │  (writer): Read / Write / Edit / Bash / Glob / Grep / Agent    │
-   │  — produces exploit.py / solver.py / report.md in              │
-   │  /data/jobs/<id>/work/.                                        │
-   │                                                                │
-   │  Liveness signals consumed by the viewer:                      │
-   │    • agent_heartbeat()  — meta.last_agent_event_at per SDK     │
-   │      message, throttled 5 s/job                                │
-   │    • RQ worker key      — rq:worker:<name> in redis (~10 s)    │
-   │    • token + cost meter — sums result.usage across every turn  │
-   │    • soft-timeout watchdog → meta.awaiting_decision banner     │
-   └──────────────┬─────────────────────────────────┬───────────────┘
-                  │ Task("recon", "<q>")            │ docker.sock
-                  ▼                                 ▼
-   ┌── SUB WORKER — recon subagent ──┐ ┌── SUB WORKER — sandboxes ─┐
-   │  in-process Claude (same model  │ │  spawned per-job,         │
-   │  as main, separate context).    │ │  removed when done:       │
-   │  • Read / Bash / Glob / Grep    │ │    decompiler  (Ghidra)   │
-   │  • CANNOT Write / Edit          │ │    forensic    (TSK +     │
-   │  • returns ≤2 KB compact summary│ │       qemu-img + Vol3)    │
-   │  Heavy disasm / source greps /  │ │    misc        (binwalk + │
-   │  ghiant decompilation never     │ │       steghide + ...)     │
-   │  pollute main's history; only   │ │    runner      (exec      │
-   │  the summary lands in main.     │ │       exploit.py /        │
-   │                                 │ │       solver.py)          │
-   │                                 │ │    sage        (optional  │
-   │                                 │ │       Coppersmith / LLL)  │
-   └─────────────────────────────────┘ └───────────────────────────┘
+   browser :8000
+        │  HTTP + SSE
+        ▼
+   ┌─── api  (FastAPI) ────┐         ┌────── redis ──────┐
+   │  uploads · /retry     │ ◄─────► │  RQ queue +       │
+   │  /resume · /timeout   │         │  worker liveness  │
+   │  /api/collector       │         └───────────────────┘
+   │                       │
+   │  ┌── reviewer ──┐     │   inline · no tools · SSE stream
+   │  │  Opus 4.7    │     │
+   │  └──────────────┘     │
+   └──────────┬────────────┘
+              │ RQ
+              ▼
+   ┌──── main worker  (N RQ procs) ────┐
+   │  main Claude agent → deliverables │
+   │  + heartbeat + token/cost meter   │
+   └──────┬───────────────────┬────────┘
+          │ Task("recon")     │ docker.sock
+          ▼                   ▼
+   ┌── recon subagent ──┐  ┌── sibling sandboxes ──────┐
+   │  in-process,       │  │  decompiler · forensic ·  │
+   │  read-only,        │  │  misc · runner · sage     │
+   │  ≤2 KB summary     │  │  (per-job, removed)       │
+   └────────────────────┘  └───────────────────────────┘
 ```
 
-- **api** (`api/`) — FastAPI on port 8000. Serves the static `web-ui/`,
-  ingests uploads into `/data/jobs/<id>/`, enqueues RQ jobs, exposes
-  the retry/resume/timeout endpoints and the public collector. The
-  reviewer Claude call is also hosted here — it is **not** an RQ job.
-- **reviewer** — runs inline inside the `/retry/stream` and
-  `/resume/stream` request handlers. Same Anthropic auth as the rest of
-  the stack (OAuth or `ANTHROPIC_API_KEY`). No tools, no filesystem
-  access — it only reads the bundle the api hands it.
-- **redis** — RQ queue + per-worker liveness key + per-job stream
-  metadata.
-- **main worker** (`worker/`) — forks `WORKER_CONCURRENCY` (default 3)
-  independent RQ processes that share Redis. Each running job can
-  launch sibling sandbox containers via the mounted Docker socket.
-- **sub worker** — two flavors, both transient to the job:
-  - **recon subagent** (in-process under main) — see [Agent architecture](#agent-architecture).
-  - **sibling sandboxes** — `decompiler / forensic / misc / runner /
-    sage` images, built once but not started. The worker `docker run`s
-    them per job, then removes them.
+### reviewer (`api/routes/retry.py`)
+
+- Triggered by `/retry/stream` and `/resume/stream` when no manual hint is supplied.
+- `_gather_context()` bundles the prior job's `meta.json`, `run.log`, `report.md`, `exploit.py` / `solver.py`, std{out,err}, `callbacks.jsonl`, and 2–3 entry-point source files.
+- Replies with ONE ≤1500-char paragraph diagnosing the failure. Streams to the browser over SSE, then is hoisted into the next job's prompt as `⚠ PRIORITY GUIDANCE`.
+- Auth / rate / credit / policy errors surface in the panel and **block** the new job from being enqueued.
+
+### main worker (`worker/runner.py`)
+
+- Forks `WORKER_CONCURRENCY` (default 3) independent RQ processes named `htct-w0..N`. On boot, sweeps stale `rq:worker:htct-w*` keys from a SIGKILL'd previous life, then registers afresh.
+- Each process picks a job from redis, runs the module pipeline, and drives the **main Claude agent** (writer) which produces deliverables in `/data/jobs/<id>/work/`.
+- Liveness signals consumed by the browser:
+  - `agent_heartbeat()` → `meta.last_agent_event_at` per SDK message (5 s throttle).
+  - RQ worker key `rq:worker:<name>` (~10 s heartbeat).
+  - Token + cost meter — `result.usage` summed across every turn.
+  - Soft-timeout watchdog → `meta.awaiting_decision` banner.
+
+### sub worker — two flavors, both transient to the job
+
+- **recon subagent** — in-process under main. Same model, **separate context window**. Read-only (`Read` / `Bash` / `Glob` / `Grep`); cannot `Write` or `Edit`. Returns a ≤2 KB compact summary so heavy disasm / source greps / ghiant decompilation never pollute main's history. See [Agent architecture](#agent-architecture).
+- **sibling sandboxes** — `decompiler` (Ghidra), `forensic` (TSK + qemu-img + Vol3), `misc` (binwalk + steghide + …), `runner` (exec exploit.py / solver.py), `sage` (optional Coppersmith / LLL). Built once via `--profile tools`, never started by `compose up`. The worker `docker run`s them per job and removes them when done.
 
 ## Agent architecture
 
