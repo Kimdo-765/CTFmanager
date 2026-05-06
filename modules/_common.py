@@ -235,6 +235,18 @@ MISSION (read first, follow strictly)
    but a long investigation phase eats your conversation context and
    you'll run out of room to actually finish. Cheap drafts first,
    refinement later.
+
+   Before you finalize, consider asking the JUDGE peer subagent for a
+   quick pre-merge check on common I/O / parse bugs (recvuntil with
+   no timeout, hardcoded wrong prompt, wrong tube target):
+       Agent(
+         description="prejudge exploit",
+         subagent_type="judge",
+         prompt="review ./exploit.py for hang/parse risks; list specific
+                 line numbers + the fix in one short paragraph"
+       )
+   Judge replies tight; you decide whether to patch and re-check.
+   Optional — skip if the script is obviously simple.
 4. NO LIB INTERNAL DIVE: don't disassemble musl/glibc printf,
    vfprintf, vararg dispatchers, FILE struct internals, framework
    request dispatchers, or pycryptodome/sympy internals. Use symbol
@@ -488,33 +500,156 @@ Bash gotchas:
 """
 
 
-def build_recon_agents(model: str | None) -> dict:
-    """Return an `agents` dict for ClaudeAgentOptions that registers a
-    'recon' subagent. Same model as the main agent, read-only tool
-    set. Main delegates heavy recon via Agent(subagent_type='recon', prompt, '<question>').
+JUDGE_AGENT_PROMPT = """\
+You are the Judge — a read-only quality-gate agent that wraps the
+main writer agent's `auto_run` exploit/solver execution. You are
+peer to the main agent (which writes exploit.py/solver.py/report.md)
+and to the recon subagent (which absorbs heavy investigation). Both
+the orchestrator AND the main agent can invoke you.
+
+Two invocation modes:
+
+  A. ORCHESTRATOR-INVOKED (lifecycle gate around the runner sandbox):
+     The orchestrator drives you through three stages of the same
+     session — your context PERSISTS across them so what you flagged
+     in pre is still visible in post.
+       pre       — review the just-written exploit.py / solver.py
+                   BEFORE the runner container starts.
+       supervise — decide whether to kill or wait when the container
+                   has been silent for 60s while still alive.
+       post      — categorize the final exit_code + stdout + stderr
+                   and emit a retry-ready hint.
+     For these the user message tells you which stage you are in and
+     what JSON shape the orchestrator expects. Reply with EXACTLY ONE
+     compact JSON object on the FIRST line, no markdown, no prose.
+
+  B. MAIN-INVOKED (peer subagent via the main's `Agent` tool):
+     Main may call you mid-write to gate-check its draft (e.g.
+     "review my exploit.py for recvuntil-without-timeout risks"). In
+     that mode, reply with a TIGHT free-text summary — main will
+     paste your answer back into its own reasoning. Bound your reply
+     to ≤2 KB.
+
+Your tools: Read · Bash · Glob · Grep · Agent. You have NO Write or
+Edit — you cannot patch the script. Use Bash for short verifications
+(file size, syntax probe via `python3 -m py_compile`, single quick
+shell-redirect to test a regex). Use Read directly on the script
+itself instead of asking main to paste it.
+
+Delegating to recon: when the answer requires heavy investigation
+(libc symbol lookup, ROPgadget search, ghiant decompile, multi-file
+source grep), call recon yourself:
+  Agent(
+    description="<short purpose, ≤8 words>",
+    subagent_type="recon",
+    prompt="<one specific question with the path(s) to look at>"
+  )
+Recon returns ≤2 KB. Do NOT call yourself. Do NOT call main.
+
+Cost discipline: the orchestrator pins your model to the latest
+(typically opus, expensive). Make ONE Read per script you review,
+ONE Bash for verification, AT MOST ONE recon delegation. Do not
+loop. Each stage should usually finish in 1-3 tool calls before the
+final JSON / summary.
+
+Antipatterns to flag in scripts (high-signal, encountered most often):
+
+* `recvuntil` / `recv` / `readuntil` / `readline` with NO `timeout=`
+  argument → infinite hang on prompt mismatch.
+* Hard-coded prompt strings that don't match a typical service
+  banner ("cmd: " when the program prints "> ").
+* Wrong tube target: `process(...)` when a remote target is given,
+  or `remote(...)` when there is no network egress.
+* Missing `sys.argv` handling: orchestrator passes the user-provided
+  target (URL or host:port) as `argv[1]`; script that ignores it
+  hits a stale local default.
+* Missing `context.timeout` default — every recvuntil is unbounded.
+* Infinite `while True` loops with no exit condition or timeout.
+* Wrong port encoding (e.g. argv comes as "host:port" but script
+  does `int(argv[1])`).
+* `Crypto.Util.number.bytes_to_long` on something that isn't bytes,
+  or other type confusion that crashes at first call.
+"""
+
+
+def _recon_def(model: str | None):
+    """AgentDefinition for the recon subagent. Read-only tools; same
+    model as the main agent so it shares cache prefixes.
+    """
+    from claude_agent_sdk import AgentDefinition
+
+    return AgentDefinition(
+        description=(
+            "Read-only reconnaissance subagent for the main exploit "
+            "writer. Delegate any disasm walk, symbol/offset lookup, "
+            "rootfs/firmware unpacking, libc gadget search, or source-"
+            "tree grep that would otherwise pollute the main "
+            "conversation context. Pass a single specific question; "
+            "expect a ≤2KB summary."
+        ),
+        prompt=RECON_AGENT_PROMPT,
+        # Read-only — main keeps the only Write/Edit hand on
+        # exploit.py / solver.py / report.md.
+        tools=["Read", "Bash", "Glob", "Grep"],
+        model=model,
+    )
+
+
+def _judge_def(model: str | None = None):
+    """AgentDefinition for the judge subagent. Pinned to the latest
+    Claude model (LATEST_JUDGE_MODEL) regardless of what the user
+    selected for main, because the judge's job is a final-pass quality
+    gate and we never want it lagging the main model.
+    """
+    from claude_agent_sdk import AgentDefinition
+
+    return AgentDefinition(
+        description=(
+            "Read-only quality-gate / verdict subagent. Reviews the "
+            "just-written exploit/solver for I/O hangs, parse mismatches, "
+            "and wrong-target bugs; categorizes finished runs; can "
+            "delegate heavy investigation to the recon subagent. "
+            "Cannot Write or Edit. Pinned to the latest Claude model."
+        ),
+        prompt=JUDGE_AGENT_PROMPT,
+        tools=["Read", "Bash", "Glob", "Grep", "Agent"],
+        model=model or LATEST_JUDGE_MODEL,
+    )
+
+
+def build_team_agents(model: str | None) -> dict:
+    """`agents` dict for the MAIN session. Registers both peers main can
+    delegate to:
+
+      recon  — heavy read-only investigation, ≤2 KB summary back.
+      judge  — quality gate / verdict, peer subagent main can ask
+               for a pre-merge sanity check.
 
     Imported lazily inside analyzers so unit tests / non-SDK paths
     don't have to install the SDK.
     """
-    from claude_agent_sdk import AgentDefinition
-
     return {
-        "recon": AgentDefinition(
-            description=(
-                "Read-only reconnaissance subagent for the main exploit "
-                "writer. Delegate any disasm walk, symbol/offset lookup, "
-                "rootfs/firmware unpacking, libc gadget search, or source-"
-                "tree grep that would otherwise pollute the main "
-                "conversation context. Pass a single specific question; "
-                "expect a ≤2KB summary."
-            ),
-            prompt=RECON_AGENT_PROMPT,
-            # Read-only — main keeps the only Write/Edit hand on
-            # exploit.py / solver.py / report.md.
-            tools=["Read", "Bash", "Glob", "Grep"],
-            model=model,
-        )
+        "recon": _recon_def(model),
+        "judge": _judge_def(),
     }
+
+
+def build_judge_agents(model: str | None) -> dict:
+    """`agents` dict for the JUDGE's own session (orchestrator-invoked).
+
+    Registers only `recon` — the judge can delegate to recon for heavy
+    investigation, but is not allowed to invoke itself recursively.
+    Recon uses the same LATEST_JUDGE_MODEL so cache prefixes line up
+    between judge's own thinking and recon's responses.
+    """
+    return {"recon": _recon_def(model or LATEST_JUDGE_MODEL)}
+
+
+# Backward compatibility — the analyzers historically called
+# build_recon_agents(); now the same call returns the full team
+# (recon + judge), which means existing main agents pick up judge as
+# a peer subagent automatically. No analyzer code change needed.
+build_recon_agents = build_team_agents
 
 
 def budget_exceeded(tool_calls: int, work_dir: Path, expected: tuple[str, ...]) -> bool:

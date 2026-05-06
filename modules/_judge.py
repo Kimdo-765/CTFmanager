@@ -1,38 +1,46 @@
 """Quality-gate judge for auto-run exploit/solver execution.
 
-Three short, no-tools Claude calls wrap each `attempt_sandbox_run`:
+The judge is a stateful agent that wraps every `attempt_sandbox_run`:
 
-* `prejudge_script(...)` — pre-flight static review of the script. Looks
-  for the I/O patterns that historically cause hangs (recvuntil with no
-  timeout, hard-coded prompt mismatches, wrong tube target, missing
-  argv handling). Returns `{ok, severity, issues}`. If the runner
-  caller decides the verdict is severe enough to abort, the container
-  never starts and the failure is recorded as `prejudge_blocked`.
+  pre       — review the just-written script BEFORE the runner
+              container starts.
+  supervise — decide kill/continue when the running container has
+              been silent for SUPERVISE_STALL_S while still alive
+              (one-shot per run; conservative cost mode).
+  post      — categorize the final exit_code + stdout + stderr and
+              produce a retry-ready hint.
 
-* `supervise_run_once(...)` — single one-shot decision when the running
-  container has emitted no new stdout/stderr for `stall_seconds`. Judge
-  reads the recent stdout / stderr tail + the script source, returns
-  `{action: "kill"|"continue", reason}`. Called at most once per run
-  (conservative mode A) so judge cost stays at ≤1 turn for hangs and
-  0 for normal runs.
+Same-job continuity: prejudge captures a `session_id`; supervise +
+postjudge `resume` that session via `fork_session=False` so the judge
+remembers what it warned about earlier in the run. Each stage is a
+fresh `query()` call but the SDK loads the prior conversation from
+the project-key directory under `~/.claude/projects/`.
 
-* `postjudge_run(...)` — post-mortem categorization once the container
-  exits (either naturally or by supervise-kill). Returns
-  `{verdict, summary, retry_hint}` where verdict ∈
-  {success, partial, hung, parse_error, network_error, crash, timeout,
-  unknown}.  `retry_hint` is non-empty whenever the verdict isn't
-  "success", so the existing /retry flow can pick it up.
+Tools: Read · Bash · Glob · Grep · Agent — judge can verify by
+Reading the script directly, doing a quick `python3 -m py_compile`
+or `objdump`-style probe via Bash, or delegating heavy investigation
+to the recon subagent. NO Write / Edit. Cost-disciplined: each stage
+typically resolves in 1–3 tool calls.
 
-All three use `modules._common.LATEST_JUDGE_MODEL`. They are best-effort:
-on judge failure (auth/rate/empty) the helper degrades to permissive
-defaults (prejudge ok=True, supervise action=continue, postjudge
-verdict=unknown) so the runner is never harder to use because the
-judge itself misbehaved.
+All judge calls are best-effort. Judge auth/rate/empty failures fall
+back to permissive defaults (prejudge ok=True, supervise
+action=continue, postjudge verdict=unknown) so the runner is never
+harder to use because of a flaky judge.
+
+Public surface:
+  * `prejudge_script(jd, script_rel, target, log_fn) → dict`
+  * `supervise_run_once(jd, script_rel, stall_s, out_tail, err_tail, log_fn) → dict`
+  * `postjudge_run(jd, script_rel, exit_code, stdout, stderr, log_fn,
+                   *, extra_context="") → dict`
+  * Internal `_session_state` (per-job session_id) is shared across
+    all three so back-to-back calls within the same auto_run land in
+    the same Claude session.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -40,121 +48,200 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    SystemMessage,
     TextBlock,
     query,
 )
 
-from modules._common import LATEST_JUDGE_MODEL
+from modules._common import LATEST_JUDGE_MODEL, build_judge_agents
 
 
-_PREJUDGE_PROMPT = """\
-You are reviewing an auto-generated CTF exploit/solver script BEFORE
-it runs in a sandboxed container. Look for issues that historically
-cause hangs, parse mismatches, or wrong-target failures:
+# ---------------------------------------------------------------------------
+# Stage prompts
+# ---------------------------------------------------------------------------
 
-* recvuntil / recv / readuntil / readline with NO timeout argument
-  (these block forever if the prompt does not match).
-* Hard-coded prompt strings that don't match a typical service banner
-  (e.g. expecting "cmd: " when the program prints "> ").
-* Wrong tube target: process(...) on a local file when a remote
-  target was provided, or remote(...) when there is no network egress.
-* Missing or wrong sys.argv handling: the orchestrator passes the
-  user-provided target (URL or host:port) as argv[1].
-* Missing context.timeout default — recvuntil etc. block forever.
-* Infinite while True loops with no exit condition or timeout.
+_PREJUDGE_USER_TMPL = """\
+STAGE: prejudge
 
-Reply with EXACTLY ONE compact JSON object on the FIRST line, no
-markdown, no commentary:
-{"ok": true|false, "severity": "low"|"med"|"high", "issues": ["...", "..."]}
+The orchestrator is about to spawn the runner container that executes
+this script. Review it for issues that historically cause hangs,
+parse mismatches, or wrong-target failures. Use Read on the script
+itself if you want full source; use Bash for a quick `python3 -m
+py_compile` or syntax probe. Only delegate to recon if you need to
+verify a binary's actual prompt, libc symbol, or other heavy fact.
 
-* ok=true means the script is safe to run as-is. ok=false means at
-  least one likely-fatal issue was found.
-* severity=high means do NOT run it (caller will abort).
-* low / med are advisory; the run still proceeds.
-* issues is a short list (up to 6) of one-line findings.
+After you finish investigating, reply with EXACTLY ONE compact JSON
+object on the FIRST line, no markdown, no commentary:
+{{"ok": true|false, "severity": "low"|"med"|"high", "issues": ["...", "..."]}}
+
+* ok=true means the script is safe to run as-is.
+* severity=high blocks the run (orchestrator aborts before container
+  start). low / med are advisory; the run still proceeds.
+* issues is a short list (≤6) of one-line findings.
+
+Inputs:
+  target          : {target}
+  script_filename : {script_rel}
+  cwd             : {cwd}
+
+The script lives at `{script_path}`. Read it directly.
 """
 
-_SUPERVISE_PROMPT_TMPL = """\
-You are watching a CTF exploit/solver run in a sandboxed container.
-The container has emitted no new stdout/stderr output for
-{stall_s} seconds while still alive. Decide whether to keep waiting
-or kill it.
+_SUPERVISE_USER_TMPL = """\
+STAGE: supervise
 
-Inputs: the last bytes of stdout and stderr, and the script source.
+The runner container is still alive but has emitted no new
+stdout/stderr for {stall_s} seconds. Decide whether to keep waiting
+or kill it. You may Read the script to refresh your memory; you may
+Bash a quick check (e.g. `grep -n recvuntil {script_path}` to count
+unbounded reads). Don't delegate to recon here — supervise must be
+fast.
 
-Reply with EXACTLY ONE compact JSON object on the FIRST line:
+Reply with EXACTLY ONE compact JSON object on the FIRST line, no
+markdown:
 {{"action": "kill"|"continue", "reason": "<short>"}}
 
 Choose "kill" if the script is clearly stuck on a recvuntil/parse
-mismatch, an infinite loop, or otherwise will never produce output.
+mismatch, infinite loop, or otherwise will never produce output.
 Choose "continue" if the silence looks legitimate (slow crypto,
-network round-trip, sleep, or pwntools is just buffering before its
-first prompt).
+network round-trip, sleep, or pwntools is buffering before its first
+prompt).
+
+=== last stdout (tail) ===
+{stdout_tail}
+
+=== last stderr (tail) ===
+{stderr_tail}
 """
 
-_POSTJUDGE_PROMPT = """\
-You are post-mortem analyzing a CTF exploit/solver run that has
-finished (either naturally or because supervise killed it). Inputs:
-exit_code, stdout tail, stderr tail, script source.
+_POSTJUDGE_USER_TMPL = """\
+STAGE: postjudge
 
-Categorize the run and produce a tight retry hint. Reply with EXACTLY
-ONE JSON object on the FIRST line, no markdown:
-{"verdict": "success"|"partial"|"hung"|"parse_error"|"network_error"|"crash"|"timeout"|"unknown",
+The runner container has finished. Categorize the result and produce
+a tight retry hint. You may Read the script + std{{out,err}} files
+under `{cwd}` if you need more than the tail below; you may Bash
+short verifications (e.g. grep stdout for flag patterns).
+
+Reply with EXACTLY ONE compact JSON object on the FIRST line, no
+markdown:
+{{"verdict": "success"|"partial"|"hung"|"parse_error"|"network_error"|"crash"|"timeout"|"unknown",
  "summary": "<=200 chars",
- "retry_hint": "<=600 chars; empty string when verdict==success"}
+ "retry_hint": "<=600 chars; empty when verdict==success"}}
 
 Verdict guide:
-* success — a flag was clearly captured (FLAG{...}/HTB{...}/DH{...}/
-  picoCTF{...} or otherwise unambiguous).
-* partial — a leak / intermediate result, no flag.
-* hung — output stalled, supervise killed (exit_code negative or
-  killed_by_supervise hint in the run).
-* parse_error — recvuntil / format mismatch / wrong prompt assumption.
-* network_error — connection refused / DNS / TLS failure.
-* crash — unhandled Python exception or non-zero exit with traceback.
-* timeout — the runner's own timeout fired.
-* unknown — none of the above.
+  success       — a flag was clearly captured (FLAG{{}}/HTB{{}}/
+                  DH{{}}/picoCTF{{}} or otherwise unambiguous).
+  partial       — leak / intermediate result, no flag.
+  hung          — supervise killed it (negative exit_code or
+                  killed_by_supervise).
+  parse_error   — recvuntil / format mismatch / wrong prompt.
+  network_error — connection refused / DNS / TLS failure.
+  crash         — unhandled exception or non-zero exit + traceback.
+  timeout       — runner's own timeout fired.
+  unknown       — none of the above.
 
 retry_hint MUST be a single paragraph the next agent can act on
-without seeing this judgment.
+without seeing this judgment. Empty string when verdict==success.
+
+Inputs:
+  exit_code : {exit_code}
+{extra_context}
+
+=== stdout (tail) ===
+{stdout_tail}
+
+=== stderr (tail) ===
+{stderr_tail}
 """
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Session-id continuity (per job, per process)
+# ---------------------------------------------------------------------------
+#
+# Each auto_run cycle goes pre → (optional) supervise → post. Pre
+# captures a session_id; supervise + post resume that session via
+# `fork_session=False` so the judge's context is shared. We key the
+# session map by job_id since one worker process can interleave
+# multiple jobs (shouldn't happen with current orchestrator, but the
+# state is cheap and dictionary-keyed by job_id is more robust than
+# a global).
+
+_session_lock = threading.Lock()
+_session_ids: dict[str, str] = {}
+
+
+def _remember_sid(job_id: str, sid: str | None) -> None:
+    if not sid:
+        return
+    with _session_lock:
+        _session_ids[job_id] = sid
+
+
+def _recall_sid(job_id: str) -> str | None:
+    with _session_lock:
+        return _session_ids.get(job_id)
+
+
+def _forget_sid(job_id: str) -> None:
+    with _session_lock:
+        _session_ids.pop(job_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Async core — single Claude turn that may use tools.
 # ---------------------------------------------------------------------------
 
 
-async def _ask_judge(
+async def _run_judge_turn(
     user_prompt: str,
-    system_prompt: str,
     *,
-    max_chars: int = 4000,
-) -> str:
-    """Run a single Claude turn with no tools; return the assistant text.
-    Empty string on failure — judge errors are NEVER fatal.
+    cwd: Path,
+    resume_sid: str | None,
+) -> tuple[str, str | None]:
+    """Run a single judge turn (which may internally do multiple tool
+    calls). Returns (final_text, captured_session_id).
+
+    Empty string + None on failure — judge errors are NEVER fatal.
     """
     options = ClaudeAgentOptions(
-        system_prompt=system_prompt,
+        system_prompt=None,  # judge AgentDefinition prompt is loaded by SDK
         model=LATEST_JUDGE_MODEL,
-        cwd="/tmp",
-        allowed_tools=[],
+        cwd=str(cwd),
+        allowed_tools=["Read", "Bash", "Glob", "Grep", "Agent"],
         permission_mode="bypassPermissions",
+        agents=build_judge_agents(LATEST_JUDGE_MODEL),
+        resume=resume_sid,
+        fork_session=False if resume_sid else None,
     )
     parts: list[str] = []
+    captured_sid: str | None = None
     try:
         async for msg in query(prompt=user_prompt, options=options):
-            if isinstance(msg, AssistantMessage):
+            if isinstance(msg, SystemMessage):
+                # The init SystemMessage carries the new session's id.
+                # Subsequent messages also have session_id; first one wins.
+                sid = getattr(msg, "session_id", None) or (
+                    msg.data.get("session_id") if hasattr(msg, "data") else None
+                )
+                if sid and not captured_sid:
+                    captured_sid = sid
+            elif isinstance(msg, AssistantMessage):
                 for blk in msg.content:
                     if isinstance(blk, TextBlock):
                         parts.append(blk.text)
             elif isinstance(msg, ResultMessage):
+                # ResultMessage also carries session_id as a fallback
+                sid = getattr(msg, "session_id", None)
+                if sid and not captured_sid:
+                    captured_sid = sid
                 if getattr(msg, "is_error", False):
-                    return ""
+                    return "", captured_sid
                 break
     except Exception:
-        return ""
-    return "".join(parts).strip()[:max_chars]
+        return "", captured_sid
+
+    return "".join(parts).strip()[:8000], captured_sid
 
 
 def _run_async(coro):
@@ -168,8 +255,6 @@ def _run_async(coro):
     try:
         return asyncio.run(coro)
     except RuntimeError:
-        import threading
-
         result: dict[str, Any] = {}
 
         def _run():
@@ -182,7 +267,12 @@ def _run_async(coro):
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         t.join()
-        return result.get("v", "")
+        return result.get("v", ("", None))
+
+
+# ---------------------------------------------------------------------------
+# JSON parsing + tail helpers
+# ---------------------------------------------------------------------------
 
 
 def _parse_json(text: str) -> dict:
@@ -203,9 +293,7 @@ def _parse_json(text: str) -> dict:
             return d
     except json.JSONDecodeError:
         pass
-    # Strip any leading code fence
     if s.startswith("```"):
-        # drop first line + trailing ```
         body = s.split("\n", 1)[-1]
         if body.endswith("```"):
             body = body[:-3]
@@ -215,7 +303,6 @@ def _parse_json(text: str) -> dict:
                 return d
         except json.JSONDecodeError:
             pass
-    # First-line scan
     for line in s.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -229,23 +316,7 @@ def _parse_json(text: str) -> dict:
     return {}
 
 
-def _read_tail(p: Path, *, max_bytes: int) -> str:
-    """Read the last max_bytes of a file as utf-8 (with replacement). Empty
-    string if the file doesn't exist or can't be read.
-    """
-    if not p.is_file():
-        return ""
-    try:
-        data = p.read_bytes()
-    except OSError:
-        return ""
-    if len(data) > max_bytes:
-        data = data[-max_bytes:]
-    return data.decode("utf-8", errors="replace")
-
-
 def _truncate_tail(text: str, *, max_bytes: int) -> str:
-    """Same as _read_tail but for an already-loaded string buffer."""
     if not text:
         return ""
     b = text.encode("utf-8", errors="replace")
@@ -255,7 +326,7 @@ def _truncate_tail(text: str, *, max_bytes: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 — prejudge
+# Stage 1 — prejudge (NEW session)
 # ---------------------------------------------------------------------------
 
 
@@ -264,33 +335,38 @@ def prejudge_script(
     script_rel: str,
     target: str | None,
     log_fn: Callable[[str], None],
+    *,
+    job_id: str | None = None,
 ) -> dict:
     """Static review of the about-to-run script.
 
-    Returns:
-        {
-          "ok": bool,             # default-True when the judge fails
-          "severity": "low"|"med"|"high",
-          "issues": list[str],    # up to 6, each <=200 chars
-          "raw": str,             # raw judge text
-        }
+    Starts a NEW judge session and stashes its session_id under
+    `_session_ids[job_id]` so supervise + postjudge can resume it.
+    `job_id` defaults to the job dir name (last path segment).
     """
+    job_id = job_id or jd.name
     script = jd / script_rel
     if not script.is_file():
         log_fn(f"[judge] prejudge skipped — {script_rel} missing")
         return {"ok": True, "severity": "low", "issues": [], "raw": ""}
 
-    src = _read_tail(script, max_bytes=12000)
-    user_prompt = (
-        f"target: {target or '(none)'}\n"
-        f"script_filename: {script_rel}\n\n"
-        f"=== {script_rel} ===\n{src}"
+    user_prompt = _PREJUDGE_USER_TMPL.format(
+        target=target or "(none)",
+        script_rel=script_rel,
+        cwd=jd,
+        script_path=script,
     )
-    raw = _run_async(_ask_judge(user_prompt, _PREJUDGE_PROMPT))
+    raw, sid = _run_async(
+        _run_judge_turn(user_prompt, cwd=jd, resume_sid=None)
+    )
+    _remember_sid(job_id, sid)
     parsed = _parse_json(raw)
 
     if not parsed:
-        log_fn("[judge] prejudge: judge returned no parseable JSON; running anyway")
+        log_fn(
+            "[judge] prejudge: no parseable JSON returned — "
+            "running anyway (permissive default)"
+        )
         return {"ok": True, "severity": "low", "issues": [], "raw": raw}
 
     ok = bool(parsed.get("ok", True))
@@ -311,7 +387,7 @@ def prejudge_script(
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 — supervise (one-shot when output stalls)
+# Stage 2 — supervise (resumes prejudge session)
 # ---------------------------------------------------------------------------
 
 
@@ -322,27 +398,24 @@ def supervise_run_once(
     stdout_tail: str,
     stderr_tail: str,
     log_fn: Callable[[str], None],
+    *,
+    job_id: str | None = None,
 ) -> dict:
-    """One-shot stall decision.
-
-    Returns:
-        {
-          "action": "kill"|"continue",   # default "continue" on judge fail
-          "reason": str,
-          "raw": str,
-        }
+    """One-shot stall decision. Resumes the prejudge session so the judge
+    sees its prior warnings while making the kill/continue call.
     """
+    job_id = job_id or jd.name
     script = jd / script_rel
-    src = _read_tail(script, max_bytes=8000) if script.is_file() else ""
-
-    user_prompt = (
-        f"stall_s: {stall_seconds}\n\n"
-        f"=== last stdout (tail) ===\n{stdout_tail or '(empty)'}\n\n"
-        f"=== last stderr (tail) ===\n{stderr_tail or '(empty)'}\n\n"
-        f"=== {script_rel} ===\n{src}"
+    user_prompt = _SUPERVISE_USER_TMPL.format(
+        stall_s=stall_seconds,
+        script_path=script,
+        stdout_tail=_truncate_tail(stdout_tail, max_bytes=4096) or "(empty)",
+        stderr_tail=_truncate_tail(stderr_tail, max_bytes=4096) or "(empty)",
     )
-    sys_prompt = _SUPERVISE_PROMPT_TMPL.format(stall_s=stall_seconds)
-    raw = _run_async(_ask_judge(user_prompt, sys_prompt))
+    raw, sid = _run_async(
+        _run_judge_turn(user_prompt, cwd=jd, resume_sid=_recall_sid(job_id))
+    )
+    _remember_sid(job_id, sid)
     parsed = _parse_json(raw)
 
     action = str(parsed.get("action") or "continue").lower()
@@ -355,7 +428,7 @@ def supervise_run_once(
 
 
 # ---------------------------------------------------------------------------
-# Stage 3 — postjudge
+# Stage 3 — postjudge (resumes the same session, then forgets)
 # ---------------------------------------------------------------------------
 
 
@@ -374,30 +447,29 @@ def postjudge_run(
     log_fn: Callable[[str], None],
     *,
     extra_context: str = "",
+    job_id: str | None = None,
 ) -> dict:
     """Categorize a finished run and produce a retry hint.
 
-    Returns:
-        {
-          "verdict": str,        # see _VALID_VERDICTS
-          "summary": str,        # <=200 chars
-          "retry_hint": str,     # <=600 chars; "" when verdict == success
-          "raw": str,
-        }
+    Resumes the session opened by prejudge so the verdict can reference
+    the issues judge flagged earlier. Drops the session_id from the
+    in-memory map after (post is the last stage).
     """
-    script = jd / script_rel
-    src = _read_tail(script, max_bytes=10000) if script.is_file() else ""
+    job_id = job_id or jd.name
     out_t = _truncate_tail(stdout, max_bytes=8000)
     err_t = _truncate_tail(stderr, max_bytes=4000)
 
-    user_prompt = (
-        f"exit_code: {exit_code}\n"
-        f"{extra_context}\n"
-        f"=== stdout (tail) ===\n{out_t or '(empty)'}\n\n"
-        f"=== stderr (tail) ===\n{err_t or '(empty)'}\n\n"
-        f"=== {script_rel} ===\n{src}"
+    user_prompt = _POSTJUDGE_USER_TMPL.format(
+        exit_code=exit_code,
+        extra_context=(extra_context or "").rstrip(),
+        cwd=jd,
+        stdout_tail=out_t or "(empty)",
+        stderr_tail=err_t or "(empty)",
     )
-    raw = _run_async(_ask_judge(user_prompt, _POSTJUDGE_PROMPT))
+    raw, sid = _run_async(
+        _run_judge_turn(user_prompt, cwd=jd, resume_sid=_recall_sid(job_id))
+    )
+    _remember_sid(job_id, sid)
     parsed = _parse_json(raw)
 
     verdict = str(parsed.get("verdict") or "unknown").lower()
@@ -406,11 +478,14 @@ def postjudge_run(
     summary = str(parsed.get("summary") or "")[:400]
     retry_hint = str(parsed.get("retry_hint") or "")[:1200]
     if verdict == "success":
-        retry_hint = ""  # no hint needed on success
+        retry_hint = ""
 
     log_fn(f"[judge] postjudge verdict={verdict} summary={summary[:160]}")
     if retry_hint:
         log_fn(f"[judge] postjudge retry_hint={retry_hint[:200]}")
+
+    # Last stage — release session bookkeeping for this job_id.
+    _forget_sid(job_id)
 
     return {
         "verdict": verdict,

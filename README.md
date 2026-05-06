@@ -103,29 +103,69 @@ Four Claude-driven roles, each with its own context window:
 
 ### judge (`modules/_judge.py`)
 
-Quality-gate around every `auto_run` exploit/solver execution.
-Three short, no-tools Claude turns on the latest model
-(`modules._common.LATEST_JUDGE_MODEL`, currently `claude-opus-4-7` —
-shared with the retry reviewer):
+Quality-gate agent around every `auto_run` exploit/solver execution.
+Pinned to `LATEST_JUDGE_MODEL` (currently `claude-opus-4-7` — shared
+with the retry reviewer). Judge is a peer to recon: same read-only
+tool set (`Read` / `Bash` / `Glob` / `Grep`) plus `Agent` so it can
+delegate heavy investigation to recon. **No `Write` / `Edit`** —
+judge cannot patch the script.
 
-- **prejudge** — runs **before** the runner container starts. Static
-  review of the produced script: looks for `recvuntil` calls without a
-  timeout, prompt strings hard-coded to mismatch typical service
-  banners, wrong tube target (`process()` vs `remote()`), missing
-  `sys.argv` / `context.timeout` defaults, and infinite loops. Returns
-  `{ok, severity, issues}`. `severity=high` aborts the run before
-  spawning the container; the failure is recorded as
-  `judge_aborted: true` with the issue list.
+**main ↔ judge ↔ sub** triangle:
+
+```
+            ┌──────────────── main (writer) ────────────────┐
+            │  Read · Write · Edit · Bash · Glob · Grep ·   │
+            │  Agent(subagent_type="recon" | "judge")       │
+            └────────┬───────────────────────────┬──────────┘
+                     │                           │
+       Agent("recon", ...)                Agent("judge", ...)
+                     │                           │
+                     ▼                           ▼
+            ┌── recon ──────────┐       ┌── judge ──────────────┐
+            │  read-only        │       │  read-only + Agent    │
+            │  ≤2 KB summary    │       │  pinned to latest     │
+            └───────────────────┘       │  model                │
+                     ▲                  └────────┬──────────────┘
+                     │                           │
+                     │       Agent("recon", ...) │
+                     └───────────────────────────┘
+```
+
+Three orchestrator-driven stages, **all sharing one Claude session**
+(prejudge captures `session_id`; supervise + postjudge resume via
+`fork_session=False` — judge's verdict in post can reference what it
+flagged in pre):
+
+- **prejudge** — runs **before** the runner container starts. Judge
+  Reads the script directly, may run a quick `python3 -m py_compile`
+  via Bash, optionally delegates to recon for binary-protocol
+  verification. Returns `{ok, severity, issues}`. `severity=high`
+  aborts the run before spawning the container; the failure is
+  recorded as `judge_aborted: true` with the issue list.
 - **supervise** — runs **once** if the container has emitted no new
-  stdout/stderr for **60 s** while still alive. Receives the recent
-  output tail + the script source, returns `{action: kill|continue,
-  reason}`. Single-shot per run (conservative cost mode), so a
-  legitimate slow operation never racks up repeat judge calls.
+  stdout/stderr for **60 s** while still alive. Same session, fast
+  path (no recon delegation): `{action: kill|continue, reason}`.
+  Single-shot per run so a legitimate slow operation never racks up
+  repeat judge calls.
 - **postjudge** — runs **after** the container exits (either naturally
   or by supervise-kill). Categorizes the result as one of `success` /
   `partial` / `hung` / `parse_error` / `network_error` / `crash` /
   `timeout` / `unknown`, and produces a `retry_hint` paragraph the
   existing /retry flow can pick up directly.
+
+Main can also invoke judge **proactively** mid-write via the standard
+`Agent` tool:
+```python
+Agent(
+    description="prejudge exploit",
+    subagent_type="judge",
+    prompt="review ./exploit.py for hang/parse risks; list specific
+            line numbers + the fix in one short paragraph",
+)
+```
+This is a separate one-shot invocation independent of the
+orchestrator's pre/super/post lifecycle (different SDK session, same
+agent definition).
 
 Each judge stage is best-effort: a judge auth/rate/empty failure
 degrades to permissive defaults (prejudge ok, supervise continue,
@@ -133,7 +173,9 @@ postjudge unknown) so the runner is never harder to use because of a
 flaky judge call. All output prefixed `[judge]` in `run.log`.
 
 Toggle in **Settings → Enable judge for auto-run** (default on); off
-reverts to plain blocking wait + bare `exit_code`.
+reverts to plain blocking wait + bare `exit_code`. The `judge`
+subagent stays registered for main — the toggle only gates the
+orchestrator's pre/super/post lifecycle wrapping.
 
 ## Agent architecture
 
