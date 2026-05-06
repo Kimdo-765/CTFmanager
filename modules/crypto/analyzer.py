@@ -32,6 +32,7 @@ from modules._common import (
     job_dir,
     log_line,
     log_thinking,
+    prior_work_dirs,
     read_meta,
     scan_job_for_flags,
     soft_timeout_watchdog,
@@ -63,6 +64,10 @@ async def _run_agent(
         allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent"],
         permission_mode="bypassPermissions",
         add_dirs=add_dirs,
+        # JOB_ID lets retry/resume preambles anchor the agent on the
+        # current job's directory rather than the prior session's
+        # baked-in absolute paths.
+        env={"JOB_ID": job_id},
         resume=resume_sid,
         fork_session=bool(resume_sid),
         agents=build_recon_agents(model),
@@ -140,7 +145,11 @@ async def _run_agent(
             write_meta(job_id, awaiting_decision=False)
 
     jd = job_dir(job_id)
-    found = collect_outputs(work_dir, ["solver.py", "solver.sage", "report.md"])
+    fallback_dirs = prior_work_dirs(job_id)
+    found = collect_outputs(
+        work_dir, ["solver.py", "solver.sage", "report.md"],
+        fallback_dirs=fallback_dirs,
+    )
     for name in ("solver.py", "solver.sage", "report.md"):
         if name not in found and (jd / name).is_file():
             found[name] = jd / name
@@ -151,6 +160,9 @@ async def _run_agent(
         target = jd / name
         if src.resolve() != target.resolve():
             target.write_bytes(src.read_bytes())
+        work_target = work_dir / name
+        if src.resolve() != work_target.resolve():
+            work_target.write_bytes(src.read_bytes())
     return summary
 
 

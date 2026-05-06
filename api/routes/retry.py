@@ -265,6 +265,42 @@ async def _ask_reviewer_streaming(context: str) -> AsyncIterator[tuple[str, dict
 _CLAUDE_HOME = Path("/root/.claude")
 
 
+_STALE_SENTINEL_NAME = "_STALE_DO_NOT_WRITE_HERE.md"
+
+
+def _drop_stale_sentinel(prev_work: Path, prev_id: str) -> None:
+    """Drop a marker file into the prior job's work tree.
+
+    The forked SDK session frequently `cd`s back into the prior cwd
+    (`/data/jobs/<prev_id>/work/`) because that path is hard-baked
+    into its tool history. The first thing a careful agent does
+    after `cd` is `ls` — when this sentinel shows up in the listing
+    the agent sees an unmistakable signal that the directory has
+    been retired.
+
+    Best-effort: ignored if the dir is gone or fs is read-only.
+    Repeated retries refresh the file in place (it just gets the
+    latest description).
+    """
+    try:
+        sentinel = prev_work / _STALE_SENTINEL_NAME
+        sentinel.write_text(
+            f"# 🚨 THIS DIRECTORY IS STALE — DO NOT WRITE HERE\n\n"
+            f"You are looking at `/data/jobs/{prev_id}/work/`. This was the "
+            f"work tree of a PREVIOUS attempt that the user has already "
+            f"retried/resumed.\n\n"
+            f"The orchestrator collects artifacts only from the CURRENT job's "
+            f"`work/` tree. Any Write/Edit you make under this directory will "
+            f"be silently discarded — your retry will return UNCHANGED files "
+            f"and waste a full agent run.\n\n"
+            f"**Action**: `cd` back to your job's work tree (the one whose id "
+            f"matches the JOB_ID env var, NOT `{prev_id}`) and re-issue your "
+            f"writes with bare names (`exploit.py`) or `./`-relative paths.\n"
+        )
+    except OSError:
+        pass
+
+
 def _carry_session_jsonl(sid: str, prev_work: Path, new_work: Path) -> None:
     """Make a prev SDK session reachable from the new job's cwd.
 
@@ -343,6 +379,10 @@ def _resubmit(
         prev_work = prev_jd / "work"
         if prev_work.is_dir():
             shutil.copytree(prev_work, new_jd / "work", dirs_exist_ok=False)
+            # Plant a stale-marker into the OLD work tree so a forked
+            # session that `cd`s back into its baked-in absolute path
+            # sees an unmistakable file in `ls` output.
+            _drop_stale_sentinel(prev_work, prev_meta.get("id") or "")
         # Carry the SDK session transcript so fork_session=True can
         # actually find the prior conversation. The CLI transport
         # derives the project key from cwd; without copying the jsonl
@@ -351,6 +391,15 @@ def _resubmit(
         prev_sid = prev_meta.get("claude_session_id")
         if prev_sid:
             _carry_session_jsonl(prev_sid, prev_work, new_jd / "work")
+        # The sentinel was carried into the new work tree by copytree —
+        # drop it from the new tree so the agent doesn't trip over it
+        # when working in its own cwd.
+        new_sentinel = new_jd / "work" / _STALE_SENTINEL_NAME
+        if new_sentinel.is_file():
+            try:
+                new_sentinel.unlink()
+            except OSError:
+                pass
 
     # Target: caller can override (user-supplied via UI). Empty
     # override falls back to the prior target. Sentinel "(none)" lets
@@ -733,6 +782,33 @@ def _halt_source_job(safe: str, prev_meta: dict) -> dict:
     return halt
 
 
+_STALE_PATH_WARNING_TMPL = (
+    "🚨 CRITICAL — your cwd has CHANGED since the prior session.\n"
+    "The prior agent's tool history shows absolute writes like "
+    "`/data/jobs/{prev_id}/work/exploit.py`. THAT PATH IS NOW STALE — "
+    "the new job has a DIFFERENT id and the orchestrator collects "
+    "artifacts ONLY from your CURRENT cwd. Writing to the old "
+    "absolute path will silently leak edits into the dead prior "
+    "directory and your retry will return UNCHANGED files.\n"
+    "RULES for every Write/Edit/Bash you issue from now on:\n"
+    "  • Use bare names (`exploit.py`, `report.md`) or `./`-relative "
+    "paths (`./decomp/main.c`).\n"
+    "  • NEVER write to `/data/jobs/{prev_id}/...` — that directory "
+    "is no longer yours; you'll find a `_STALE_DO_NOT_WRITE_HERE.md` "
+    "marker if you `ls` it.\n"
+    "  • NEVER `cd /data/jobs/{prev_id}/...` — your cwd is already "
+    "the new job's work tree; there is no reason to leave it.\n"
+    "  • NEVER write to `/root/...` (empty home dir).\n"
+    "  • NEVER prefix with `./work/` (doubled path — your cwd IS the "
+    "work tree).\n"
+    "MANDATORY FIRST CALL — before ANY other tool, run exactly:\n"
+    "  Bash(command=\"pwd && echo \\\"job_id=$JOB_ID\\\" && ls -la\", "
+    "description=\"anchor cwd on retry\")\n"
+    "If pwd doesn't match `/data/jobs/$JOB_ID/work`, stop and "
+    "re-orient before any further tool call."
+)
+
+
 def _retry_preamble(prev_id: str, hint: str) -> str:
     """Preamble for the standard retry path (failed / no_flag /
     finished). The new agent is launched with `resume=<prev_session>` +
@@ -740,26 +816,26 @@ def _retry_preamble(prev_id: str, hint: str) -> str:
     reasoning, thinking, and tool history; ./work/ has been carried
     over so any path the prior agent wrote still resolves.
 
-    The text is intentionally short — most signal already lives in the
-    forked conversation. The fallback line covers the rare case where
-    SDK couldn't locate the prior transcript and the agent boots
-    fresh: in that case ./work/ is still the right place to catch up.
+    The stale-path warning is the load-bearing part: without it, the
+    forked agent re-uses the prior absolute paths from its tool
+    history (`/data/jobs/<prev_id>/work/...`), edits the OLD job dir,
+    and our `collect_outputs(work_dir, ...)` step picks up the
+    untouched carry-copy in the NEW job dir.
     """
     return (
         f"[retry of job {prev_id} — same Claude session forked]\n"
-        f"Your current working directory IS the prior attempt's work "
+        + _STALE_PATH_WARNING_TMPL.format(prev_id=prev_id)
+        + "\n\nYour current working directory IS the new job's work "
         f"tree. Everything the previous agent produced — partial "
         f"exploit.py / solver.py / report.md / decomp/ / extracted/ "
-        f"/ bin/ / scratch — sits directly at `./`. Read with bare "
-        f"names (`exploit.py`) or relative paths (`./report.md`); "
-        f"NEVER use `/root/...` (that's an empty home dir, not where "
-        f"your files live), and NEVER prefix with `./work/` (that's "
-        f"a doubled path that doesn't exist either). If your "
-        f"conversation context already shows the prior reasoning + "
-        f"tool history, just continue from where you left off in "
-        f"light of the hint below. If not (rare — SDK couldn't "
-        f"locate the prior session), `ls` once and read whichever "
-        f"file matters before applying the hint.\n\n"
+        f"/ bin/ / scratch — has been COPIED into your new cwd and "
+        f"sits directly at `./`. If your conversation context "
+        f"already shows the prior reasoning + tool history, continue "
+        f"from where you left off in light of the hint below — but "
+        f"every new Write/Edit MUST use bare or `./`-relative paths "
+        f"per the rules above. If the SDK couldn't locate the prior "
+        f"session (rare), `ls` once and read whichever file matters "
+        f"before applying the hint.\n\n"
         f"{hint}"
     )
 
@@ -769,21 +845,26 @@ def _resume_preamble(prev_id: str, hint: str) -> str:
     the prior session was halted MID-RUN by the user — so the agent
     should treat the work as in-flight ("pick up where you left off")
     rather than as a finished failure to revisit.
+
+    Same stale-path concern as retry: the forked tool history
+    references `/data/jobs/<prev_id>/work/...`, but the new cwd is
+    `/data/jobs/<new_id>/work/`. Without the explicit warning the
+    agent edits the dead directory.
     """
     return (
         f"[resume of job {prev_id} — interrupted, same session forked]\n"
-        f"Your prior session was halted mid-run. Your current "
-        f"working directory IS the prior attempt's work tree — "
-        f"whatever files you had already written are sitting "
-        f"directly at `./`. Read with bare names (`exploit.py`) or "
-        f"relative paths (`./report.md`); NEVER use `/root/...` "
-        f"(that's empty), and NEVER prefix with `./work/` (doubled "
-        f"path). If your conversation context still has the prior "
-        f"reasoning + tool history, continue exactly where you left "
-        f"off and apply the new guidance below — do not restart the "
-        f"analysis. If not (rare — SDK couldn't locate the prior "
-        f"session), `ls` once and read whichever file matters "
-        f"before applying the hint.\n\n"
+        + _STALE_PATH_WARNING_TMPL.format(prev_id=prev_id)
+        + "\n\nYour prior session was halted mid-run. Your current "
+        f"working directory IS the NEW job's work tree — whatever "
+        f"files you had already written have been COPIED into the "
+        f"new cwd and sit directly at `./`. If your conversation "
+        f"context still has the prior reasoning + tool history, "
+        f"continue exactly where you left off and apply the new "
+        f"guidance below — do not restart the analysis, and remember "
+        f"every new Write/Edit MUST use bare or `./`-relative paths. "
+        f"If the SDK couldn't locate the prior session (rare), `ls` "
+        f"once and read whichever file matters before applying the "
+        f"hint.\n\n"
         f"{hint}"
     )
 

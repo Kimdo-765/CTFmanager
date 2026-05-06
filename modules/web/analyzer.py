@@ -32,6 +32,7 @@ from modules._common import (
     job_dir,
     log_line,
     log_thinking,
+    prior_work_dirs,
     read_meta,
     scan_job_for_flags,
     soft_timeout_watchdog,
@@ -63,6 +64,10 @@ async def _run_agent(
         allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent"],
         permission_mode="bypassPermissions",
         add_dirs=add_dirs,
+        # JOB_ID lets retry/resume preambles (and the agent) anchor on
+        # the current job's directory rather than the prior session's
+        # baked-in absolute paths.
+        env={"JOB_ID": job_id},
         resume=resume_sid,
         fork_session=bool(resume_sid),
         agents=build_recon_agents(model),
@@ -151,10 +156,14 @@ async def _run_agent(
             write_meta(job_id, awaiting_decision=False)
 
     jd = job_dir(job_id)
-    # Prefer the agent's cwd, but also check /root/ AND the job root in case
-    # the agent wrote with an absolute path. collect_outputs handles cwd +
-    # /root, then we additionally consider files already at the job root.
-    found = collect_outputs(work_dir, ["exploit.py", "report.md"])
+    # Prefer the agent's cwd, but also check /root/, the job root, and
+    # any prior-attempt work dirs (for retry/resume — the forked SDK
+    # session sometimes re-uses absolute paths from the prior tool
+    # history and silently writes into the OLD job dir).
+    fallback_dirs = prior_work_dirs(job_id)
+    found = collect_outputs(
+        work_dir, ["exploit.py", "report.md"], fallback_dirs=fallback_dirs,
+    )
     if "exploit.py" not in found and (jd / "exploit.py").is_file():
         found["exploit.py"] = jd / "exploit.py"
     if "report.md" not in found and (jd / "report.md").is_file():
@@ -162,10 +171,17 @@ async def _run_agent(
     summary["exploit_present"] = "exploit.py" in found
     summary["report_present"] = "report.md" in found
     for name, src in found.items():
-        # Only copy if the file isn't already at the job root
         target = jd / name
         if src.resolve() != target.resolve():
             target.write_bytes(src.read_bytes())
+        # Mirror into work_dir too — the next /retry uses
+        # `<this_job>/work/` as its carry source via shutil.copytree,
+        # so without this any fallback recovery (file actually written
+        # to a stale absolute path) would be carried as a stale copy
+        # AGAIN on the next retry.
+        work_target = work_dir / name
+        if src.resolve() != work_target.resolve():
+            work_target.write_bytes(src.read_bytes())
     return summary
 
 

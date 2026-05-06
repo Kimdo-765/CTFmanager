@@ -70,21 +70,48 @@ def read_meta(job_id: str) -> dict[str, Any]:
         return {}
 
 
-def collect_outputs(work_dir: Path, names: list[str]) -> dict[str, Path]:
+def collect_outputs(
+    work_dir: Path,
+    names: list[str],
+    *,
+    fallback_dirs: list[Path] | None = None,
+) -> dict[str, Path]:
     """Find each requested filename. Looks in work_dir first, then falls
     back to /root/ (the agent's HOME — sometimes the agent ignores cwd
-    and uses an absolute path under home).
+    and uses an absolute path under home), and finally any caller-supplied
+    `fallback_dirs`.
+
+    On a retry/resume the forked SDK session occasionally re-uses the
+    PRIOR job's absolute paths (`/data/jobs/<prev_id>/work/...`) from
+    its tool history, so the new agent's edits land in the OLD job
+    dir while the new work_dir keeps the untouched carry-copy. To
+    recover from that, callers can pass the prior work dir(s) here:
+    when the same name appears in multiple candidates, the one with
+    the most-recent mtime wins (carry-copy preserves the original
+    mtime via copy2/copytree, so any post-carry rewrite in the prior
+    dir naturally registers as newer).
 
     Returns a dict {name: actual_path} for files that were located.
     """
+    fallback_dirs = list(fallback_dirs or [])
+    candidates_dirs = [work_dir, Path("/root"), *fallback_dirs]
     found: dict[str, Path] = {}
-    candidates_dirs = [work_dir, Path("/root")]
     for name in names:
+        best: Path | None = None
+        best_mtime: float = -1.0
         for d in candidates_dirs:
             p = d / name
-            if p.is_file():
-                found[name] = p
-                break
+            try:
+                if not p.is_file():
+                    continue
+                mt = p.stat().st_mtime
+            except OSError:
+                continue
+            if mt > best_mtime:
+                best = p
+                best_mtime = mt
+        if best is not None:
+            found[name] = best
     return found
 
 
@@ -671,6 +698,35 @@ def split_retry_hint(description: str | None) -> tuple[str, str]:
     base = description[:idx].strip()
     hint = description[idx + len(_RETRY_HINT_MARKER):].strip()
     return base, hint
+
+
+def prior_work_dirs(job_id: str) -> list[Path]:
+    """Return prior-attempt work directories for a retry/resume chain.
+
+    Walks the `retry_of` / `resumed_from` lineage in meta.json so the
+    caller can include those dirs as fallbacks when collecting agent
+    artifacts. The forked SDK session sometimes re-uses absolute
+    paths (`/data/jobs/<prev_id>/work/...`) from the prior tool
+    history — without this fallback the new run's exploit.py /
+    report.md silently lands in the OLD job dir while the new one
+    keeps the unmodified carry-copy. Bounded walk (8 hops) so a
+    pathological chain can't loop forever.
+    """
+    seen: set[str] = set()
+    out: list[Path] = []
+    cur = read_meta(job_id) or {}
+    for _ in range(8):
+        prev = cur.get("retry_of") or cur.get("resumed_from")
+        if not prev or prev in seen:
+            break
+        seen.add(prev)
+        candidate = job_dir(prev) / "work"
+        if candidate.is_dir():
+            out.append(candidate)
+        cur = read_meta(prev) or {}
+        if not cur:
+            break
+    return out
 
 
 def classify_agent_error(message: str) -> str | None:

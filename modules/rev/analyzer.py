@@ -32,6 +32,7 @@ from modules._common import (
     job_dir,
     log_line,
     log_thinking,
+    prior_work_dirs,
     read_meta,
     scan_job_for_flags,
     soft_timeout_watchdog,
@@ -149,7 +150,10 @@ async def _run_agent(
         if read_meta(job_id).get("awaiting_decision"):
             write_meta(job_id, awaiting_decision=False)
 
-    found = collect_outputs(work_dir, ["solver.py", "report.md"])
+    fallback_dirs = prior_work_dirs(job_id)
+    found = collect_outputs(
+        work_dir, ["solver.py", "report.md"], fallback_dirs=fallback_dirs,
+    )
     summary["solver_present"] = "solver.py" in found
     summary["report_present"] = "report.md" in found
     summary["decomp_used"] = (work_dir / "decomp").exists()
@@ -160,7 +164,12 @@ async def _run_agent(
             pass
     jd = job_dir(job_id)
     for name, src in found.items():
-        (jd / name).write_bytes(src.read_bytes())
+        target = jd / name
+        if src.resolve() != target.resolve():
+            target.write_bytes(src.read_bytes())
+        work_target = work_dir / name
+        if src.resolve() != work_target.resolve():
+            work_target.write_bytes(src.read_bytes())
     return summary
 
 
