@@ -21,6 +21,12 @@ LIBERAL_FLAG_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_]{1,16}\{[!-~]{2,200}\}")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 JOBS_DIR = DATA_DIR / "jobs"
 
+# Single source of truth for the latest Claude model used by ad-hoc
+# Claude calls (retry reviewer, exploit/solver judge). Bump here and
+# every helper that imports it picks up the new model on the next
+# run — no per-callsite edit needed.
+LATEST_JUDGE_MODEL = "claude-opus-4-7"
+
 
 def job_dir(job_id: str) -> Path:
     p = JOBS_DIR / job_id

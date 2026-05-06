@@ -25,10 +25,37 @@ SCHEMA: list[tuple[str, str | None, type, Any]] = [
     ("job_timeout_seconds", "JOB_TIMEOUT", int, 900),
     ("worker_concurrency", "WORKER_CONCURRENCY", int, 3),
     ("callback_url", "CALLBACK_URL", str, ""),
+    # Quality-gate judge that wraps auto_run exploit/solver execution
+    # (pre-flight script review → stall supervisor → post-mortem
+    # verdict). Each stage is one short no-tools Claude call against
+    # LATEST_JUDGE_MODEL. Disable to skip all judge calls and run the
+    # script with the plain runner (saves ~3 Claude turns per auto_run
+    # job at the cost of losing hang/parse-error detection).
+    ("enable_judge", "ENABLE_JUDGE", bool, True),
 ]
 _SECRET_KEYS = {"anthropic_api_key", "auth_token"}
 
 _lock = threading.Lock()
+
+
+def _coerce(value: Any, typ: type) -> Any:
+    """Cast `value` to `typ`, with sane handling for bool.
+
+    Plain `bool("false")` returns True (any non-empty string is truthy).
+    For settings that come from env vars or HTTP form data we want
+    "false"/"0"/"no"/"off" → False, "true"/"1"/"yes"/"on" → True.
+    Everything else falls back to `typ(value)`.
+    """
+    if typ is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        s = str(value).strip().lower()
+        if s in ("", "0", "false", "no", "off", "none", "null"):
+            return False
+        return True
+    return typ(value)
 
 
 def load_settings() -> dict[str, Any]:
@@ -56,14 +83,14 @@ def get_setting(key: str) -> Any:
         v = settings.get(k)
         if v not in (None, ""):
             try:
-                return typ(v)
+                return _coerce(v, typ)
             except (TypeError, ValueError):
                 return v
         if env_key:
             ev = os.environ.get(env_key, "")
             if ev != "":
                 try:
-                    return typ(ev)
+                    return _coerce(ev, typ)
                 except (TypeError, ValueError):
                     return ev
         return default
@@ -148,7 +175,7 @@ def get_settings_view() -> dict[str, Any]:
         env_v = os.environ.get(env_key, "") if env_key else ""
         effective_raw = raw if raw not in (None, "") else env_v if env_v else default
         try:
-            effective = typ(effective_raw) if effective_raw not in (None, "") else default
+            effective = _coerce(effective_raw, typ) if effective_raw not in (None, "") else default
         except (TypeError, ValueError):
             effective = effective_raw
         if key in _SECRET_KEYS:
@@ -181,7 +208,7 @@ def update_settings(patch: dict[str, Any]) -> dict[str, Any]:
         for k, _, typ, _ in SCHEMA:
             if k == key:
                 try:
-                    cur[key] = typ(val)
+                    cur[key] = _coerce(val, typ)
                 except (TypeError, ValueError):
                     cur[key] = val
                 break

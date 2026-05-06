@@ -42,13 +42,14 @@ target is given).
 
 ## Architecture
 
-Three Claude-driven roles, each with its own context window:
+Four Claude-driven roles, each with its own context window:
 
 | Role | Where it runs | Tools | Purpose |
 |---|---|---|---|
 | **reviewer** | `api` container, inline in `/retry` & `/resume` handlers | none (diagnostic only) | Reads the failed prior job and writes a 1-paragraph hint, streamed to the browser |
 | **main worker** | `worker` container, one RQ process per concurrency slot | `Read` `Write` `Edit` `Bash` `Glob` `Grep` `Agent` | Runs the module pipeline; writes `exploit.py` / `solver.py` / `report.md` |
 | **sub worker** | in-process under main (recon) **or** sibling docker container (sandbox) | recon: `Read` `Bash` `Glob` `Grep` (read-only) · sandboxes: shell | Heavy investigation + isolated tool execution |
+| **judge** | `worker` container, around every `auto_run` execution | none (3 short turns, latest model) | Pre-flight script review · stall watchdog · post-mortem verdict for the runner sandbox |
 
 ```
    browser :8000
@@ -99,6 +100,40 @@ Three Claude-driven roles, each with its own context window:
 
 - **recon subagent** — in-process under main. Same model, **separate context window**. Read-only (`Read` / `Bash` / `Glob` / `Grep`); cannot `Write` or `Edit`. Returns a ≤2 KB compact summary so heavy disasm / source greps / ghiant decompilation never pollute main's history. See [Agent architecture](#agent-architecture).
 - **sibling sandboxes** — `decompiler` (Ghidra), `forensic` (TSK + qemu-img + Vol3), `misc` (binwalk + steghide + …), `runner` (exec exploit.py / solver.py), `sage` (optional Coppersmith / LLL). Built once via `--profile tools`, never started by `compose up`. The worker `docker run`s them per job and removes them when done.
+
+### judge (`modules/_judge.py`)
+
+Quality-gate around every `auto_run` exploit/solver execution.
+Three short, no-tools Claude turns on the latest model
+(`modules._common.LATEST_JUDGE_MODEL`, currently `claude-opus-4-7` —
+shared with the retry reviewer):
+
+- **prejudge** — runs **before** the runner container starts. Static
+  review of the produced script: looks for `recvuntil` calls without a
+  timeout, prompt strings hard-coded to mismatch typical service
+  banners, wrong tube target (`process()` vs `remote()`), missing
+  `sys.argv` / `context.timeout` defaults, and infinite loops. Returns
+  `{ok, severity, issues}`. `severity=high` aborts the run before
+  spawning the container; the failure is recorded as
+  `judge_aborted: true` with the issue list.
+- **supervise** — runs **once** if the container has emitted no new
+  stdout/stderr for **60 s** while still alive. Receives the recent
+  output tail + the script source, returns `{action: kill|continue,
+  reason}`. Single-shot per run (conservative cost mode), so a
+  legitimate slow operation never racks up repeat judge calls.
+- **postjudge** — runs **after** the container exits (either naturally
+  or by supervise-kill). Categorizes the result as one of `success` /
+  `partial` / `hung` / `parse_error` / `network_error` / `crash` /
+  `timeout` / `unknown`, and produces a `retry_hint` paragraph the
+  existing /retry flow can pick up directly.
+
+Each judge stage is best-effort: a judge auth/rate/empty failure
+degrades to permissive defaults (prejudge ok, supervise continue,
+postjudge unknown) so the runner is never harder to use because of a
+flaky judge call. All output prefixed `[judge]` in `run.log`.
+
+Toggle in **Settings → Enable judge for auto-run** (default on); off
+reverts to plain blocking wait + bare `exit_code`.
 
 ## Agent architecture
 
@@ -218,11 +253,12 @@ All knobs live in two places:
    | `HOST_CLAUDE_HOME` | `${HOME}/.claude` | host path of Claude Code config |
    | `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `999999` | per-turn SDK output cap (the model's own ceiling, ~64k for Sonnet/Opus, becomes the effective limit) |
    | `INVESTIGATION_BUDGET` | `0` | tool-call budget after which a web/pwn/crypto/rev job aborts cleanly if no `exploit.py` / `solver.py` was produced. `0` (default) disables the trip-wire; set to a positive int to enable. |
+   | `ENABLE_JUDGE` | `1` | wrap every `auto_run` runner execution with the 3-stage judge (pre / stall-supervise / post). Set to `0` to skip judge calls entirely. See [judge](#judge-modules_judgepy). |
 
 2. **Settings tab** in the UI — writes to `/data/settings.json`, overrides `.env`
    without restart for: Anthropic API key, Claude model, Auth token, Job TTL,
-   Job timeout, Worker concurrency. (Concurrency change requires
-   `docker compose restart worker`.)
+   Job timeout, Worker concurrency, Callback URL, **Enable judge**.
+   (Concurrency change requires `docker compose restart worker`.)
 
 Precedence: `settings.json` > `.env` > defaults.
 

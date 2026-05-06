@@ -167,6 +167,8 @@ async function loadSettings() {
   f.querySelector("[name=worker_concurrency]").value =
     s.worker_concurrency != null ? s.worker_concurrency : "";
   f.querySelector("[name=callback_url]").value = s.callback_url || "";
+  // enable_judge default-True; only un-check when explicitly stored false
+  f.querySelector("[name=enable_judge]").checked = s.enable_judge !== false;
   document.getElementById("key-status").textContent = s.anthropic_api_key_set
     ? `set (${s.anthropic_api_key_masked}) — leave blank to keep, type new to replace`
     : (s.anthropic_api_key_env_set ? "using ANTHROPIC_API_KEY from env" : "not set");
@@ -193,6 +195,7 @@ document.getElementById("settings-form").addEventListener("submit", async (e) =>
       // Empty secret field: skip — keep current value
       continue;
     }
+    if (k === "enable_judge") continue;  // handled explicitly below
     if (v === "") {
       payload[k] = null;  // null = clear the override
       continue;
@@ -203,6 +206,9 @@ document.getElementById("settings-form").addEventListener("submit", async (e) =>
       payload[k] = v;
     }
   }
+  // Checkboxes are absent from FormData when unchecked — read directly
+  // so the OFF state is sent as `false`, not "clear the override".
+  payload.enable_judge = !!e.target.querySelector("[name=enable_judge]").checked;
   const res = await fetch(`${API}/settings`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },

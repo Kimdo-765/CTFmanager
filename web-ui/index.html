@@ -307,6 +307,11 @@
           <input type="url" name="callback_url" placeholder="https://your-listener.example.com/x" />
           <small style="color:#8b949e">forwarded to exploits as <code>CALLBACK_URL</code> env. Use ngrok / requestbin / your own VPS for remote bots that can't reach private IPs.</small>
         </label>
+        <label class="checkbox">
+          <input type="checkbox" name="enable_judge" />
+          Enable judge for auto-run (pre-flight script review · stall watchdog · post-mortem verdict)
+          <small style="color:#8b949e">adds ~1 short Claude turn per stage on the latest model. Disable to run scripts with the plain runner (saves cost; no hang/parse-error detection).</small>
+        </label>
         <div style="display:flex;gap:0.5rem">
           <button type="submit">Save</button>
           <button type="button" id="settings-reload" style="background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:0.5rem 1rem;border-radius:6px;cursor:pointer">Reload</button>

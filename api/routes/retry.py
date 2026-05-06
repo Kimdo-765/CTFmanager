@@ -35,7 +35,7 @@ from fastapi.responses import StreamingResponse
 
 from api.queue import get_queue, hard_timeout_for, resolve_timeout
 from api.storage import JOBS_DIR, job_dir, new_job_id, read_job_meta, write_job_meta
-from modules._common import classify_agent_error
+from modules._common import LATEST_JUDGE_MODEL, classify_agent_error
 from modules.settings_io import apply_to_env, get_setting
 
 
@@ -89,7 +89,10 @@ def _diagnose_reviewer_text(accumulated: str) -> tuple[str, str] | None:
 
 router = APIRouter()
 
-LATEST_REVIEWER_MODEL = "claude-opus-4-7"
+# Reviewer shares the same "latest model" pin as the in-runner judge —
+# both are short, no-tools Claude calls and we want to upgrade them in
+# lockstep. Single source of truth lives in modules._common.
+LATEST_REVIEWER_MODEL = LATEST_JUDGE_MODEL
 
 _REVIEWER_PROMPT = """\
 You are reviewing a previous CTF-solving attempt that did NOT recover the
