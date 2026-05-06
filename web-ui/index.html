@@ -60,7 +60,10 @@
           Job timeout (seconds, blank = global setting)
           <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
-        <button type="submit">Analyze</button>
+        <div class="form-actions">
+          <button type="submit">Analyze</button>
+          <button type="reset" title="Clear file, target, and all other inputs">Reset</button>
+        </div>
       </form>
     </section>
 
@@ -91,7 +94,10 @@
           Job timeout (seconds, blank = global setting)
           <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
-        <button type="submit">Decompile + Analyze</button>
+        <div class="form-actions">
+          <button type="submit">Decompile + Analyze</button>
+          <button type="reset" title="Clear file, target, and all other inputs">Reset</button>
+        </div>
         <small style="color:#8b949e">First run requires the decompiler image: <code>docker compose --profile tools build decompiler</code></small>
       </form>
     </section>
@@ -142,7 +148,10 @@
           Job timeout (seconds, blank = global setting)
           <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
-        <button type="submit">Collect Artifacts</button>
+        <div class="form-actions">
+          <button type="submit">Collect Artifacts</button>
+          <button type="reset" title="Clear file, image type, target OS, and all other inputs">Reset</button>
+        </div>
         <small style="color:#8b949e">First run requires the forensic image: <code>docker compose --profile tools build forensic</code></small>
       </form>
     </section>
@@ -174,7 +183,10 @@
           Job timeout (seconds, blank = global setting)
           <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
-        <button type="submit">Analyze</button>
+        <div class="form-actions">
+          <button type="submit">Analyze</button>
+          <button type="reset" title="Clear file, passphrase, and all other inputs">Reset</button>
+        </div>
         <small style="color:#8b949e">First run requires the misc image: <code>docker compose --profile tools build misc</code></small>
       </form>
     </section>
@@ -210,7 +222,10 @@
           Job timeout (seconds, blank = global setting)
           <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
-        <button type="submit">Analyze + Solve</button>
+        <div class="form-actions">
+          <button type="submit">Analyze + Solve</button>
+          <button type="reset" title="Clear file, target, and all other inputs">Reset</button>
+        </div>
         <small style="color:#8b949e">Worker has pycryptodome, gmpy2, sympy, z3-solver, ecdsa, pwntools. Sage requires <code>docker compose --profile tools-sage pull sage</code>.</small>
       </form>
     </section>
@@ -238,7 +253,10 @@
           Job timeout (seconds, blank = global setting)
           <input type="number" name="job_timeout" min="60" placeholder="6000" />
         </label>
-        <button type="submit">Decompile + Solve</button>
+        <div class="form-actions">
+          <button type="submit">Decompile + Solve</button>
+          <button type="reset" title="Clear file and all other inputs">Reset</button>
+        </div>
         <small style="color:#8b949e">Reuses decompiler image. Solver runs with crypto libs (pycryptodome, gmpy2, sympy, z3, pwntools).</small>
       </form>
     </section>

@@ -369,6 +369,25 @@ button[type="submit"], #refresh-jobs {
   cursor: pointer;
   align-self: flex-start;
 }
+.form-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  align-self: flex-start;
+}
+.form-actions button[type="submit"] { align-self: auto; }
+.form-actions button[type="reset"] {
+  background: transparent;
+  color: #8b949e;
+  border: 1px solid #30363d;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.form-actions button[type="reset"]:hover {
+  color: #c9d1d9;
+  border-color: #58a6ff;
+}
 #jobs-list { list-style: none; padding: 0; margin: 1rem 0; }
 #jobs-list li {
   padding: 0.5rem;
