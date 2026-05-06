@@ -442,6 +442,15 @@ HexTech_CTF_TOOL/
   `strace`, `ltrace`, `patchelf`, `cpio`, `ROPgadget` (with
   `capstone>=5` so ARM64 gadget search actually returns hits),
   `one_gadget`, `pwn checksec`.
+- **C++ binaries**: full Ghidra demangler (`/opt/ghidra/GPL/DemanglerGnu`)
+  + `c++filt` + `nm -C` / `objdump -d -C`. Decompiled output uses
+  unmangled names (`MyClass::method()` not `_ZN7MyClass…`).
+- **Go binaries**: Ghidra 12 ships Go runtime type databases for Go
+  1.15–1.23 — ghiant decompiles named or stripped Go binaries with
+  function/type recovery automatically. Plus `redress` (amd64 only)
+  for first-pass triage: `redress info <bin>` reads Go version +
+  module + package counts via pclntab, `redress packages`
+  / `types` / `source` for deeper recovery.
 - Dynamic analysis is reachable for foreign-arch ELFs too:
   `qemu-aarch64-static -g 1234 ./bin/x &` followed by
   `gdb-multiarch -batch -ex 'set arch aarch64' -ex 'target remote

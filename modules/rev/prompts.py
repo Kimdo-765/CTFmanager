@@ -33,7 +33,21 @@ Tools available via Bash:
 - `ghiant <binary> [outdir]`  ← Ghidra-headless decompiler wrapper.
   Writes per-function `.c` files to `./decomp/` (or the given dir).
   Decompilation takes 1–3 minutes per binary, so call it ONLY when
-  raw disasm + strings don't give you a clear picture.
+  raw disasm + strings don't give you a clear picture. Ghidra 12
+  ships Go runtime type databases (1.15–1.23) so ghiant recovers Go
+  function/type info automatically when the binary is Go.
+- `redress` ← Go-binary triage. Run BEFORE ghiant when
+  `file ./bin/<name>` mentions "Go BuildID":
+    redress info ./bin/<name>      # Go version + Build ID + module
+                                   # root + package counts (main / std
+                                   # / vendor). Works on stripped
+                                   # binaries via pclntab.
+    redress packages ./bin/<name>  # List every package — often reveals
+                                   # `main.solve`, `crypto/aes`, etc.
+    redress types ./bin/<name>     # Recovered Go type definitions.
+    redress source ./bin/<name>    # Source-code projection.
+  Cheaper than ghiant for first-pass orientation. Skip for non-Go
+  binaries.
 - pwntools, pycryptodome, gmpy2, sympy, z3-solver are preinstalled —
   use `python3 -c '...'` for quick experiments.
 
@@ -47,11 +61,15 @@ Bash gotchas in this sandbox:
 Suggested workflow:
 1. Quick triage: `file ./bin/<name>`, `strings ./bin/<name> | head -200`
    (often reveals format strings, hardcoded keys, or hint constants).
+   If `file` says "Go BuildID", run `redress info ./bin/<name>` for Go
+   version + module + package list before any disassembly.
 2. For small/simple binaries: `objdump -d ./bin/<name>` and read main +
    any obvious helpers. Run the binary on a sample input to see
-   prompts.
+   prompts. For Go: filter to `main.*` symbols with
+   `objdump -d -j .text ./bin/<name> | grep -E "^[0-9a-f]+ <main\."`.
 3. If logic is non-trivial (custom VMs, big functions, heavy crypto):
    run `ghiant ./bin/<name>` and trace through `./decomp/main_*.c`.
+   Ghidra recovers Go types automatically for Go 1.15–1.23 builds.
 4. Decide between two solver strategies and pick the simpler one:
    a. Forward-simulate the algorithm in Python (when the program
       hashes/encrypts a static flag and prints success/failure).

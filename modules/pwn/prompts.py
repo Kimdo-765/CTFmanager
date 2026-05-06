@@ -35,7 +35,21 @@ Tools available via Bash:
 - `ghiant <binary> [outdir]`  ← Ghidra-headless decompiler wrapper.
   Writes per-function `.c` files to `./decomp/` (or the given dir).
   Decompilation takes 1–3 minutes per binary, so call it ONLY when raw
-  disassembly + strings aren't enough to understand the logic.
+  disassembly + strings aren't enough to understand the logic. Ghidra
+  12 ships Go runtime type databases (1.15–1.23) so ghiant recovers
+  Go function/type info automatically when the binary is Go.
+- `redress` ← Go-binary triage. Run BEFORE ghiant when
+  `file ./bin/<name>` mentions "Go BuildID":
+    redress info ./bin/<name>      # Go version + Build ID + module
+                                   # root + package counts (main / std
+                                   # / vendor). Works on stripped
+                                   # binaries via pclntab.
+    redress packages ./bin/<name>  # List every package — often reveals
+                                   # `main.solve`, `crypto/aes`, etc.
+    redress types ./bin/<name>     # Recovered Go type definitions.
+    redress source ./bin/<name>    # Source-code projection.
+  Cheaper than ghiant for first-pass orientation. Skip for non-Go
+  binaries.
 - pwntools is preinstalled — you can import it from a quick `python3 -c
   '...'` script for offset/gadget calculations.
 
@@ -51,12 +65,17 @@ Bash gotchas in this sandbox:
 
 Suggested workflow:
 1. Quick triage: `file ./bin/<name>`, `pwn checksec --file ./bin/<name>`,
-   `strings ./bin/<name> | head -200`.
+   `strings ./bin/<name> | head -200`. If `file` says "Go BuildID",
+   add `redress info ./bin/<name>` for Go version + module + packages
+   before any disassembly.
 2. For small/simple binaries: `objdump -d ./bin/<name> | less` is often
    faster than full decompilation. Read `main` and any obvious helpers.
+   For Go: prefer `objdump -d -j .text ./bin/<name> | grep -E "^[0-9a-f]+ <main\."`
+   to filter to `main.*` symbols only.
 3. If the logic is non-trivial (custom VMs, large functions, heavy
    crypto): run `ghiant ./bin/<name>` and read `./decomp/main_*.c`,
-   then follow the call graph.
+   then follow the call graph. Ghidra recovers Go types automatically
+   for Go 1.15–1.23 builds.
 4. Pinpoint the bug class (BoF, fmt-string, UAF, integer overflow, …)
    with concrete file:line references.
 5. Compute offsets and gadgets you need.

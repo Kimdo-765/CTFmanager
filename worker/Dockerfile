@@ -69,6 +69,29 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # than building a full ROP chain when one_gadget conditions hold.
 RUN gem install --no-document one_gadget
 
+# redress — Go-binary aware reverse tooling (https://github.com/goretk/redress).
+# Ghidra 12 already ships Go runtime type databases for 1.15-1.23 in
+# /opt/ghidra/Ghidra/Features/Base/data/typeinfo/golang/, so ghiant
+# decompiles named Go binaries fine. redress complements that for
+# stripped Go binaries: `redress info` reads the Go pclntab to recover
+# Go version + module + package list even when symbols are stripped,
+# and `redress symbols` lists `package.func` names that nm misses.
+# amd64-only (upstream ships no arm64 binary); on non-amd64 hosts the
+# Go pwn/rev path falls back to ghiant alone.
+ARG REDRESS_VERSION=v1.2.65
+RUN ARCH=$(dpkg --print-architecture) \
+ && if [ "$ARCH" = "amd64" ]; then \
+        curl -fsSL "https://github.com/goretk/redress/releases/download/${REDRESS_VERSION}/redress-${REDRESS_VERSION}-linux-amd64.tar.gz" \
+             -o /tmp/redress.tar.gz \
+         && tar -C /usr/local/bin --strip-components=1 \
+                -xzf /tmp/redress.tar.gz "redress-${REDRESS_VERSION}/redress" \
+         && chmod +x /usr/local/bin/redress \
+         && rm -f /tmp/redress.tar.gz \
+         && echo "redress installed: $(redress --version 2>&1 | head -1)"; \
+    else \
+        echo "redress: skipping install on $ARCH (no upstream binary)"; \
+    fi
+
 COPY worker /app/worker
 
 # Expose ghiant as a Bash command so the agent can invoke decompilation
