@@ -378,7 +378,12 @@ async def patch_target(job_id: str, request: Request):
 
     Returns: {"ok": true, "target_url": <new>, "prior": <old>}.
     """
+    # `Path(job_id).name` strips path separators but doesn't reject
+    # ".."/"."/"" — those would resolve to JOBS_DIR's parent or itself.
+    # Be explicit so the audit-log open() can't punch out of the dir.
     safe = Path(job_id).name
+    if safe in ("", ".", "..") or "/" in safe or "\\" in safe:
+        raise HTTPException(status_code=400, detail="invalid job_id")
     meta = read_job_meta(safe)
     if not meta:
         raise HTTPException(status_code=404, detail="job not found")
@@ -401,8 +406,14 @@ async def patch_target(job_id: str, request: Request):
         new_target = clean
 
     prior = meta.get("target_url")
-    meta["target_url"] = new_target
-    write_job_meta(safe, meta)
+    # IMPORTANT: use modules._common.write_meta (read-merge-write at
+    # WRITE time), not api.storage.write_job_meta (which would overwrite
+    # the entire file from this snapshot). The worker holds the meta
+    # for in-flight jobs and writes heartbeat + cost + status updates
+    # constantly; full overwrite from here would clobber any keys the
+    # worker added between our read and our write.
+    from modules._common import write_meta as _merge_write_meta
+    _merge_write_meta(safe, target_url=new_target)
 
     # Audit trail in run.log so the change is visible to the reviewer
     # on a future retry and to anyone tailing the run.

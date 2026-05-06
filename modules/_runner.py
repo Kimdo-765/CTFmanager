@@ -120,12 +120,21 @@ def _wait_with_supervise(
                 "supervise": supervise_result,
             }
 
-        # Stall detection on combined log byte-length.
+        # Stall detection on combined log byte-length. If the docker
+        # socket hiccups and `container.logs()` raises, we have no
+        # signal — treat it as "we don't know" by refreshing
+        # `last_change`. Otherwise a string of fetch failures would
+        # falsely register as a 60s stall and burn one supervise judge
+        # call against an empty buffer.
+        log_fetch_ok = True
         try:
             buf = container.logs(stdout=True, stderr=True)
         except Exception:
             buf = b""
-        if len(buf) != last_size:
+            log_fetch_ok = False
+        if not log_fetch_ok:
+            last_change = time.time()
+        elif len(buf) != last_size:
             last_size = len(buf)
             last_change = time.time()
         elif (
@@ -315,92 +324,106 @@ def attempt_sandbox_run(
 
     enable_judge = _judge_enabled()
 
-    # ---------- Stage 1: prejudge (advisory) ----------
-    # Decision power lives with the main agent — main is expected to
-    # have called the judge subagent itself before finalizing (see the
-    # JUDGE GATE block in mission_block). The orchestrator's prejudge
-    # here is a paper-trail backstop: findings get recorded into
-    # result.json so the retry reviewer can reference them, but the
-    # severity of those findings does NOT block the runner. Hangs /
-    # parse-error scripts are still caught by the supervise stall
-    # watchdog and surfaced by postjudge.
-    prejudge: dict | None = None
-    if enable_judge:
-        try:
-            prejudge = _judge.prejudge_script(
-                work_dir, script_filename, target, log_fn,
-            )
-        except Exception as e:
-            log_fn(f"[judge] prejudge failed: {e}")
-            prejudge = {
-                "ok": True,
-                "severity": "low",
-                "issues": [],
-                "raw": "",
-                "error": str(e),
-            }
-        if prejudge and not prejudge.get("ok") and prejudge.get("severity") == "high":
-            log_fn(
-                f"[runner] prejudge advisory: severity=high, "
-                f"{len(prejudge.get('issues') or [])} issues — "
-                f"running anyway (main owns the gate; supervise + "
-                f"postjudge will backstop)"
-            )
-
-    # ---------- Stage 2: actual run ----------
-    args = [target] if target else []
-    log_fn(
-        f"[runner] executing {script_filename} "
-        f"(target={target}, sage={use_sage}, judge={enable_judge}) ..."
-    )
+    # The judge stages share one Claude session via session_id resume.
+    # `prejudge_script` writes a sid into _judge._session_ids; postjudge
+    # clears it on its happy path. If anything between the two raises
+    # before postjudge fires, the sid would otherwise leak into the
+    # module-level dict for the worker process's lifetime. Wrap in
+    # try/finally so cleanup is unconditional.
     try:
-        res = run_in_sandbox(
-            job_id, script_filename, args=args, use_sage=use_sage,
-            log_fn=log_fn, enable_judge=enable_judge,
+        # ---------- Stage 1: prejudge (advisory) ----------
+        # Decision power lives with the main agent — main is expected to
+        # have called the judge subagent itself before finalizing (see the
+        # JUDGE GATE block in mission_block). The orchestrator's prejudge
+        # here is a paper-trail backstop: findings get recorded into
+        # result.json so the retry reviewer can reference them, but the
+        # severity of those findings does NOT block the runner. Hangs /
+        # parse-error scripts are still caught by the supervise stall
+        # watchdog and surfaced by postjudge.
+        prejudge: dict | None = None
+        if enable_judge:
+            try:
+                prejudge = _judge.prejudge_script(
+                    work_dir, script_filename, target, log_fn,
+                )
+            except Exception as e:
+                log_fn(f"[judge] prejudge failed: {e}")
+                prejudge = {
+                    "ok": True,
+                    "severity": "low",
+                    "issues": [],
+                    "raw": "",
+                    "error": str(e),
+                }
+            if prejudge and not prejudge.get("ok") and prejudge.get("severity") == "high":
+                log_fn(
+                    f"[runner] prejudge advisory: severity=high, "
+                    f"{len(prejudge.get('issues') or [])} issues — "
+                    f"running anyway (main owns the gate; supervise + "
+                    f"postjudge will backstop)"
+                )
+
+        # ---------- Stage 2: actual run ----------
+        args = [target] if target else []
+        log_fn(
+            f"[runner] executing {script_filename} "
+            f"(target={target}, sage={use_sage}, judge={enable_judge}) ..."
         )
-    except Exception as e:
-        log_fn(f"[runner] failed to spawn sandbox: {e}")
-        return {"error": str(e), "prejudge": prejudge}
-
-    log_fn(
-        f"[runner] exit_code={res['exit_code']}; "
-        f"stdout {len(res['stdout'])}B / stderr {len(res['stderr'])}B"
-    )
-
-    # Write logs to job dir (unchanged contract for downstream tools).
-    (work_dir / f"{script_filename}.stdout").write_text(res["stdout"])
-    (work_dir / f"{script_filename}.stderr").write_text(res["stderr"])
-
-    # ---------- Stage 3: postjudge ----------
-    if enable_judge:
-        extra = ""
-        if res.get("timeout"):
-            extra = "(runner timeout fired before container exit)\n"
-        elif res.get("killed_by_supervise"):
-            extra = (
-                "(supervise judge killed the container due to stalled "
-                "output)\n"
-            )
         try:
-            post = _judge.postjudge_run(
-                work_dir,
-                script_filename,
-                res["exit_code"],
-                res["stdout"],
-                res["stderr"],
-                log_fn,
-                extra_context=extra,
+            res = run_in_sandbox(
+                job_id, script_filename, args=args, use_sage=use_sage,
+                log_fn=log_fn, enable_judge=enable_judge,
             )
         except Exception as e:
-            log_fn(f"[judge] postjudge failed: {e}")
-            post = {
-                "verdict": "unknown",
-                "summary": "",
-                "retry_hint": "",
-                "raw": "",
-                "error": str(e),
-            }
-        res["judge"] = post
-    if prejudge is not None:
-        res["prejudge"] = prejudge
-    return res
+            log_fn(f"[runner] failed to spawn sandbox: {e}")
+            return {"error": str(e), "prejudge": prejudge}
+
+        log_fn(
+            f"[runner] exit_code={res['exit_code']}; "
+            f"stdout {len(res['stdout'])}B / stderr {len(res['stderr'])}B"
+        )
+
+        # Write logs to job dir (unchanged contract for downstream tools).
+        (work_dir / f"{script_filename}.stdout").write_text(res["stdout"])
+        (work_dir / f"{script_filename}.stderr").write_text(res["stderr"])
+
+        # ---------- Stage 3: postjudge ----------
+        if enable_judge:
+            extra = ""
+            if res.get("timeout"):
+                extra = "(runner timeout fired before container exit)\n"
+            elif res.get("killed_by_supervise"):
+                extra = (
+                    "(supervise judge killed the container due to stalled "
+                    "output)\n"
+                )
+            try:
+                post = _judge.postjudge_run(
+                    work_dir,
+                    script_filename,
+                    res["exit_code"],
+                    res["stdout"],
+                    res["stderr"],
+                    log_fn,
+                    extra_context=extra,
+                )
+            except Exception as e:
+                log_fn(f"[judge] postjudge failed: {e}")
+                post = {
+                    "verdict": "unknown",
+                    "summary": "",
+                    "retry_hint": "",
+                    "raw": "",
+                    "error": str(e),
+                }
+            res["judge"] = post
+        if prejudge is not None:
+            res["prejudge"] = prejudge
+        return res
+    finally:
+        # postjudge_run already calls _forget_sid on its happy path —
+        # this is the safety net for early-exit / exception paths.
+        try:
+            _judge._forget_sid(job_id)
+        except Exception:
+            pass
