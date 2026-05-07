@@ -149,27 +149,34 @@ async def _run_agent(
         watchdog.cancel()
         if read_meta(job_id).get("awaiting_decision"):
             write_meta(job_id, awaiting_decision=False)
-
-    fallback_dirs = prior_work_dirs(job_id)
-    found = collect_outputs(
-        work_dir, ["solver.py", "report.md"], fallback_dirs=fallback_dirs,
-    )
-    summary["solver_present"] = "solver.py" in found
-    summary["report_present"] = "report.md" in found
-    summary["decomp_used"] = (work_dir / "decomp").exists()
-    if summary["decomp_used"]:
+        # Carry artifacts up to the job dir. Runs in `finally` so any
+        # abrupt exit (RQ stop / Stop&Resume / SIGTERM-with-grace) still
+        # flushes solver.py / report.md into <jobdir>/, where the API's
+        # file links look. Wrapped in its own try/except so a copy
+        # failure can't mask the real agent error in summary.
         try:
-            summary["decomp_function_count"] = len(list((work_dir / "decomp").glob("*.c")))
-        except Exception:
-            pass
-    jd = job_dir(job_id)
-    for name, src in found.items():
-        target = jd / name
-        if src.resolve() != target.resolve():
-            target.write_bytes(src.read_bytes())
-        work_target = work_dir / name
-        if src.resolve() != work_target.resolve():
-            work_target.write_bytes(src.read_bytes())
+            fallback_dirs = prior_work_dirs(job_id)
+            found = collect_outputs(
+                work_dir, ["solver.py", "report.md"], fallback_dirs=fallback_dirs,
+            )
+            summary["solver_present"] = "solver.py" in found
+            summary["report_present"] = "report.md" in found
+            summary["decomp_used"] = (work_dir / "decomp").exists()
+            if summary["decomp_used"]:
+                try:
+                    summary["decomp_function_count"] = len(list((work_dir / "decomp").glob("*.c")))
+                except Exception:
+                    pass
+            jd = job_dir(job_id)
+            for name, src in found.items():
+                target = jd / name
+                if src.resolve() != target.resolve():
+                    target.write_bytes(src.read_bytes())
+                work_target = work_dir / name
+                if src.resolve() != work_target.resolve():
+                    work_target.write_bytes(src.read_bytes())
+        except Exception as carry_err:
+            log_line(job_id, f"CARRY_ERROR: {carry_err}")
     return summary
 
 

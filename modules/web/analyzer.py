@@ -154,34 +154,41 @@ async def _run_agent(
         # the job has finished and the user no longer needs to decide.
         if read_meta(job_id).get("awaiting_decision"):
             write_meta(job_id, awaiting_decision=False)
-
-    jd = job_dir(job_id)
-    # Prefer the agent's cwd, but also check /root/, the job root, and
-    # any prior-attempt work dirs (for retry/resume — the forked SDK
-    # session sometimes re-uses absolute paths from the prior tool
-    # history and silently writes into the OLD job dir).
-    fallback_dirs = prior_work_dirs(job_id)
-    found = collect_outputs(
-        work_dir, ["exploit.py", "report.md"], fallback_dirs=fallback_dirs,
-    )
-    if "exploit.py" not in found and (jd / "exploit.py").is_file():
-        found["exploit.py"] = jd / "exploit.py"
-    if "report.md" not in found and (jd / "report.md").is_file():
-        found["report.md"] = jd / "report.md"
-    summary["exploit_present"] = "exploit.py" in found
-    summary["report_present"] = "report.md" in found
-    for name, src in found.items():
-        target = jd / name
-        if src.resolve() != target.resolve():
-            target.write_bytes(src.read_bytes())
-        # Mirror into work_dir too — the next /retry uses
-        # `<this_job>/work/` as its carry source via shutil.copytree,
-        # so without this any fallback recovery (file actually written
-        # to a stale absolute path) would be carried as a stale copy
-        # AGAIN on the next retry.
-        work_target = work_dir / name
-        if src.resolve() != work_target.resolve():
-            work_target.write_bytes(src.read_bytes())
+        # Carry artifacts up to the job dir. Runs in `finally` so any
+        # abrupt exit (RQ stop / Stop&Resume / SIGTERM-with-grace) still
+        # flushes exploit.py / report.md into <jobdir>/, where the API's
+        # file links look. Wrapped in its own try/except so a copy
+        # failure can't mask the real agent error in summary.
+        try:
+            jd = job_dir(job_id)
+            # Prefer the agent's cwd, but also check /root/, the job root, and
+            # any prior-attempt work dirs (for retry/resume — the forked SDK
+            # session sometimes re-uses absolute paths from the prior tool
+            # history and silently writes into the OLD job dir).
+            fallback_dirs = prior_work_dirs(job_id)
+            found = collect_outputs(
+                work_dir, ["exploit.py", "report.md"], fallback_dirs=fallback_dirs,
+            )
+            if "exploit.py" not in found and (jd / "exploit.py").is_file():
+                found["exploit.py"] = jd / "exploit.py"
+            if "report.md" not in found and (jd / "report.md").is_file():
+                found["report.md"] = jd / "report.md"
+            summary["exploit_present"] = "exploit.py" in found
+            summary["report_present"] = "report.md" in found
+            for name, src in found.items():
+                target = jd / name
+                if src.resolve() != target.resolve():
+                    target.write_bytes(src.read_bytes())
+                # Mirror into work_dir too — the next /retry uses
+                # `<this_job>/work/` as its carry source via shutil.copytree,
+                # so without this any fallback recovery (file actually written
+                # to a stale absolute path) would be carried as a stale copy
+                # AGAIN on the next retry.
+                work_target = work_dir / name
+                if src.resolve() != work_target.resolve():
+                    work_target.write_bytes(src.read_bytes())
+        except Exception as carry_err:
+            log_line(job_id, f"CARRY_ERROR: {carry_err}")
     return summary
 
 

@@ -143,26 +143,33 @@ async def _run_agent(
         watchdog.cancel()
         if read_meta(job_id).get("awaiting_decision"):
             write_meta(job_id, awaiting_decision=False)
-
-    jd = job_dir(job_id)
-    fallback_dirs = prior_work_dirs(job_id)
-    found = collect_outputs(
-        work_dir, ["solver.py", "solver.sage", "report.md"],
-        fallback_dirs=fallback_dirs,
-    )
-    for name in ("solver.py", "solver.sage", "report.md"):
-        if name not in found and (jd / name).is_file():
-            found[name] = jd / name
-    summary["solver_present"] = ("solver.py" in found) or ("solver.sage" in found)
-    summary["sage_solver"] = ("solver.sage" in found) and ("solver.py" not in found)
-    summary["report_present"] = "report.md" in found
-    for name, src in found.items():
-        target = jd / name
-        if src.resolve() != target.resolve():
-            target.write_bytes(src.read_bytes())
-        work_target = work_dir / name
-        if src.resolve() != work_target.resolve():
-            work_target.write_bytes(src.read_bytes())
+        # Carry artifacts up to the job dir. Runs in `finally` so any
+        # abrupt exit (RQ stop / Stop&Resume / SIGTERM-with-grace) still
+        # flushes solver.{py,sage} / report.md into <jobdir>/. Wrapped
+        # in its own try/except so a copy failure can't mask the real
+        # agent error in summary.
+        try:
+            jd = job_dir(job_id)
+            fallback_dirs = prior_work_dirs(job_id)
+            found = collect_outputs(
+                work_dir, ["solver.py", "solver.sage", "report.md"],
+                fallback_dirs=fallback_dirs,
+            )
+            for name in ("solver.py", "solver.sage", "report.md"):
+                if name not in found and (jd / name).is_file():
+                    found[name] = jd / name
+            summary["solver_present"] = ("solver.py" in found) or ("solver.sage" in found)
+            summary["sage_solver"] = ("solver.sage" in found) and ("solver.py" not in found)
+            summary["report_present"] = "report.md" in found
+            for name, src in found.items():
+                target = jd / name
+                if src.resolve() != target.resolve():
+                    target.write_bytes(src.read_bytes())
+                work_target = work_dir / name
+                if src.resolve() != work_target.resolve():
+                    work_target.write_bytes(src.read_bytes())
+        except Exception as carry_err:
+            log_line(job_id, f"CARRY_ERROR: {carry_err}")
     return summary
 
 

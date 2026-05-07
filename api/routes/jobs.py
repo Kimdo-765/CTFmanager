@@ -289,10 +289,17 @@ def get_job_log(job_id: str, tail: int | None = None):
 @router.get("/{job_id}/file/{name}")
 def get_job_file(job_id: str, name: str):
     safe = Path(name).name
-    f = JOBS_DIR / job_id / safe
-    if not f.exists():
-        raise HTTPException(status_code=404, detail="file not found")
-    return FileResponse(str(f))
+    jd = JOBS_DIR / job_id
+    # Primary location: <jobdir>/<name>, populated by the analyzer's
+    # carry step at the end of _run_agent. If the run was killed mid-
+    # flight (RQ stop / Stop&Resume / SIGKILL) the carry never ran but
+    # the artifact is still in <jobdir>/work/<name>. Fall back there
+    # so the UI's file links work for stopped jobs too.
+    candidates = [jd / safe, jd / "work" / safe]
+    for f in candidates:
+        if f.is_file():
+            return FileResponse(str(f))
+    raise HTTPException(status_code=404, detail="file not found")
 
 
 @router.get("/{job_id}/result")
