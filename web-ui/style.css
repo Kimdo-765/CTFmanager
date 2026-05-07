@@ -671,6 +671,28 @@ button[type="submit"], #refresh-jobs {
   letter-spacing: 0.2px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.run-log-tz-toggle {
+  margin-left: auto;
+  background: #21262d;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  padding: 0.1rem 0.5rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.4px;
+  cursor: pointer;
+  user-select: none;
+  flex: 0 0 auto;
+}
+.run-log-tz-toggle:hover {
+  background: #30363d;
+  border-color: #484f58;
+  color: #f0f6fc;
+}
+.run-log-tz-toggle:active {
+  background: #161b22;
+}
 
 /* The <pre.run-log> sitting inside the window frame */
 .run-log-window .run-log {

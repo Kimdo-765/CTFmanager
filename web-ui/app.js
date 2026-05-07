@@ -43,6 +43,25 @@ function fillModelSelects() {
 
 let selectedJob = null;
 let pollTimer = null;
+
+// Run-log timestamp display mode. Logs are written in UTC by the
+// orchestrator (`[HH:MM:SS]`). Default is UTC so behavior is
+// unchanged for users who haven't opted in. The toggle button in
+// the run-log titlebar flips this and triggers a re-render.
+let runlogTz = (() => {
+  try { return localStorage.getItem("runlog_tz") || "utc"; }
+  catch (_) { return "utc"; }
+})();
+function _setRunlogTz(tz) {
+  if (tz !== "utc" && tz !== "local") tz = "utc";
+  runlogTz = tz;
+  try { localStorage.setItem("runlog_tz", tz); } catch (_) {}
+  if (selectedJob) renderJob(selectedJob, { force: true });
+}
+function _localTzName() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "local"; }
+  catch (_) { return "local"; }
+}
 // Lightweight 1-second tick that updates ONLY the timing pill's
 // textContent on running jobs. Independent of pollTimer (which
 // re-renders the whole detail panel and is paused on selection /
@@ -1085,8 +1104,11 @@ async function renderJob(id, opts = {}) {
         <span class="run-log-dot run-log-dot-y"></span>
         <span class="run-log-dot run-log-dot-g"></span>
         <span class="run-log-title">job ${escapeHtml(id)} — ${escapeHtml(job.module || "?")}</span>
+        <button class="run-log-tz-toggle" data-action="toggle-tz"
+                title="Toggle run-log timestamps (UTC ↔ ${escapeHtml(_localTzName())})"
+        >${runlogTz === "utc" ? "UTC" : "Local"}</button>
       </div>
-      <pre class="run-log" data-job-id="${id}" data-status="${escapeHtml(job.status || "")}">${log ? colorizeRunLog(log) : "(empty)"}</pre>
+      <pre class="run-log" data-job-id="${id}" data-status="${escapeHtml(job.status || "")}">${log ? colorizeRunLog(log, job.started_at) : "(empty)"}</pre>
       ${livenessPill || tokensPill ? `
       <div class="run-log-footer">
         ${livenessPill}
@@ -1246,6 +1268,13 @@ async function renderJob(id, opts = {}) {
     });
   }
 
+  const tzBtn = detail.querySelector('.run-log-tz-toggle[data-action="toggle-tz"]');
+  if (tzBtn) {
+    tzBtn.addEventListener("click", () => {
+      _setRunlogTz(runlogTz === "utc" ? "local" : "utc");
+    });
+  }
+
   for (const btn of detail.querySelectorAll(".copy-btn")) {
     btn.addEventListener("click", async () => {
       const flag = btn.dataset.flag;
@@ -1332,7 +1361,42 @@ const _RUNLOG_PATTERNS = [
     render: (m) => `<span class="rl-lifecycle rl-system">${escapeHtml(m[1])}</span>` },
 ];
 
-function _colorizeRunLogLine(line) {
+// Format a `HH:MM:SS` timestamp for display. The on-disk log records
+// UTC time-of-day only; this helper anchors the time-of-day on the
+// job's `started_at` UTC date, advances the day-counter on midnight
+// rollover, and (in local mode) converts to the user's timezone via
+// the browser's Date object. State is per-render, mutated as the
+// caller walks lines top-to-bottom.
+function _formatLogTs(hms, anchor, state) {
+  const parts = hms.split(":");
+  if (parts.length !== 3) return hms;
+  const hh = +parts[0], mm = +parts[1], ss = +parts[2];
+  if (Number.isNaN(hh) || Number.isNaN(mm) || Number.isNaN(ss)) return hms;
+  const sod = hh * 3600 + mm * 60 + ss;
+  // Day rollover: if the new line's seconds-of-day is well below
+  // the last seen, assume we crossed at least one UTC midnight. The
+  // 60-second slack tolerates concurrent-thread log lines arriving a
+  // hair out of order so we don't mistakenly bump the day counter.
+  if (state.lastSod >= 0 && sod < state.lastSod - 60) {
+    state.dayOffset += 1;
+  }
+  state.lastSod = sod;
+  if (runlogTz !== "local" || !anchor) {
+    return hms;
+  }
+  const d = new Date(Date.UTC(
+    anchor.getUTCFullYear(),
+    anchor.getUTCMonth(),
+    anchor.getUTCDate() + state.dayOffset,
+    hh, mm, ss,
+  ));
+  const h = String(d.getHours()).padStart(2, "0");
+  const m = String(d.getMinutes()).padStart(2, "0");
+  const s = String(d.getSeconds()).padStart(2, "0");
+  return `${h}:${m}:${s}`;
+}
+
+function _colorizeRunLogLine(line, anchor, state) {
   // Header injected by /api/jobs/{id}/log?tail=… (e.g. "…(showing last X
   // of Y bytes — download full log via …)…"). Render dim+italic.
   if (line.startsWith("…(showing last")) {
@@ -1343,7 +1407,7 @@ function _colorizeRunLogLine(line) {
     if (!line) return "";
     return `<span class="rl-system">${escapeHtml(line)}</span>`;
   }
-  const ts = m[1];
+  const ts = _formatLogTs(m[1], anchor, state);
   let rest = m[2];
 
   // Per-line agent tag: analyzers prefix lines from the main vs the
@@ -1374,9 +1438,20 @@ function _colorizeRunLogLine(line) {
   return `<span class="rl-ts">[${ts}]</span> ${agentChip}${indent}<span class="rl-system">${escapeHtml(rest)}</span>`;
 }
 
-function colorizeRunLog(text) {
+function colorizeRunLog(text, anchorIso) {
   if (!text) return "";
-  return text.split("\n").map(_colorizeRunLogLine).join("\n");
+  let anchor = null;
+  if (anchorIso) {
+    const d = new Date(anchorIso);
+    if (!Number.isNaN(d.getTime())) anchor = d;
+  }
+  // dayOffset / lastSod are mutated by _formatLogTs as we walk lines
+  // top-to-bottom; reset for each call so toggling between jobs (or
+  // re-rendering after a TZ flip) starts clean.
+  const state = { dayOffset: 0, lastSod: -1 };
+  return text.split("\n").map(
+    (line) => _colorizeRunLogLine(line, anchor, state),
+  ).join("\n");
 }
 
 // --- File preview modal -----------------------------------------------------
