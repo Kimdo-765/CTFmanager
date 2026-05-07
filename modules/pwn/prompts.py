@@ -73,9 +73,13 @@ Suggested workflow:
    For Go: prefer `objdump -d -j .text ./bin/<name> | grep -E "^[0-9a-f]+ <main\."`
    to filter to `main.*` symbols only.
 3. If the logic is non-trivial (custom VMs, large functions, heavy
-   crypto): run `ghiant ./bin/<name>` and read `./decomp/main_*.c`,
-   then follow the call graph. Ghidra recovers Go types automatically
-   for Go 1.15–1.23 builds.
+   crypto): run `ghiant ./bin/<name>` to populate `./decomp/`. Then
+   IMMEDIATELY delegate the first pass to recon — ask for the function
+   inventory + ranked vulnerability candidates (see "Decomp triage" below).
+   DO NOT read `./decomp/*.c` yourself for first-pass triage; recon's
+   ≤2 KB summary is the entry point. Read individual `.c` files only
+   for the HIGH/MED candidates recon flagged. Ghidra recovers Go types
+   automatically for Go 1.15–1.23 builds.
 4. Pinpoint the bug class (BoF, fmt-string, UAF, integer overflow, …)
    with concrete file:line references.
 5. Compute offsets and gadgets you need.
@@ -139,9 +143,16 @@ DELEGATE TO recon WHEN:
 - gadget hunting: "from `./libc.so` find {ldr x0,[sp,#X]; ldr x30,[sp];
   ret} gadgets and {svc 0; ret}. Return up to 10 of each with the
   exact register offsets.";
-- decomp walk: "run ghiant on ./bin/<name> if ./decomp/ is empty,
-  then summarize what `vuln()` / `read_input()` / `proc_init()` do
-  in ≤12 lines with file:line refs and the key constants";
+- decomp triage (FIRST PASS — ALWAYS delegate this, never read
+  ./decomp/*.c yourself for first-look): "run ghiant on
+  ./bin/<name> if ./decomp/ is empty, then return the decomp triage
+  protocol — FUNCTIONS inventory + CANDIDATES (ranked HIGH/MED/LOW
+  with bug class + file:line) + NEXT recommendation. Skip libc/Go-
+  runtime helpers.";
+- decomp deep-dive (AFTER triage — only on the candidate(s) main
+  decided to dig into): "summarize what `vuln()` / `read_input()` /
+  `proc_init()` do in ≤12 lines with file:line refs and the key
+  constants";
 - rootfs unpacking: "extract `./challenge/rootfs` (gzipped cpio) into
   ./rootfs/ and return what `etc/inetd.conf` + `etc/services` say
   about the chal service";
@@ -155,19 +166,30 @@ DELEGATE TO recon WHEN:
   gdb-multiarch (set arch aarch64), break at `<vmaddr>`, dump x0..x7
   + sp + 0x40 stack words. Return only the values."
 
-DECOMP IS A FIRST-CLASS INPUT, USE IT:
+DECOMP IS A FIRST-CLASS INPUT, USE IT — BUT THROUGH RECON:
 The `ghiant` Bash wrapper writes per-function `.c` files into ./decomp/.
-That tree is YOUR primary source for understanding the binary — don't
-read raw `objdump -d` output for `main` / `vuln` / etc. when a
-decompiled `.c` for the same function exists. Typical flow:
+That tree is your primary source for understanding the binary, BUT
+reading 50–500 .c files yourself blows up your context and burns the
+clock. Recon does the wide read; you do the narrow read.
 
   1. Quick triage by you: `file`, `pwn checksec`, `strings | head`.
-  2. If decomp/ doesn't exist yet AND raw disasm is dense, delegate
-     to recon: `Agent(subagent_type="recon", prompt="run ghiant on ./bin/<name> and
-     summarize main / vuln / read_input / proc_init with sizes,
-     constants, sinks. ≤12 lines.")`.
-  3. Only re-grep ./decomp/*.c yourself for the specific call site
-     that the recon summary pointed at — don't open every file.
+  2. Delegate decomp triage to recon FIRST, even if you think you
+     already know the bug class:
+       Agent(subagent_type="recon",
+             prompt="run ghiant on ./bin/<name> if ./decomp/ is empty,
+                     then return the decomp triage protocol —
+                     FUNCTIONS inventory + CANDIDATES (HIGH/MED/LOW
+                     with bug class + file:line) + NEXT
+                     recommendation. Skip libc/Go-runtime helpers.")
+     Recon returns ≤2 KB: the function list and the 1-5 functions
+     you should actually read.
+  3. Read ONLY the HIGH/MED candidate `.c` file(s) recon flagged.
+     If you need a deeper summary of one candidate without reading
+     the full file, ask recon for a deep-dive on that one function.
+  4. NEVER read every `./decomp/*.c` — that's recon's job, not yours.
+     If you find yourself opening a third `.c` file that recon didn't
+     flag, you're off-path; ask recon "did I miss something in
+     <function X>?" instead.
 
 KEEP DOING YOURSELF (don't delegate):
 - writing exploit.py / report.md (recon CANNOT Write);

@@ -68,7 +68,12 @@ Suggested workflow:
    prompts. For Go: filter to `main.*` symbols with
    `objdump -d -j .text ./bin/<name> | grep -E "^[0-9a-f]+ <main\."`.
 3. If logic is non-trivial (custom VMs, big functions, heavy crypto):
-   run `ghiant ./bin/<name>` and trace through `./decomp/main_*.c`.
+   run `ghiant ./bin/<name>` to populate `./decomp/`. Then IMMEDIATELY
+   delegate the first pass to recon — ask for the function inventory
+   + ranked CANDIDATES (interesting check / decode / VM functions; see
+   "Decomp triage" below). DO NOT read `./decomp/*.c` yourself for
+   first-pass triage; recon's ≤2 KB summary is the entry point. Read
+   individual `.c` files only for the candidates recon flagged.
    Ghidra recovers Go types automatically for Go 1.15–1.23 builds.
 4. Decide between two solver strategies and pick the simpler one:
    a. Forward-simulate the algorithm in Python (when the program
@@ -98,7 +103,14 @@ whenever investigation would dump >2 KB of raw output into your own
 context.
 
 DELEGATE TO recon WHEN:
-- "summarize what `verify_input()` does in 8 lines with the key
+- decomp triage (FIRST PASS — ALWAYS delegate this, never read
+  ./decomp/*.c yourself for first-look): "run ghiant on
+  ./bin/<name> if ./decomp/ is empty, then return the decomp triage
+  protocol — FUNCTIONS inventory + CANDIDATES (ranked HIGH/MED/LOW
+  with role: check / decode / VM-step / key-derivation / etc. +
+  file:line) + NEXT recommendation. Skip libc/Go-runtime helpers.";
+- decomp deep-dive (AFTER triage, on the candidate main picked):
+  "summarize what `verify_input()` does in 8 lines with the key
   constants and operations, file:line refs";
 - "find every function that XORs against a constant in ./decomp/.
   Return func:address and the constant.";
@@ -110,19 +122,30 @@ DELEGATE TO recon WHEN:
   arch), break at the check function, dump the comparison registers,
   return the observed expected value".
 
-DECOMP IS A FIRST-CLASS INPUT, USE IT:
+DECOMP IS A FIRST-CLASS INPUT, USE IT — BUT THROUGH RECON:
 The `ghiant` wrapper writes per-function `.c` files to ./decomp/.
-Prefer those over raw `objdump -d` once you've located the function
-of interest. Typical flow:
+That tree is your primary source for understanding the binary, BUT
+reading 50–500 .c files yourself blows up your context and burns the
+clock. Recon does the wide read; you do the narrow read.
 
   1. Quick triage by you: `file`, `strings | head`, run with sample
      input to see prompts.
-  2. If decomp/ is empty AND the disasm is dense, delegate:
-     `Agent(subagent_type="recon", prompt="run ghiant on ./bin/<name>; summarize main /
-     check / decode (or whatever you find) in ≤12 lines with
-     file:line refs and any key constants/operations.")`.
-  3. Re-grep ./decomp/*.c yourself only for the exact call site the
-     recon summary pointed at.
+  2. Delegate decomp triage to recon FIRST:
+       Agent(subagent_type="recon",
+             prompt="run ghiant on ./bin/<name> if ./decomp/ is empty,
+                     then return the decomp triage protocol —
+                     FUNCTIONS inventory + CANDIDATES (with role:
+                     check/decode/VM-step/key-derivation + file:line)
+                     + NEXT recommendation. Skip libc/Go-runtime
+                     helpers.")
+     Recon returns ≤2 KB: the function list and the 1-5 functions
+     you should actually read.
+  3. Read ONLY the candidate `.c` file(s) recon flagged. Need a
+     deeper summary of one candidate without reading the file? Ask
+     recon for a deep-dive on that one function.
+  4. NEVER read every `./decomp/*.c` — that's recon's job. If you're
+     opening a third `.c` file recon didn't flag, ask recon "did I
+     miss something?" instead.
 
 KEEP DOING YOURSELF (don't delegate):
 - writing solver.py / report.md (recon CANNOT Write);

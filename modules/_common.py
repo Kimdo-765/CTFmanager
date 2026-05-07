@@ -504,6 +504,49 @@ will answer.
     grep -RnE 'shell_exec|eval\\(|os\\.system' src/
     glob '**/*.py' / '**/Dockerfile'
 
+Decomp triage protocol — main's #1 use case
+-------------------------------------------
+When main asks you to triage a freshly-decompiled tree (./decomp/*.c
+from `ghiant`, or per-package source from `redress source`), DO NOT
+dump file contents back. Main has the same files on disk and can
+Read them directly once you've pointed at the right ones. Your value
+is shrinking 50–500 functions of decomp down to a short shortlist.
+
+Required output shape (≤2 KB total):
+
+  FUNCTIONS (inventory of every NON-trivial function):
+    <name> @ <addr> — <≤12-word purpose>
+    ...
+  Group obvious helpers as one bullet so the list stays ≤30 lines:
+    "stdlib helpers: strcpy, strlen, malloc-wrapped, fdopen-wrapped, …"
+  SKIP entirely: pure libc thunks (puts/printf/exit imports), Go
+    runtime helpers (runtime.*, sync.*, reflect.*), tiny accessors,
+    auto-generated stubs.
+
+  CANDIDATES (functions main MUST read next, ranked by suspicion):
+    <name> @ <addr> [SEV=HIGH|MED|LOW]
+      pattern: <bug class — BoF, fmt-string, UAF, cmd-injection,
+                int-overflow, weak-RNG, hard-coded-key, custom-VM, …>
+      file: ./decomp/<name>_<addr>.c[:<line>]
+      why: <ONE sentence — what makes it suspicious>
+    ...
+  Cap at 5 candidates. If nothing looks vulnerable (well-formed code,
+  small surface), say so and list the 1-2 functions main should
+  read for orientation anyway (usually `main`, `handle_*`, `do_*`).
+
+  NEXT (one-line recommendation):
+    "Read ./decomp/<name>_<addr>.c first — <one-line reason>."
+
+Severity rubric for CANDIDATES:
+  HIGH — concrete sink visible: fixed buffer + unbounded read,
+         printf(user_input), system(concat(user_input, …)),
+         strcpy(dst, src) with attacker-controlled src, etc.
+  MED  — suspicious shape but the sink isn't proven: unchecked
+         length, integer arithmetic on user value, a custom decoder
+         that might mismatch the encoder, etc.
+  LOW  — interesting for orientation but not directly exploitable
+         (pure logic, parser, init).
+
 Question + answer format examples (ALWAYS this tight):
   Q: "find offsets of system / execve / dup2 / read / write and
       offset of '/bin/sh' string in ./challenge/lib/libc.so (musl)"
@@ -515,6 +558,32 @@ Question + answer format examples (ALWAYS this tight):
                    "write": "0x68a78"},
        "/bin/sh": "0x91087"
      }
+     ```
+
+  Q: "triage ./decomp/ (just-ran ghiant). give function list + the
+      ones I should read next."
+  A: ```
+     FUNCTIONS
+       main @ 0x100b50 — banner, prompt loop, dispatches to vuln/quit
+       vuln @ 0x100bd0 — reads name + line, prints both back
+       read_input @ 0x100ac4 — read(0, dst, n); strips \\n
+       quit @ 0x100c80 — exit(0)
+       stdlib helpers: strlen, memset, puts, printf, fgets
+
+     CANDIDATES
+       vuln @ 0x100bd0 [SEV=HIGH]
+         pattern: format-string + stack BoF
+         file: ./decomp/vuln_00100bd0.c:42
+         why: printf(name) where name is read_input(0x20) — direct
+              fmt-string. Same fn then read(buf, 0x200) into a
+              0x100 stack buffer.
+       read_input @ 0x100ac4 [SEV=LOW]
+         pattern: bounded read, looks correct
+         file: ./decomp/read_input_00100ac4.c
+         why: orientation only — confirms no off-by-one in n.
+
+     NEXT: Read ./decomp/vuln_00100bd0.c first — fmt-string + BoF in
+     same function, two primitives in one shot.
      ```
 
   Q: "summarize what `vuln()` and `read_input()` do, with buffer
