@@ -6,34 +6,17 @@ from pathlib import Path
 from typing import Optional
 
 import anyio
-from claude_agent_sdk import (
-    AssistantMessage,
-    SystemMessage,
-    ClaudeAgentOptions,
-    ResultMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
-    query,
-)
+from claude_agent_sdk import ClaudeAgentOptions
 
 from modules._common import (
-    agent_heartbeat,
-    agent_tag,
-    budget_exceeded,
     build_recon_agents,
-    capture_session_id,
-    classify_agent_error,
     collect_outputs,
     extract_cost,
-    format_tool_result,
     job_dir,
     log_line,
-    log_thinking,
     prior_work_dirs,
     read_meta,
+    run_main_agent_session,
     scan_job_for_flags,
     soft_timeout_watchdog,
     write_meta,
@@ -89,62 +72,26 @@ async def _run_agent(
     soft_timeout = int(read_meta(job_id).get("job_timeout") or 0)
     watchdog = asyncio.create_task(soft_timeout_watchdog(job_id, soft_timeout))
 
+    sandbox_result: Optional[dict] = None
+
+    def _sandbox_for(script_name: str) -> Optional[dict]:
+        # attempt_sandbox_run is sync; the helper calls it via anyio.to_thread.
+        return attempt_sandbox_run(
+            job_id, script_name, target, lambda s: log_line(job_id, s),
+        )
+
     try:
-        async for msg in query(prompt=user_prompt, options=options):
-            capture_session_id(msg, job_id)
-            agent_heartbeat(job_id, msg)
-            if isinstance(msg, AssistantMessage):
-                summary["messages"] += 1
-                tag = agent_tag(msg)
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        log_line(job_id, f"[{tag}] AGENT: {block.text[:500]}")
-                    elif isinstance(block, ToolUseBlock):
-                        summary["tool_calls"] += 1
-                        args_preview = json.dumps(block.input)[:200]
-                        log_line(
-                            job_id,
-                            f"[{tag}] TOOL {block.name}: {args_preview}",
-                        )
-                    elif isinstance(block, ThinkingBlock):
-                        log_thinking(
-                            lambda s, _t=tag: log_line(job_id, f"[{_t}] {s}"),
-                            "THINK", block.thinking,
-                        )
-            elif isinstance(msg, UserMessage):
-                tag = agent_tag(msg)
-                content = msg.content if isinstance(msg.content, list) else []
-                for block in content:
-                    if isinstance(block, ToolResultBlock):
-                        log_line(
-                            job_id,
-                            f"[{tag}] " + format_tool_result(block.content, block.is_error),
-                        )
-            if budget_exceeded(summary["tool_calls"], work_dir, ("exploit.py",)):
-                log_line(
-                    job_id,
-                    "BUDGET_ABORT: investigation budget exceeded "
-                    f"({summary['tool_calls']} tool calls, no exploit.py). "
-                    "Stopping early — retry with a hint to push the agent "
-                    "past the analysis loop.",
-                )
-                summary["agent_error"] = "investigation budget exceeded"
-                summary["agent_error_kind"] = "budget"
-                break
-            if isinstance(msg, ResultMessage):
-                summary["result"] = {
-                    "duration_ms": msg.duration_ms,
-                    "num_turns": msg.num_turns,
-                    "total_cost_usd": msg.total_cost_usd,
-                    "is_error": msg.is_error,
-                }
-                log_line(job_id, f"DONE: {summary['result']}")
-    except Exception as e:
-        msg_text = str(e)
-        kind = classify_agent_error(msg_text)
-        summary["agent_error"] = msg_text
-        summary["agent_error_kind"] = kind
-        log_line(job_id, f"AGENT_ERROR ({kind}): {msg_text[:400]}")
+        sandbox_result = await run_main_agent_session(
+            job_id,
+            options=options,
+            initial_prompt=user_prompt,
+            summary=summary,
+            work_dir=work_dir,
+            artifact_names=("exploit.py",),
+            auto_run=auto_run,
+            sandbox_runner=_sandbox_for,
+            log_fn=lambda s: log_line(job_id, s),
+        )
     finally:
         watchdog.cancel()
         if read_meta(job_id).get("awaiting_decision"):
@@ -169,9 +116,9 @@ async def _run_agent(
                     pass
             jd = job_dir(job_id)
             for name, src in found.items():
-                target = jd / name
-                if src.resolve() != target.resolve():
-                    target.write_bytes(src.read_bytes())
+                target_path = jd / name
+                if src.resolve() != target_path.resolve():
+                    target_path.write_bytes(src.read_bytes())
                 # Mirror into work_dir so the next /retry's carry step
                 # picks up the freshest version, not the stale carry-copy.
                 work_target = work_dir / name
@@ -179,6 +126,7 @@ async def _run_agent(
                     work_target.write_bytes(src.read_bytes())
         except Exception as carry_err:
             log_line(job_id, f"CARRY_ERROR: {carry_err}")
+    summary["sandbox"] = sandbox_result
     return summary
 
 
@@ -203,12 +151,9 @@ def run_job(
         )
         cost = extract_cost(agent_summary)
 
-        sandbox_result = None
-        if auto_run and agent_summary.get("exploit_present"):
-            write_meta(job_id, stage="sandbox-run")
-            sandbox_result = attempt_sandbox_run(
-                job_id, "exploit.py", target, lambda s: log_line(job_id, s)
-            )
+        # Sandbox+judge already happened inside the agent session loop;
+        # the helper stashed the LAST sandbox_result on the summary.
+        sandbox_result = agent_summary.pop("sandbox", None)
 
         flags = scan_job_for_flags(job_id)
         agent_err = agent_summary.get("agent_error")

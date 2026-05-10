@@ -92,12 +92,40 @@ RUN ARCH=$(dpkg --print-architecture) \
         echo "redress: skipping install on $ARCH (no upstream binary)"; \
     fi
 
+# GEF — modern gdb plugin (heap visualizer, vmmap, pattern, checksec,
+# ROP helpers, ARM/MIPS/PowerPC support). Single Python file, no
+# heavy deps — the right default for a debugger subagent. The agent
+# can opt into pwndbg via `pip install pwndbg && python -m pwndbg
+# --install` if it really needs the pwndbg-specific UX, but GEF
+# covers 95% of CTF dynamic analysis. Source it conditionally so
+# `gdb -nx` still gets a clean default-gdb shell.
+RUN curl -fsSL https://gef.blah.cat/py -o /opt/gef.py \
+ && printf '%s\n' \
+        '# Auto-load GEF unless GDB was started with -nx.' \
+        'python' \
+        'import os' \
+        'if not os.environ.get("GDB_NO_GEF"):' \
+        '    gdb.execute("source /opt/gef.py")' \
+        'end' \
+    > /etc/gdb/gdbinit \
+ && echo "GEF installed at /opt/gef.py, autoloaded via /etc/gdb/gdbinit"
+
 COPY worker /app/worker
 
 # Expose ghiant as a Bash command so the agent can invoke decompilation
 # on demand instead of forcing it as a pre-step.
 RUN ln -sf /app/worker/ghiant_cli.py /usr/local/bin/ghiant \
  && chmod +x /app/worker/ghiant_cli.py
+
+# Expose `chal-libc-fix` as a Bash command — patchelf wrapper that
+# scans the challenge bundle for a Dockerfile / Makefile / docker-
+# compose.yml that names the libc + ld-linux pair the chal really
+# runs against, and rewrites the binary's interpreter / RUNPATH to
+# load THAT libc instead of the worker's system libc. The debugger
+# subagent calls this before any gdb session so dynamic analysis
+# matches remote behavior.
+RUN ln -sf /app/worker/chal_libc_fix.py /usr/local/bin/chal-libc-fix \
+ && chmod +x /app/worker/chal_libc_fix.py
 
 ENV PYTHONPATH=/app
 

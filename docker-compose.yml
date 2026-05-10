@@ -57,6 +57,19 @@ services:
       # Trip-wire: kill investigation-loop runaway before the SDK
       # exhausts its conversation context. 0 disables.
       INVESTIGATION_BUDGET: ${INVESTIGATION_BUDGET:-0}
+      # Max postjudge-driven auto retries within a single job (in
+      # addition to the first attempt). When auto_run is on and the
+      # sandbox returns a non-success verdict with an actionable
+      # retry_hint, the orchestrator injects that hint as a new user
+      # turn back to the same main SDK session, preserving cache.
+      # Semantics:
+      #   0                    → disabled (legacy fire-and-forget)
+      #   N (positive int)     → cap at exactly N retries
+      #   -1 / inf / unlimited → no cap; loop continues until success,
+      #     empty retry_hint, agent error, BUDGET_ABORT, user Stop, or
+      #     soft/hard timeout
+      # Default: -1 (unlimited). Override via .env if you want a cap.
+      AUTO_RETRY_MAX: ${AUTO_RETRY_MAX:--1}
     volumes:
       - ./data:/data
       - ./modules:/app/modules:ro

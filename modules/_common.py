@@ -41,6 +41,32 @@ def log_line(job_id: str, line: str) -> None:
         fp.write(f"[{ts}] {line}\n")
 
 
+def log_block(
+    job_id: str,
+    prefix: str,
+    body: str,
+    *,
+    tag: str | None = None,
+) -> None:
+    """Multi-line log write where every output line carries the same
+    timestamp + agent tag prefix. Used for full-fidelity main agent
+    output (no truncation, real newlines preserved). The repeated
+    prefix is mild visual noise but lets the existing run-log
+    colorizer style every row consistently — without it, continuation
+    lines would render as plain gray text and lose their agent color.
+
+    Single-line bodies behave the same as log_line.
+    """
+    f = job_dir(job_id) / "run.log"
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    tag_part = f"[{tag}] " if tag else ""
+    body = body or ""
+    lines = body.splitlines() or [""]
+    out = "".join(f"[{ts}] {tag_part}{prefix}: {line}\n" for line in lines)
+    with f.open("a") as fp:
+        fp.write(out)
+
+
 _TERMINAL_STATUSES = {"finished", "failed", "no_flag", "stopped"}
 
 
@@ -216,8 +242,8 @@ MISSION (read first, follow strictly)
 -------------------------------------
 1. WRITE: produce {deliverables} in your CURRENT WORKING DIRECTORY
    using RELATIVE paths. The orchestrator collects only files at cwd.
-2. DELEGATE: heavy investigation goes to the read-only `recon`
-   subagent. Call it via the `Agent` tool — exact invocation:
+2. DELEGATE STATIC investigation to the read-only `recon` subagent
+   via the `Agent` tool:
        Agent(
          description="<short purpose, ≤8 words>",
          subagent_type="recon",
@@ -229,6 +255,37 @@ MISSION (read first, follow strictly)
    lookup, decomp summary, rootfs unpack — first instinct should be
    to delegate. Doing it yourself in Bash is reserved for short
    verifications (one-line file Read, single curl, single nc probe).
+
+   DELEGATE DYNAMIC analysis to the `debugger` subagent — gdb,
+   strace, ltrace, qemu-user. The debugger AUTOMATICALLY patchelf's
+   the binary against the chal's bundled libc (via `chal-libc-fix`)
+   so leaked addresses and heap layouts match what the remote
+   produces — gdb on the worker's system libc would lie. Call it
+   when you need OBSERVED runtime state that disasm can't tell you:
+
+       Agent(
+         description="<observable, ≤8 words>",
+         subagent_type="debugger",
+         prompt=(
+           "GOAL: <what fact do you need? e.g. 'libc base after the
+            third printf', 'canary value at vuln entry', 'tcache
+            chunk addresses after 4 alloc + 2 free'>\\n"
+           "BINARY: ./bin/<name>\\n"
+           "INPUT:  <literal stdin bytes, or a Python snippet that
+            prints them; can also be 'first connect to <target>'>\\n"
+           "BREAKPOINTS: <addr or symbol; what to dump at each>\\n"
+           "CONSTRAINTS: <remote? cross-arch? glibc version?>\\n"
+         )
+       )
+
+   Debugger replies with `OBSERVED / TRACE / CONCLUSION / CAVEATS`.
+   Use it BEFORE writing the final exploit when you're not sure
+   about (a) leaked-address shape, (b) heap chunk addresses /
+   alignment, (c) which one_gadget actually fires given the post-
+   leak register state, (d) whether your input crosses an EOF
+   correctly, (e) signal/abort fired vs SIGSEGV, (f) glibc version
+   when the bundled libc isn't labeled. Don't delegate trivial
+   static questions — those go to recon.
 3. BUDGET (soft): after ~10 tool calls without a draft {short},
    STOP investigating and write the draft from your best hypothesis.
    Iterate after. There's no hard cap — the worker won't abort you —
@@ -238,10 +295,20 @@ MISSION (read first, follow strictly)
 
 JUDGE GATE (mandatory before you finalize)
 ------------------------------------------
-Before you end your turn for good, you MUST send your final
-exploit/solver to the JUDGE peer subagent for a pre-merge review.
-Judge has saved real runs in the past from the I/O hangs / parse
-mismatches that the orchestrator's plain runner can't detect.
+Before you end your turn, you MUST send your final exploit/solver to
+the JUDGE peer subagent for a pre-merge review. Judge has saved real
+runs in the past from the I/O hangs / parse mismatches that the
+orchestrator's plain runner can't detect.
+
+NOTE: ending your turn is not the end of the conversation. If
+auto_run is on and the script fails in the sandbox, the orchestrator
+will inject the postjudge verdict + retry_hint as a new user turn
+back to YOU (same SDK session, full context preserved). Treat it
+like a normal user follow-up: read the message, apply the fix,
+re-run the JUDGE GATE on the patched script, and end your turn
+again. The orchestrator caps this loop (default 2 retries) to keep
+costs bounded — but it lets you fix obvious bugs without forcing the
+human to click /retry.
 
 Call:
     Agent(
@@ -293,6 +360,33 @@ a single subagent turn.
    tables + standard library calls.
 5. NO REPEATED slicing of saved disasm: grep what you need once
    and move on.
+6. RUNAWAY OUTPUT — STOP, DO NOT ANALYZE. If a Bash tool result
+   begins with "Output too large (NNN MB). Full output saved to..."
+   the underlying process produced a flood (typically megabytes to
+   gigabytes). Treat it as a SIGNAL, NOT DATA:
+     * The 2KB preview is the FIRST 2KB of an infinite loop / EOF
+       prompt re-spew / hex-dump-of-everything. It is NOT a
+       representative sample of program behavior.
+     * DO NOT continue the analysis branch that fired the command.
+       DO NOT try to Read or grep the saved tool-results file —
+       it's the same pathological flood.
+     * STOP and re-examine the command. Common root causes:
+         - Binary read past stdin EOF and looped on its prompt
+           forever; `timeout N` didn't help because the buffered
+           pipe absorbs output faster than timeout can kill.
+         - `objdump -d`/`strings` on a huge binary without `head`
+           or `grep`.
+         - `find /` walked the whole filesystem.
+         - `cat /dev/urandom` / `yes` / similar.
+     * Re-run with a size guard:
+         `<cmd> | head -c 65536`           # first 64 KB
+         `<cmd> 2>&1 | head -200`           # first 200 lines
+         `<cmd> | grep -m1 PATTERN`         # stop at first match
+         `<cmd> 2>/dev/null | wc -c`        # measure size, no body
+       For interactive binaries that prompt forever after EOF, send
+       a quit/exit command in the input or use `timeout 2 ... </dev/null`
+       and confirm the binary actually terminates before piping to
+       further tools.
 
 """
 
@@ -470,7 +564,20 @@ will answer.
     ghiant <bin> [outdir]                      # Ghidra headless, 1-3 min
     # produces ./decomp/<func>_<addr>.c — read main_*.c then follow
     # the call graph by symbol name. Don't dump the whole tree;
-    # grep for the suspicious call sites.
+    # grep for the suspicious call sites. Saves the Ghidra project
+    # under <jobdir>/.ghidra_proj/ so the second call (and any
+    # subsequent `ghiant xrefs ...`) skips auto-analysis.
+
+  Cross-references (cheap after the first ghiant — uses cached project):
+    ghiant xrefs <bin> <symbol_or_addr> [--limit 50]
+    # Returns JSON on stdout: {target, kind, address, found, shown,
+    # xrefs:[{from, ref_type, function, function_addr}, ...]}.
+    # Use this BEFORE grepping ./decomp/*.c for an address — Ghidra
+    # already knows every reference site (instructions + data refs)
+    # and gives ref_type (UNCONDITIONAL_CALL / DATA_READ / DATA_WRITE
+    # / etc.) which a text grep cannot. Auto-bootstraps a full
+    # analysis if no cached project exists yet, so it's safe to call
+    # before `ghiant <bin>`. Cold call ~10-20s, warm call ~5s.
 
   Cross-arch execution + dynamic analysis with QEMU-user (foreign ELFs):
     qemu-aarch64-static ./bin/<name>           # run native, no kernel
@@ -503,6 +610,23 @@ will answer.
     jq '...' findings.json
     grep -RnE 'shell_exec|eval\\(|os\\.system' src/
     glob '**/*.py' / '**/Dockerfile'
+
+  Heap / FSOP probes (main's most expensive failure mode is
+  rediscovering glibc-version-specific facts; you can answer most
+  of these in <30s of Bash):
+    # glibc version + linux-vdso + tls hints
+    strings <libc> | grep -F 'GLIBC ' | head -3
+    # FSOP-relevant offsets in one shot
+    python3 -c "from pwn import ELF; e=ELF('<libc>'); \\
+      print({k: hex(e.symbols.get(k) or 0) for k in \\
+        ['_IO_2_1_stdout_','_IO_list_all','_IO_wfile_jumps', \\
+         '_IO_str_jumps','__libc_argv','environ','__free_hook', \\
+         '__malloc_hook','_rtld_global']})"
+    # one_gadget candidates with constraints
+    one_gadget <libc>             # all
+    one_gadget -l 1 <libc>        # most permissive only
+    # tcache layout sanity (look for tcache_perthread_struct sizing)
+    aarch64-linux-gnu-readelf -p .rodata <libc> | grep -E 'tcache|chunk'
 
 Decomp triage protocol — main's #1 use case
 -------------------------------------------
@@ -606,6 +730,22 @@ Bash gotchas:
   disassembly, redirect to a file and `grep` / `sed -n` it. Saving
   to /tmp/d.txt is fine even though you can't `Write` directly —
   `>` redirect inside Bash is allowed.
+- RUNAWAY OUTPUT (multi-MB+) — STOP, DO NOT ANALYZE THE PREVIEW.
+  If the tool result starts with "Output too large (NNN MB). Full
+  output saved to ...":
+    * The 2KB preview is the FIRST 2KB of an infinite flood (binary
+      reading past stdin EOF and re-printing its prompt forever,
+      objdump on a huge ELF, find / walking the FS, …) — NOT a
+      representative sample.
+    * Do NOT base your answer on it. Do NOT Read the saved
+      tool-results file — same flood.
+    * Re-run with a size guard ALWAYS:
+        `<cmd> | head -c 65536`        # first 64 KB
+        `<cmd> 2>&1 | head -200`        # first 200 lines
+        `<cmd> | grep -m1 PATTERN`      # stop at first match
+    * For interactive binaries: pipe `</dev/null` and confirm the
+      program EXITS instead of looping on its prompt; if it loops,
+      send an explicit quit token in the input first.
 """
 
 
@@ -704,6 +844,270 @@ Antipatterns to flag in scripts (high-signal, encountered most often):
   does `int(argv[1])`).
 * `Crypto.Util.number.bytes_to_long` on something that isn't bytes,
   or other type confusion that crashes at first call.
+
+Heap / FSOP class antipatterns (silent crashes the regular checks
+don't catch — flag these aggressively when the script touches
+`_IO_FILE`, tcache, fastbin, unsorted, large bin, vtable):
+
+* FSOP vtable write happens BEFORE `_wide_data` / `_wide_vtable` /
+  rdi-rsi-rbp-rbx slots are populated. Any stdio call between the
+  vtable write and the trigger fires `_IO_wfile_overflow` on
+  partial state → SIGSEGV. The vtable assignment MUST be the LAST
+  write of the chain. If the script issues a prompt-loop write
+  (`cmd:`, `> `) right after the vtable write but before the
+  trigger, that's a HIGH severity ordering bug.
+* `__free_hook` / `__malloc_hook` / `__realloc_hook` referenced on a
+  glibc ≥2.34 build. Those symbols were REMOVED in 2.34. The script
+  will crash on `e.symbols['__free_hook']` (KeyError) or write to a
+  random nearby address. Verify the libc version and propose
+  `_IO_list_all` / `_IO_2_1_stdout_` / `__exit_funcs` instead.
+* `_IO_str_jumps` `__finish` chain on glibc ≥2.37. That path was
+  patched. Recommend `_IO_wfile_jumps` overflow instead.
+* tcache poison without safe-linking XOR on glibc ≥2.32 (writing
+  raw `target_addr` instead of `target_addr ^ (heap_chunk >> 12)`).
+  Or vice versa: applying the XOR on glibc ≤2.31 (which has no
+  safe-linking) so the resulting fd points to garbage.
+* Critical address contains a whitespace byte (0x09 / 0x0a / 0x0b
+  / 0x0c / 0x0d / 0x20) and the input path is `cin >>` /
+  `getline(cin, ...)`. The write truncates mid-address → wrong
+  field overwritten → SIGSEGV. Recommend a different gadget /
+  retry loop on ASLR.
+* Hard-coded libc offset constants (`UNSORTED_BIN_OFF = 0x1e5b20`)
+  with NO version check. They shift between glibc patch levels.
+  Either derive from the supplied libc.so via `pwn.ELF()` at
+  runtime, or include an explicit `assert` on libc_base & 0xfff.
+* Heap / libc leak NEVER validated before being used as a base.
+  An `assert leaked & 0xfff == 0` (libc page-aligned) on the libc
+  base prevents one whole class of "the chain ran on garbage".
+* `p.interactive()` after the FSOP trigger inside a runner
+  sandbox. The sandbox has no TTY; interactive blocks on stdin
+  and the supervise watchdog kills the run before flag exfil.
+  Recommend `recvall(timeout=N)` or `recvuntil(b'\\n', timeout=N)`
+  guarded by `if sys.stdin.isatty(): p.interactive()`.
+"""
+
+
+DEBUGGER_AGENT_PROMPT = """\
+You are the Debugger — a dynamic-analysis subagent invoked by the
+main exploit/solver writer. Your value is RUNNING the binary under
+gdb / strace / ltrace and reporting *observed* behavior (register
+state at a breakpoint, leaked addresses, heap chunk layouts, signal
+that fired, stack canary value, …) so main doesn't have to guess
+from disassembly alone.
+
+You are PEER to recon (static investigator) and judge (script
+quality gate). You can call recon for static facts; you cannot
+call yourself, judge, or main.
+
+When main delegates to you, the prompt should contain:
+  GOAL       — what specific observable does main want?
+  BINARY     — path to the ELF (`./bin/<name>` typically)
+  INPUT      — what to feed via stdin (literal bytes or a Python
+               snippet that prints them)
+  BREAKPOINTS / WATCHPOINTS — where to stop and what to dump
+  CONSTRAINTS — remote target? cross-arch? glibc version known?
+
+Reply (≤2 KB) with EXACTLY the values main needs, formatted tight:
+
+  OBSERVED:
+    <one fact per bullet — register=value, address, chunk, …>
+  TRACE (only when illuminating):
+    <ordered events, ≤6 lines>
+  CONCLUSION:
+    <one sentence answering main's GOAL>
+  CAVEATS:
+    <any divergence from production: glibc swapped, ASLR off, …>
+
+Tool catalogue (Bash inside the worker container)
+-------------------------------------------------
+* gdb / gdb-multiarch — modern (16.x). GEF auto-loads via
+  /etc/gdb/gdbinit; use `gdb -nx` to disable plugins. Common
+  one-shot patterns:
+
+    # Break at function entry, dump regs + stack
+    gdb -batch -nh \\
+        -ex 'set pagination off' \\
+        -ex 'b *vuln' -ex 'r <<<""' \\
+        -ex 'info reg' -ex 'x/40gx $rsp' \\
+        ./bin/foo
+
+    # Capture canary + libc base from a leak path
+    gdb -batch -nh \\
+        -ex 'b *0x4011a4' -ex 'r' \\
+        -ex 'p (void*)$fs_base+0x28' \\
+        -ex 'info proc map' \\
+        ./bin/foo < /tmp/probe.in
+
+    # Heap state right after target malloc
+    gdb -batch \\
+        -ex 'b *malloc' -ex 'commands' -ex 'silent' -ex 'finish' \\
+        -ex 'p (void*)$rax' -ex 'continue' -ex 'end' \\
+        -ex 'r <<< "alloc\\n"' \\
+        -ex 'heap chunks' \\
+        ./bin/foo
+
+  GEF helpers worth knowing: `vmmap`, `heap chunks`, `heap bins
+  tcache`, `canary`, `pattern create N`, `pattern search <reg>`,
+  `xinfo <addr>`, `checksec`. Use them via `-ex '<cmd>'`.
+
+  IMPORTANT — your Bash tool is ONE-SHOT. Each `gdb` call boots a
+  fresh process; you cannot type into a live gdb prompt and read
+  the response. Three patterns let you achieve the same thing:
+
+    PATTERN A — short -ex chain (≤5 commands)
+      Already shown above. Best when you know the exact commands
+      up front and don't need conditional branching.
+
+    PATTERN B — Python gdb script (multi-step, conditional, loops)
+      RECOMMENDED for any non-trivial probe. Drop a Python file
+      into /tmp and feed it via `-x`. The script runs INSIDE one
+      gdb session, so it sees breakpoints, has full pwntools-style
+      access via the gdb module, and can branch on observed values.
+      All GEF commands work via `gdb.execute(...)`.
+
+        cat > /tmp/probe.py <<'PY'
+        import gdb
+        gdb.execute("file ./bin/foo")
+        gdb.execute("b *vuln+0x42")
+        gdb.execute("r < /tmp/in")
+        rax = int(gdb.parse_and_eval("$rax")) & ((1 << 64) - 1)
+        print(f"[probe] first leak rax = {hex(rax)}")
+        # Conditional: only proceed if leak looks like a libc ptr
+        if (rax >> 40) != 0x7f:
+            print("[probe] leak shape wrong — abort")
+        else:
+            libc_base = rax - 0x1ec000  # adjust per libc
+            print(f"[probe] libc_base candidate = {hex(libc_base)}")
+            gdb.execute("c")
+            gdb.execute("heap chunks")           # GEF cmd
+            gdb.execute("info reg rdi rsi rdx")
+            gdb.execute("x/4gx $rsp")
+        PY
+        gdb -batch -x /tmp/probe.py
+
+      Loop over candidates? Just write a Python `for` in the script.
+      Want to print structured JSON for main? `print(json.dumps({...}))`
+      at the end and grep that single line out of stdout.
+
+    PATTERN C — gdbserver + multiple gdb-batch attaches (state
+                survives across Bash calls)
+      Use this when you genuinely need to inspect AFTER another
+      Bash call has fired. The inferior keeps living in gdbserver
+      between gdb-batch attaches, but software/hardware breakpoints
+      may not survive the disconnect; treat each attach as setting
+      breakpoints fresh.
+
+        # Bash call 1: launch gdbserver, leave it
+        gdbserver --multi --once :1234 ./bin/foo < /tmp/in &
+
+        # Bash call 2: connect, run to a bp, disconnect (inferior
+        # stays stopped under gdbserver)
+        gdb -batch -nh \\
+            -ex 'target remote :1234' \\
+            -ex 'b *0x401234' -ex 'c' \\
+            -ex 'info reg' -ex 'detach'
+
+      For a foreign-arch chal: same flow but `qemu-aarch64-static
+      -g 1234 ./bin/foo &` then `gdb-multiarch -batch ...`.
+
+  Pick PATTERN B as your default. It gets you "interactive feel"
+  inside one gdb session without the orchestration headache of C.
+
+* strace / ltrace — for "what syscalls fire" / "what libc calls
+  fire" without learning gdb scripting. Faster for fingerprinting:
+
+    strace -f -e trace=read,write,open,connect ./bin/foo < /tmp/in
+    ltrace -f -n2 ./bin/foo < /tmp/in 2>&1 | head -100
+
+* qemu-aarch64-static / qemu-arm-static — run foreign-arch ELFs.
+  Combine with `-g <port>` + gdb-multiarch for cross-arch debug:
+
+    qemu-aarch64-static -g 1234 ./bin/foo < /tmp/in &
+    gdb-multiarch -nh -batch \\
+        -ex 'set arch aarch64' \\
+        -ex 'target remote :1234' \\
+        -ex 'b *<addr>' -ex 'continue' \\
+        -ex 'info reg' -ex 'x/40gx $sp' \\
+        -ex 'detach'
+
+* checksec / nm / readelf — quick static reference WITHIN your
+  workflow (don't bother delegating these to recon — one shell
+  command each).
+
+Sandbox-libc isolation (use this BEFORE you trust gdb output)
+-------------------------------------------------------------
+The worker container ships glibc 2.41 (Debian 13). If the chal was
+built against a different glibc (typical — most CTF chals run on
+2.27 / 2.31 / 2.35), running it raw against the worker libc gives
+WRONG offsets, wrong heap layout, wrong FSOP vtable addresses, and
+will mislead main.
+
+Solution: `chal-libc-fix` patches the binary's interpreter +
+RUNPATH to load the chal's bundled libc:
+
+    # Auto-detect from Dockerfile / lib dirs in the chal bundle
+    chal-libc-fix ./bin/foo
+
+    # Explicit lib dir
+    chal-libc-fix ./bin/foo --libs ./challenge/lib
+
+    # Backup the original first (recommended on first patch)
+    chal-libc-fix ./bin/foo --keep-original
+
+It scans:
+  1. Any `Dockerfile` for `COPY libc-* /…` or `COPY lib/ /…`
+  2. Any `lib/` / `libs/` / `glibc/` dir with both `libc.so.6` (or
+     `libc-X.YZ.so`) AND a `ld-linux-*.so.*`
+  3. Any other directory pair under `<jobdir>` containing both.
+
+Output:
+  [chal-libc-fix] detected libc:    /data/jobs/.../challenge/lib/libc.so.6
+  [chal-libc-fix] glibc version:    2.31
+  [chal-libc-fix] staged at:        /data/jobs/.../work/.chal-libs
+  [chal-libc-fix] patched: interpreter -> /…/.chal-libs/ld-2.31.so
+
+After patching, `./bin/foo` runs against the staged libc directly
+because `patchelf --set-rpath` baked the staged-libs path into the
+binary's DT_RUNPATH. **DO NOT** also `export LD_LIBRARY_PATH=...` —
+gdb internally spawns `/bin/sh` to launch the inferior, and that
+`/bin/sh` would then ALSO try to load the chal libc and crash. The
+RPATH alone is enough; just `gdb ./bin/foo`.
+
+`chal-libc-fix` will fall back to extracting libc/ld + the binary's
+DT_NEEDED .so list directly from the Dockerfile's `FROM` image when
+no physical libs are bundled (the common Dreamhack / HackTheBox
+case: bundle = Dockerfile + binary, libs only inside the base image).
+Pass `--no-image` to skip this fallback if you want to fail fast
+without pulling images. If the base image is musl/distroless and
+no glibc is available, chal-libc-fix exits 1 — say so under CAVEATS
+and fall through to the worker's system libc.
+
+Workflow: every dynamic-analysis request, in order
+--------------------------------------------------
+1. `chal-libc-fix <bin>` (skip if main says "use system libc" or if
+   the chal bundle ships no libc — say so under CAVEATS).
+2. Quick `checksec` + `file` on the patched binary.
+3. Build the gdb -batch / strace command that answers main's GOAL.
+4. Run it. If output is short (<200 lines), include the salient
+   slice in TRACE; otherwise summarize.
+5. Reply with the OBSERVED / TRACE / CONCLUSION / CAVEATS shape.
+
+Hard rules
+----------
+* OBSERVE; don't speculate. If the breakpoint never hits, say so
+  ("breakpoint at 0x4011a4 never reached; first deviation: …"),
+  don't fabricate register values.
+* Reply ≤2 KB. Long gdb dumps stay in the worker — main only sees
+  your synthesis.
+* No Write to ./exploit.py / ./solver.py / ./report.md — those are
+  main's artifacts. (You can Write scratch scripts under /tmp.)
+* Do NOT run anything for >120s without a heartbeat. If the binary
+  hangs, kill it and report ("hung after recv on fd 0; fed N bytes
+  before hang").
+* Cost discipline: one chal-libc-fix + one or two gdb -batch /
+  strace runs per delegation. If main asks 5 distinct questions in
+  one prompt, answer them in one combined gdb session whenever
+  possible (single -ex chain) instead of 5 spawns.
 """
 
 
@@ -752,13 +1156,44 @@ def _judge_def(model: str | None = None):
     )
 
 
-def build_team_agents(model: str | None) -> dict:
-    """`agents` dict for the MAIN session. Registers both peers main can
-    delegate to:
+def _debugger_def(model: str | None):
+    """AgentDefinition for the debugger subagent. Has Write because it
+    needs to drop scratch gdb scripts / probe inputs under /tmp; it
+    will NOT touch ./exploit.py / ./solver.py / ./report.md per the
+    DEBUGGER_AGENT_PROMPT contract. Same model as main so cache
+    prefixes line up between main's reasoning and debugger's
+    responses.
+    """
+    from claude_agent_sdk import AgentDefinition
 
-      recon  — heavy read-only investigation, ≤2 KB summary back.
-      judge  — quality gate / verdict, peer subagent main can ask
-               for a pre-merge sanity check.
+    return AgentDefinition(
+        description=(
+            "Dynamic-analysis subagent that runs the binary under "
+            "gdb / strace / ltrace / qemu-user and reports observed "
+            "register state, heap layouts, leaked addresses, signals "
+            "fired. Patchelfs the binary against the chal's bundled "
+            "libc/ld first (via `chal-libc-fix`) so offsets match the "
+            "remote. Same model as main for cache locality."
+        ),
+        prompt=DEBUGGER_AGENT_PROMPT,
+        # Write/Edit allowed for /tmp scratch (gdb command files,
+        # probe inputs); the debugger's prompt forbids touching the
+        # main artifacts. Agent tool so debugger can ask recon for
+        # static facts mid-session.
+        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent"],
+        model=model,
+    )
+
+
+def build_team_agents(model: str | None) -> dict:
+    """`agents` dict for the MAIN session. Registers all three peers
+    main can delegate to:
+
+      recon    — heavy read-only static investigation, ≤2 KB summary.
+      judge    — quality gate / verdict, peer subagent main can ask
+                 for a pre-merge sanity check.
+      debugger — dynamic analysis (gdb / strace / ltrace under a
+                 patchelf'd binary), reports observed runtime state.
 
     Imported lazily inside analyzers so unit tests / non-SDK paths
     don't have to install the SDK.
@@ -766,6 +1201,7 @@ def build_team_agents(model: str | None) -> dict:
     return {
         "recon": _recon_def(model),
         "judge": _judge_def(),
+        "debugger": _debugger_def(model),
     }
 
 
@@ -918,17 +1354,53 @@ def agent_heartbeat(job_id: str, msg) -> None:
     )
 
 
-def agent_tag(msg) -> str:
+# Per-job map { tool_use_id: subagent_type } — populated when the main
+# agent emits an Agent/Task tool_use, consulted when a subagent's reply
+# message comes back with parent_tool_use_id pointing at that id. Lets
+# us tell apart `recon` / `judge` / `debugger` (all subagents; all
+# inherit parent_tool_use_id) so the run.log per-line prefix is precise.
+_subagent_registry: dict[str, dict[str, str]] = {}
+
+
+def agent_tag(msg, job_id: str | None = None) -> str:
     """Return a stable identifier for whichever agent emitted `msg`.
 
-    Subagents inherit the `parent_tool_use_id` of the Task call that
-    spawned them, so messages with a non-None value come from the
-    `recon` subagent. Otherwise it's the main agent. This gets
-    rendered as a per-line prefix in run.log so the user can tell
-    main work apart from recon delegation at a glance.
+    Subagents inherit the `parent_tool_use_id` of the Task/Agent call
+    that spawned them. With `job_id` provided we can look up which
+    specific subagent (recon | judge | debugger) the parent invocation
+    targeted; without it we fall back to the legacy "recon" tag for
+    any subagent.
+
+    As a side effect, when `job_id` is given we also pre-register any
+    Agent/Task tool_use blocks present in THIS message so subsequent
+    subagent replies can be tagged correctly.
     """
     parent = getattr(msg, "parent_tool_use_id", None)
-    return "recon" if parent else "main"
+    if job_id:
+        # Pre-register tool_use blocks in this message (typically main's
+        # own AssistantMessage that just kicked off the subagent).
+        content = getattr(msg, "content", None)
+        if isinstance(content, list):
+            registry = _subagent_registry.setdefault(job_id, {})
+            for block in content:
+                tu_id = getattr(block, "id", None)
+                if not tu_id:
+                    continue
+                name = getattr(block, "name", None)
+                if name not in ("Task", "Agent"):
+                    continue
+                inp = getattr(block, "input", None) or {}
+                if isinstance(inp, dict):
+                    stype = inp.get("subagent_type")
+                    if isinstance(stype, str) and stype:
+                        registry[tu_id] = stype
+    if not parent:
+        return "main"
+    if job_id:
+        sub = _subagent_registry.get(job_id, {}).get(parent)
+        if sub:
+            return sub
+    return "recon"
 
 
 def capture_session_id(msg, job_id: str) -> None:
@@ -1104,6 +1576,421 @@ def log_thinking(log_fn, prefix: str, thinking_text: str) -> None:
         seen += 1
         if seen >= 8:
             break
+
+
+def format_tool_result_body(content: Any) -> str:
+    """Extract the readable text from a ToolResultBlock.content (string,
+    list of {type, text} dicts, or anything else stringifiable) WITHOUT
+    truncation or newline normalization. Used for full-fidelity main
+    agent logging — log_block then writes each line with its own
+    timestamp + agent tag prefix.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for blk in content:
+            if isinstance(blk, dict):
+                if blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                    parts.append(blk["text"])
+                elif blk.get("type") == "image":
+                    parts.append("<image>")
+                else:
+                    parts.append(str(blk))
+            else:
+                parts.append(str(blk))
+        return "\n".join(parts)
+    return str(content)
+
+
+def log_assistant_blocks(job_id: str, msg, summary: dict) -> None:
+    """Walk an AssistantMessage's content blocks and write run-log
+    entries. Main agent gets full-fidelity output (no truncation, real
+    newlines, pretty-printed JSON tool inputs). Subagents (recon /
+    judge) keep concise single-line previews — their job is to be
+    short, and clipping their output keeps the timeline skimmable.
+
+    Duck-types block class names so this helper can live in _common.py
+    without importing the SDK at module load. Mutates `summary` to
+    increment the tool_calls counter.
+    """
+    tag = agent_tag(msg, job_id)
+    blocks = getattr(msg, "content", None)
+    if not isinstance(blocks, list):
+        return
+    is_main = tag == "main"
+    for block in blocks:
+        kind = type(block).__name__
+        if kind == "TextBlock":
+            text = getattr(block, "text", "") or ""
+            if is_main:
+                log_block(job_id, "AGENT", text, tag=tag)
+            else:
+                log_line(job_id, f"[{tag}] AGENT: {text[:500]}")
+        elif kind == "ToolUseBlock":
+            summary["tool_calls"] = summary.get("tool_calls", 0) + 1
+            name = getattr(block, "name", "?")
+            inp = getattr(block, "input", None) or {}
+            if is_main:
+                try:
+                    pretty = json.dumps(inp, indent=2, ensure_ascii=False)
+                except Exception:
+                    pretty = str(inp)
+                log_block(job_id, f"TOOL {name}", pretty, tag=tag)
+            else:
+                try:
+                    args_preview = json.dumps(inp)[:200]
+                except Exception:
+                    args_preview = str(inp)[:200]
+                log_line(job_id, f"[{tag}] TOOL {name}: {args_preview}")
+        elif kind == "ThinkingBlock":
+            thinking = getattr(block, "thinking", "") or ""
+            if is_main:
+                log_block(job_id, "THINK", thinking, tag=tag)
+            else:
+                log_thinking(
+                    lambda s, _t=tag: log_line(job_id, f"[{_t}] {s}"),
+                    "THINK", thinking,
+                )
+
+
+# SDK auto-truncates Bash/Read tool results above its size cap and
+# replaces the body with this header. We detect it to surface a
+# RUNAWAY_OUTPUT warning so the agent (and the operator reading
+# run.log) can spot it instantly — the model has been observed to
+# stall after this happens, mistaking the truncated preview for the
+# true command output.
+_RUNAWAY_RE = re.compile(
+    r"Output too large\s*\(([\d.]+\s*[KMG]?B)\)\.\s*Full output saved to:?\s*(\S+)",
+    re.IGNORECASE,
+)
+
+
+def _check_runaway(job_id: str, tag: str, body: str) -> None:
+    if not body:
+        return
+    m = _RUNAWAY_RE.search(body)
+    if not m:
+        return
+    size, path = m.group(1), m.group(2)
+    log_line(
+        job_id,
+        f"[{tag}] RUNAWAY_OUTPUT detected ({size}). Saved at {path}. "
+        "DO NOT analyze the preview — re-examine the command (likely "
+        "infinite loop / EOF re-spew). Re-run with `| head -c 65536` "
+        "or `| head -200` size guard.",
+    )
+
+
+def log_user_blocks(job_id: str, msg) -> None:
+    """Walk a UserMessage's content blocks (typically tool results) and
+    write run-log entries. Main agent gets the full body of each tool
+    result with newlines preserved; subagents get the existing
+    single-line preview (≤300 bytes, ' | '-joined newlines).
+    """
+    tag = agent_tag(msg, job_id)
+    content = getattr(msg, "content", None)
+    if not isinstance(content, list):
+        return
+    is_main = tag == "main"
+    for block in content:
+        if type(block).__name__ != "ToolResultBlock":
+            continue
+        is_error = bool(getattr(block, "is_error", False))
+        body_raw = getattr(block, "content", None)
+        if is_main:
+            body = format_tool_result_body(body_raw)
+            prefix = "TOOL_ERROR" if is_error else "TOOL_RESULT"
+            if not body:
+                log_line(job_id, f"[{tag}] {prefix}: (empty)")
+            else:
+                log_block(job_id, prefix, body, tag=tag)
+            _check_runaway(job_id, tag, body)
+        else:
+            preview = format_tool_result(body_raw, is_error)
+            log_line(job_id, f"[{tag}] " + preview)
+            _check_runaway(job_id, tag, preview)
+
+
+def auto_retry_max() -> int:
+    """How many postjudge-driven auto retries to allow per job.
+
+    Semantics:
+      0                    → disabled (initial run only, no auto retry)
+      N (positive int)     → exactly N retries on top of the initial run
+      -1 / inf / unlimited → unlimited; loop continues until natural exit
+                             (flag captured · verdict==success · empty
+                             retry_hint · agent error · BUDGET_ABORT · user
+                             Stop · soft/hard timeout).
+
+    Default: -1 (unlimited). The natural exit conditions above keep cost
+    bounded for well-behaved runs, and the user can always hit Stop.
+    """
+    raw = (os.environ.get("AUTO_RETRY_MAX", "-1") or "-1").strip().lower()
+    if raw in ("inf", "unlimited", "-1", ""):
+        return -1
+    try:
+        n = int(raw)
+    except ValueError:
+        return -1
+    return max(0, n)
+
+
+def _format_postjudge_user_turn(
+    *,
+    attempt_idx: int,
+    max_attempts: int,
+    script_filename: str,
+    sandbox_result: dict,
+) -> str:
+    """Compose the user-turn body that gets injected back into main's
+    SDK session after a failed sandbox run. Tells main what verdict
+    came back, gives it the postjudge retry_hint verbatim, and asks
+    for a corrected script. Tail of stdout/stderr is included so main
+    can cross-check rather than trusting judge's summary blindly.
+    """
+    judge = (sandbox_result or {}).get("judge") or {}
+    verdict = judge.get("verdict") or "unknown"
+    summary = (judge.get("summary") or "").strip()
+    retry_hint = (judge.get("retry_hint") or "").strip()
+    exit_code = sandbox_result.get("exit_code")
+    stdout = (sandbox_result.get("stdout") or "")[-2000:]
+    stderr = (sandbox_result.get("stderr") or "")[-2000:]
+    timeout_marker = ""
+    if sandbox_result.get("timeout"):
+        timeout_marker = "  · runner timeout fired before container exit\n"
+    if sandbox_result.get("killed_by_supervise"):
+        timeout_marker += (
+            "  · supervise judge killed the container due to stalled output\n"
+        )
+    cap_str = "∞" if max_attempts < 0 else str(max_attempts)
+    return (
+        f"🔁 AUTO-RETRY {attempt_idx}/{cap_str} — postjudge feedback\n"
+        f"\n"
+        f"The orchestrator just executed `{script_filename}` in the runner "
+        f"sandbox. Result:\n"
+        f"  · exit_code: {exit_code}\n"
+        f"  · postjudge verdict: {verdict}\n"
+        f"  · postjudge summary: {summary or '(empty)'}\n"
+        f"{timeout_marker}"
+        f"\n"
+        f"=== retry hint (from postjudge — apply this) ===\n"
+        f"{retry_hint or '(judge produced no actionable hint; debug from the tails below)'}\n"
+        f"\n"
+        f"=== stdout tail ===\n"
+        f"{stdout or '(empty)'}\n"
+        f"\n"
+        f"=== stderr tail ===\n"
+        f"{stderr or '(empty)'}\n"
+        f"\n"
+        f"WHAT TO DO NOW:\n"
+        f"  1. Read the script as it stands (`Read ./{script_filename}`).\n"
+        f"  2. Apply the fix from the retry hint. If you disagree with the\n"
+        f"     hint after seeing the tails, fix what you actually believe\n"
+        f"     is broken — but say so explicitly.\n"
+        f"  3. Re-run the JUDGE GATE (peer subagent) on the patched script\n"
+        f"     before ending your turn. The orchestrator will rerun the\n"
+        f"     sandbox automatically after you finish.\n"
+        f"  4. Keep the artifact path stable (`./{script_filename}` and\n"
+        f"     `./report.md`).\n"
+        f"  5. If you cannot fix this (genuinely stuck or the bug class is\n"
+        f"     beyond the available primitive), say so and `Bash(rm -f "
+        f"./{script_filename})` so the orchestrator skips the rerun.\n"
+    )
+
+
+def _pick_present_artifact(
+    work_dir: Path, names: tuple[str, ...],
+) -> str | None:
+    for n in names:
+        if (work_dir / n).is_file():
+            return n
+    return None
+
+
+async def run_main_agent_session(
+    job_id: str,
+    *,
+    options,  # ClaudeAgentOptions; deferred import to avoid SDK at module load
+    initial_prompt: str,
+    summary: dict,
+    work_dir: Path,
+    artifact_names: tuple[str, ...],
+    auto_run: bool,
+    sandbox_runner,  # Callable[[str], Optional[dict]] | None
+    log_fn,           # Callable[[str], None]
+) -> dict | None:
+    """One-stop main-agent driver with postjudge feedback loop.
+
+    Opens a single ClaudeSDKClient session, sends `initial_prompt`,
+    streams main's response cycle, then — if auto_run is on and an
+    artifact was produced — runs the sandbox (with judge stages) and,
+    on a non-success postjudge verdict, injects the retry_hint as a
+    new user turn back into the same SDK session.
+
+    Loop terminates on FIRST hit among:
+      * flag captured / postjudge verdict == "success"
+      * postjudge produced no actionable retry_hint
+      * agent error / SDK exception
+      * BUDGET_ABORT (investigation_budget tripwire)
+      * AUTO_RETRY_MAX cap reached (when configured to a non-negative N)
+      * user pressed Stop (RQ stop signal) / soft / hard timeout
+
+    `auto_retry_max()` defaults to unlimited (-1); set
+    `AUTO_RETRY_MAX=N` env to cap.
+
+    Mutates `summary` with messages / tool_calls / agent_error /
+    exploit_present / decomp counts as the inline analyzer code did.
+    Returns the LAST sandbox_result dict (or None if auto_run disabled
+    or no artifact was ever produced).
+
+    Caller is responsible for the carry / flag-scan / meta-finalize
+    steps after this returns.
+    """
+    from claude_agent_sdk import (
+        AssistantMessage, ClaudeSDKClient, ResultMessage, UserMessage,
+    )
+    import anyio
+
+    max_retries = auto_retry_max() if auto_run else 0
+
+    last_sandbox: dict | None = None
+
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(initial_prompt)
+
+        # max_retries semantics: 0 = disabled, N>0 = cap, -1 = unlimited.
+        cap_str = "∞" if max_retries < 0 else str(max_retries)
+        attempt = 0  # 0 = initial run; 1..N = postjudge-driven retries
+        while True:
+            log_fn(f"Main session turn (attempt {attempt}/{cap_str})")
+            try:
+                async for msg in client.receive_response():
+                    capture_session_id(msg, job_id)
+                    agent_heartbeat(job_id, msg)
+                    if isinstance(msg, AssistantMessage):
+                        summary["messages"] = summary.get("messages", 0) + 1
+                        log_assistant_blocks(job_id, msg, summary)
+                    elif isinstance(msg, UserMessage):
+                        log_user_blocks(job_id, msg)
+                    if budget_exceeded(
+                        summary.get("tool_calls", 0),
+                        work_dir, artifact_names,
+                    ):
+                        log_fn(
+                            "BUDGET_ABORT: investigation budget exceeded "
+                            f"({summary.get('tool_calls', 0)} tool calls, "
+                            f"no {' / '.join(artifact_names)}). Stopping early."
+                        )
+                        summary["agent_error"] = "investigation budget exceeded"
+                        summary["agent_error_kind"] = "budget"
+                        return last_sandbox
+                    if isinstance(msg, ResultMessage):
+                        summary["result"] = {
+                            "duration_ms": msg.duration_ms,
+                            "num_turns": msg.num_turns,
+                            "total_cost_usd": msg.total_cost_usd,
+                            "is_error": msg.is_error,
+                        }
+                        log_fn(f"DONE: {summary['result']}")
+            except Exception as e:
+                msg_text = str(e)
+                kind = classify_agent_error(msg_text)
+                summary["agent_error"] = msg_text
+                summary["agent_error_kind"] = kind
+                log_fn(f"AGENT_ERROR ({kind}): {msg_text[:400]}")
+                return last_sandbox
+
+            # ---- Decide whether to feed postjudge back to main ----
+            if not auto_run or sandbox_runner is None:
+                return last_sandbox
+            picked = _pick_present_artifact(work_dir, artifact_names)
+            if not picked:
+                # Main produced nothing this round — no script to run.
+                return last_sandbox
+
+            # `attempt_sandbox_run` looks at <jobdir>/<artifact>, but the
+            # analyzer's full carry block doesn't run until its `finally`
+            # (i.e. AFTER this helper returns). Before sandbox_runner gets
+            # called we therefore promote the picked artifact and any
+            # report.md companion ourselves — otherwise the runner sees
+            # "exploit.py missing, cannot auto-run" on every cycle and the
+            # auto-retry loop short-circuits with verdict=None.
+            jd = job_dir(job_id)
+            for nm in (picked, "report.md"):
+                src = work_dir / nm
+                if not src.is_file():
+                    continue
+                dst = jd / nm
+                try:
+                    if src.resolve() != dst.resolve():
+                        dst.write_bytes(src.read_bytes())
+                except Exception as e:
+                    log_fn(f"[orchestrator] pre-sandbox carry of {nm} failed: {e}")
+
+            # Run sandbox + judge synchronously off the event loop.
+            write_meta(job_id, stage=f"sandbox-run-{attempt}" if attempt else "sandbox-run")
+            log_fn(f"[orchestrator] auto-run turn {attempt}: executing {picked}")
+            try:
+                last_sandbox = await anyio.to_thread.run_sync(sandbox_runner, picked)
+            except Exception as e:
+                log_fn(f"[orchestrator] sandbox runner crashed: {e}")
+                return last_sandbox
+
+            # Did we capture a flag this turn?
+            flags_now = scan_job_for_flags(job_id)
+            verdict = ((last_sandbox or {}).get("judge") or {}).get("verdict")
+            if flags_now or verdict == "success":
+                log_fn(
+                    f"[orchestrator] auto-run turn {attempt} succeeded "
+                    f"(flags={len(flags_now)}, verdict={verdict}) — exiting loop"
+                )
+                return last_sandbox
+
+            # Out of retries? Stop. Negative max_retries means unlimited
+            # — only natural exit conditions (flag / verdict==success /
+            # empty retry_hint / agent_error / user Stop / timeout) end
+            # the loop in that case.
+            if max_retries >= 0 and attempt >= max_retries:
+                if max_retries > 0:
+                    log_fn(
+                        f"[orchestrator] auto-retry budget exhausted "
+                        f"(attempt {attempt}/{max_retries}) — postjudge "
+                        f"verdict={verdict}; surfacing for user retry"
+                    )
+                return last_sandbox
+
+            # No retry hint? Nothing actionable to feed back.
+            retry_hint = (
+                ((last_sandbox or {}).get("judge") or {}).get("retry_hint") or ""
+            ).strip()
+            if not retry_hint:
+                log_fn(
+                    f"[orchestrator] postjudge produced no retry_hint "
+                    f"(verdict={verdict}) — stopping auto-retry"
+                )
+                return last_sandbox
+
+            # Inject postjudge feedback as next user turn and loop.
+            attempt += 1
+            write_meta(job_id, stage=f"auto-retry-{attempt}")
+            feedback = _format_postjudge_user_turn(
+                attempt_idx=attempt,
+                max_attempts=max_retries,
+                script_filename=picked,
+                sandbox_result=last_sandbox or {},
+            )
+            log_fn(
+                f"[orchestrator] injecting postjudge feedback as new user "
+                f"turn (attempt {attempt}/{max_retries}, verdict={verdict})"
+            )
+            await client.query(feedback)
+            # loop continues; receive_response on next iteration
+
+    # unreachable; kept for type-checkers
+    return last_sandbox
 
 
 async def soft_timeout_watchdog(job_id: str, soft_timeout_s: int) -> None:

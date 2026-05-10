@@ -6,34 +6,17 @@ from pathlib import Path
 from typing import Optional
 
 import anyio
-from claude_agent_sdk import (
-    AssistantMessage,
-    SystemMessage,
-    ClaudeAgentOptions,
-    ResultMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
-    query,
-)
+from claude_agent_sdk import ClaudeAgentOptions
 
 from modules._common import (
-    agent_heartbeat,
-    agent_tag,
-    budget_exceeded,
     build_recon_agents,
-    capture_session_id,
-    classify_agent_error,
     collect_outputs,
     extract_cost,
-    format_tool_result,
     job_dir,
     log_line,
-    log_thinking,
     prior_work_dirs,
     read_meta,
+    run_main_agent_session,
     scan_job_for_flags,
     soft_timeout_watchdog,
     write_meta,
@@ -83,71 +66,26 @@ async def _run_agent(
     watchdog = asyncio.create_task(soft_timeout_watchdog(job_id, soft_timeout))
 
     summary: dict = {"messages": 0, "tool_calls": 0, "model": model}
+
+    sandbox_result: Optional[dict] = None
+
+    def _sandbox_for(script_name: str) -> Optional[dict]:
+        return attempt_sandbox_run(
+            job_id, script_name, target_url, lambda s: log_line(job_id, s),
+        )
+
     try:
-        async for msg in query(prompt=user_prompt, options=options):
-            capture_session_id(msg, job_id)
-            agent_heartbeat(job_id, msg)
-            if isinstance(msg, AssistantMessage):
-                summary["messages"] += 1
-                tag = agent_tag(msg)
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        log_line(job_id, f"[{tag}] AGENT: {block.text[:500]}")
-                    elif isinstance(block, ToolUseBlock):
-                        summary["tool_calls"] += 1
-                        args_preview = json.dumps(block.input)[:200]
-                        log_line(
-                            job_id,
-                            f"[{tag}] TOOL {block.name}: {args_preview}",
-                        )
-                    elif isinstance(block, ThinkingBlock):
-                        # Surfaces extended-thinking output so the live
-                        # log doesn't go silent for minutes between tool
-                        # calls when Claude is reasoning.
-                        log_thinking(
-                            lambda s, _t=tag: log_line(job_id, f"[{_t}] {s}"),
-                            "THINK", block.thinking,
-                        )
-            elif isinstance(msg, UserMessage):
-                # ToolResultBlock comes back in the next user turn — without
-                # logging it, the run.log goes silent for the entire tool
-                # execution (long Bash commands, big Reads, ...).
-                tag = agent_tag(msg)
-                content = msg.content if isinstance(msg.content, list) else []
-                for block in content:
-                    if isinstance(block, ToolResultBlock):
-                        log_line(
-                            job_id,
-                            f"[{tag}] " + format_tool_result(block.content, block.is_error),
-                        )
-            # Trip-wire: too many tool calls without producing exploit.py.
-            # Better to abort cleanly here than let the SDK exhaust its
-            # context window mid-thought ("Prompt is too long").
-            if budget_exceeded(summary["tool_calls"], work_dir, ("exploit.py",)):
-                log_line(
-                    job_id,
-                    "BUDGET_ABORT: investigation budget exceeded "
-                    f"({summary['tool_calls']} tool calls, no exploit.py). "
-                    "Stopping early — retry with a hint to push the agent "
-                    "past the analysis loop.",
-                )
-                summary["agent_error"] = "investigation budget exceeded"
-                summary["agent_error_kind"] = "budget"
-                break
-            if isinstance(msg, ResultMessage):
-                summary["result"] = {
-                    "duration_ms": msg.duration_ms,
-                    "num_turns": msg.num_turns,
-                    "total_cost_usd": msg.total_cost_usd,
-                    "is_error": msg.is_error,
-                }
-                log_line(job_id, f"DONE: {summary['result']}")
-    except Exception as e:
-        msg_text = str(e)
-        kind = classify_agent_error(msg_text)
-        summary["agent_error"] = msg_text
-        summary["agent_error_kind"] = kind
-        log_line(job_id, f"AGENT_ERROR ({kind}): {msg_text[:400]}")
+        sandbox_result = await run_main_agent_session(
+            job_id,
+            options=options,
+            initial_prompt=user_prompt,
+            summary=summary,
+            work_dir=work_dir,
+            artifact_names=("exploit.py",),
+            auto_run=auto_run,
+            sandbox_runner=_sandbox_for,
+            log_fn=lambda s: log_line(job_id, s),
+        )
     finally:
         watchdog.cancel()
         # Clear the awaiting_decision flag if the watchdog already fired —
@@ -176,9 +114,9 @@ async def _run_agent(
             summary["exploit_present"] = "exploit.py" in found
             summary["report_present"] = "report.md" in found
             for name, src in found.items():
-                target = jd / name
-                if src.resolve() != target.resolve():
-                    target.write_bytes(src.read_bytes())
+                target_path = jd / name
+                if src.resolve() != target_path.resolve():
+                    target_path.write_bytes(src.read_bytes())
                 # Mirror into work_dir too — the next /retry uses
                 # `<this_job>/work/` as its carry source via shutil.copytree,
                 # so without this any fallback recovery (file actually written
@@ -189,6 +127,7 @@ async def _run_agent(
                     work_target.write_bytes(src.read_bytes())
         except Exception as carry_err:
             log_line(job_id, f"CARRY_ERROR: {carry_err}")
+    summary["sandbox"] = sandbox_result
     return summary
 
 
@@ -209,12 +148,7 @@ def run_job(
         )
         cost = extract_cost(agent_summary)
 
-        sandbox_result = None
-        if auto_run and agent_summary.get("exploit_present"):
-            write_meta(job_id, stage="sandbox-run")
-            sandbox_result = attempt_sandbox_run(
-                job_id, "exploit.py", target_url, lambda s: log_line(job_id, s)
-            )
+        sandbox_result = agent_summary.pop("sandbox", None)
 
         flags = scan_job_for_flags(job_id)
         agent_err = agent_summary.get("agent_error")
