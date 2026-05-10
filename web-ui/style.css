@@ -521,6 +521,14 @@ button[type="submit"], #refresh-jobs {
   font-size: 0.8rem;
   white-space: pre-wrap;
 }
+/* Description / retry-hint <pre> blocks: don't give them their own
+   internal scrollbar. The outer modal-body scrolls instead, and that
+   scroll position is preserved across polls — so the retry-hint
+   doesn't snap back to the top every 2 seconds while the user reads. */
+#job-detail pre.description-text {
+  max-height: none;
+  overflow: visible;
+}
 .file-links a { color: #58a6ff; margin-right: 1rem; }
 .file-links a.file-preview-link { cursor: pointer; }
 .file-links a.file-preview-link:hover { text-decoration: underline; }
@@ -705,7 +713,11 @@ button[type="submit"], #refresh-jobs {
   padding: 0.7rem 0.85rem 1.2rem;
   border: 0; border-radius: 0;
   margin: 0;
-  /* honor existing max-height + tail-follow behavior elsewhere */
+  /* Override the generic `#job-detail pre { max-height: 400px }` —
+     main agent output is no longer truncated, so the log needs more
+     vertical room. Scales with viewport, capped on huge screens so
+     it doesn't crowd out the rest of the job detail. */
+  max-height: min(60vh, 900px);
 }
 /* Blinking caret at the very end of the <pre>, only while the job is
    live (running or queued — i.e. the log will keep growing). */
@@ -767,10 +779,20 @@ button[type="submit"], #refresh-jobs {
   font-weight: 700; letter-spacing: 0.3px;
 }
 .run-log .rl-budget-body { color: #ffd5d3; }
+/* Runaway-output detection — same family as BUDGET_ABORT but the
+   tripwire is from the SDK side, not the orchestrator. Use a brighter
+   amber so it pops above the regular tool-result stream. */
+.run-log .rl-runaway {
+  color: #f0883e; background: #2a1a08;
+  border: 1px solid #f0883e66; border-radius: 4px;
+  padding: 0 0.35rem; margin-right: 0.35rem;
+  font-weight: 700; letter-spacing: 0.3px;
+}
+.run-log .rl-runaway-body { color: #ffd29c; font-weight: 600; }
 
-/* Agent identity chip — distinguishes main writer vs recon subagent.
-   Lines from `recon` also get a small ↳ indent marker so a Task
-   delegation reads visually like a nested call. */
+/* Agent identity chip — distinguishes main writer vs recon / judge
+   subagents. Subagent lines (recon and judge) also get a small ↳
+   indent marker so a delegation reads visually like a nested call. */
 .run-log .rl-agent-tag {
   display: inline-block;
   font-size: 0.68rem;
@@ -787,6 +809,12 @@ button[type="submit"], #refresh-jobs {
 }
 .run-log .rl-agent-tag-recon {
   color: #ffa657; background: #2a1b08; border-color: #ffa65766;
+}
+.run-log .rl-agent-tag-judge {
+  color: #56d364; background: #0e2415; border-color: #56d36466;
+}
+.run-log .rl-agent-tag-debugger {
+  color: #79c0ff; background: #0c1827; border-color: #79c0ff66;
 }
 .run-log .rl-recon-indent {
   color: #6e7681; margin-right: 0.1rem;

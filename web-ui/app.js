@@ -783,6 +783,12 @@ async function renderJob(id, opts = {}) {
     : true;
   const prevScrollTop = prevPre ? prevPre.scrollTop : 0;
   const isSameJob = prevPre && prevPre.dataset.jobId === id;
+  // Same idea for the OUTER modal-body scroll: detail.innerHTML = ... resets
+  // scrollTop to 0, so anywhere the user scrolled to read the description /
+  // retry-hint chip / result links gets snapped back to the top on every
+  // 2-second poll. Capture it now and restore after the replace, but only
+  // if we're still on the same job (a fresh job starts at the top).
+  const prevModalScrollTop = detail.scrollTop;
 
   // File-link helper. Left-click opens the syntax-highlighting preview
   // modal; middle-click / Ctrl+click / right-click "Open in new tab" still
@@ -1128,6 +1134,12 @@ async function renderJob(id, opts = {}) {
       newPre.scrollTop = prevScrollTop;
     }
   }
+  // Restore the modal-body scroll for same-job re-renders so reading the
+  // retry-hint chip / description / result links isn't yanked back to the
+  // top every 2 seconds.
+  if (isSameJob) {
+    detail.scrollTop = prevModalScrollTop;
+  }
 
   const retryBtn = detail.querySelector('.retry-btn[data-action="retry"]');
   if (retryBtn) {
@@ -1335,6 +1347,11 @@ const _RUNLOG_PATTERNS = [
   // BUDGET_ABORT: body  — investigation budget tripwire fired
   { re: /^(BUDGET_ABORT)\s*:\s*([\s\S]*)$/,
     render: (m) => `<span class="rl-label rl-budget">${escapeHtml(m[1])}</span>: <span class="rl-body rl-budget-body">${escapeHtml(m[2])}</span>` },
+  // RUNAWAY_OUTPUT detected (NNN MB)... — Bash command flooded the SDK,
+  // which auto-truncated to a 2KB preview. Highlight so the agent (and
+  // the human operator) doesn't blunder past it.
+  { re: /^(RUNAWAY_OUTPUT)\s+([\s\S]*)$/,
+    render: (m) => `<span class="rl-label rl-runaway">${escapeHtml(m[1])}</span> <span class="rl-body rl-runaway-body">${escapeHtml(m[2])}</span>` },
   // Lifecycle: ⏰ Soft timeout reached … (watchdog warning)
   { re: /^(⏰\s+Soft timeout reached[\s\S]*)$/,
     render: (m) => `<span class="rl-lifecycle rl-warn">${escapeHtml(m[1])}</span>` },
@@ -1410,22 +1427,22 @@ function _colorizeRunLogLine(line, anchor, state) {
   const ts = _formatLogTs(m[1], anchor, state);
   let rest = m[2];
 
-  // Per-line agent tag: analyzers prefix lines from the main vs the
-  // recon subagent with "[main] " / "[recon] " right after the
-  // timestamp. Strip the tag and render it as a colored chip; recon
-  // lines get a slight indent so a Task delegation reads visually
-  // like a nested call.
+  // Per-line agent tag: analyzers prefix lines with "[main] " /
+  // "[recon] " / "[judge] " / "[debugger] " right after the
+  // timestamp. Strip the tag and render it as a colored chip;
+  // subagent lines (recon / judge / debugger) get a slight indent
+  // so the delegation reads visually like a nested call.
   let agentChip = "";
-  let isRecon = false;
-  const tagMatch = rest.match(/^\[(main|recon)\]\s+([\s\S]*)$/);
+  let isSubagent = false;
+  const tagMatch = rest.match(/^\[(main|recon|judge|debugger)\]\s+([\s\S]*)$/);
   if (tagMatch) {
     const tag = tagMatch[1];
-    isRecon = tag === "recon";
+    isSubagent = tag !== "main";
     rest = tagMatch[2];
     agentChip = `<span class="rl-agent-tag rl-agent-tag-${tag}">${tag}</span>`;
   }
 
-  const indent = isRecon ? '<span class="rl-recon-indent">↳ </span>' : "";
+  const indent = isSubagent ? '<span class="rl-recon-indent">↳ </span>' : "";
 
   for (const p of _RUNLOG_PATTERNS) {
     const mm = rest.match(p.re);
