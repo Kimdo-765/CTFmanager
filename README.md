@@ -5,7 +5,7 @@ Forensic, Misc, Crypto, and Reversing — each combines automated tooling with a
 Claude Code agent that reads the challenge, identifies the vulnerability or
 flag, and generates a runnable exploit/solver script.
 
-Three Claude-driven roles split by responsibility:
+Five Claude-driven roles split by responsibility:
 
 - **reviewer** — Opus 4.7, no tools. Lives in the api container. Reads
   the prior job's `run.log` / exploit / stdout-stderr / source on
@@ -13,28 +13,45 @@ Three Claude-driven roles split by responsibility:
   is hoisted to the next agent's prompt as `⚠ PRIORITY GUIDANCE`.
 - **main worker** — RQ process in the worker container. Drives the
   module pipeline and runs the main Claude agent (writer) that
-  produces `exploit.py` / `solver.py` / `report.md`.
-- **sub worker** — read-only `recon` subagent (in-process under main)
-  + transient sibling sandbox containers (decompiler / forensic /
-  misc / runner / sage) spawned per job and removed when done.
+  produces `exploit.py` / `solver.py` / `report.md`. Hosted in a
+  single `ClaudeSDKClient` session so postjudge feedback can flow
+  back as a new user turn (see [auto-retry triangle](#auto-retry-triangle)).
+- **recon** — read-only static-investigation peer subagent. Same model,
+  separate context window. Returns a ≤2 KB summary so heavy disasm /
+  source greps / decomp triage never pollute main.
+- **judge** — read-only quality-gate peer subagent. Two roles: (1) main
+  invokes it before finalizing for hang/parse review; (2) the
+  orchestrator wraps every `auto_run` execution in a 3-stage
+  pre/supervise/post lifecycle that emits a retry hint on failure.
+- **debugger** — dynamic-analysis peer subagent. Patchelfs the binary
+  against the chal's bundled libc (auto-extracted from the Dockerfile's
+  base image when needed), then runs gdb / strace / ltrace / qemu-user
+  and reports observed runtime state to main. See
+  [debugger](#debugger-modules_commonpy-debugger_agent_prompt).
+
+Sibling sandbox containers (decompiler / forensic / misc / runner /
+sage) are spawned per job and removed when done — orthogonal to the
+five Claude roles above.
 
 See [Architecture](#architecture) and [Agent architecture](#agent-architecture).
 
 Failed jobs (or finished-without-flag) can be **retried** with an automatic
-reviewer-written hint, a hand-written hint, or stop-and-resume mid-run —
-all four paths fork the prior Claude SDK conversation and carry over the
-working directory. See [Retry / Resume](#retry--resume).
+reviewer-written hint, a hand-written hint, or stop-and-resume mid-run.
+There's also an **inline auto-retry loop** that runs without leaving the
+job: when the sandboxed run fails, postjudge's retry_hint is injected back
+into main's same SDK session and main patches + re-finalizes (configurable
+via `AUTO_RETRY_MAX`, default unlimited). See [Retry / Resume](#retry--resume).
 
 ## Modules
 
 | Module | Pipeline | Output |
 |---|---|---|
 | **Web** | Claude reads source zip → identifies vuln → writes `exploit.py` (requests/pwntools) | exploit.py + report.md |
-| **Pwn** | ghiant (Ghidra headless) decompile → Claude analysis → `exploit.py` (pwntools) | exploit.py + report.md |
+| **Pwn** | ghiant decomp + ghiant xrefs (cached Ghidra project) + chal-libc-fix base-image lib extraction + GEF gdb + debugger agent → Claude analysis → `exploit.py` | exploit.py + report.md |
 | **Forensic** | sleuthkit + qemu-img + Volatility 3 artifact sweep → optional Claude summary | summary.json + artifacts/ + report.md |
 | **Misc** | binwalk + foremost + exiftool + steghide + zsteg + pngcheck + qpdf → Claude triage | findings.json + extracted/ + report.md |
 | **Crypto** | Claude analyzes source → writes `solver.py` using gmpy2/sympy/z3/pycryptodome (or `solver.sage` with optional SageMath sandbox) | solver.py + report.md |
-| **Reversing** | ghiant decompile → Claude reverses logic → `solver.py` | solver.py + report.md |
+| **Reversing** | ghiant decomp + xrefs + debugger agent → Claude reverses logic → `solver.py` | solver.py + report.md |
 
 For Web/Pwn/Crypto/Rev, an optional `auto_run` checkbox executes the produced
 script in a sandboxed `runner` container (network-isolated unless a remote
@@ -42,14 +59,15 @@ target is given).
 
 ## Architecture
 
-Four Claude-driven roles, each with its own context window:
+Five Claude-driven roles, each with its own context window:
 
 | Role | Where it runs | Tools | Purpose |
 |---|---|---|---|
 | **reviewer** | `api` container, inline in `/retry` & `/resume` handlers | none (diagnostic only) | Reads the failed prior job and writes a 1-paragraph hint, streamed to the browser |
-| **main worker** | `worker` container, one RQ process per concurrency slot | `Read` `Write` `Edit` `Bash` `Glob` `Grep` `Agent` | Runs the module pipeline; writes `exploit.py` / `solver.py` / `report.md` |
-| **sub worker** | in-process under main (recon) **or** sibling docker container (sandbox) | recon: `Read` `Bash` `Glob` `Grep` (read-only) · sandboxes: shell | Heavy investigation + isolated tool execution |
-| **judge** | `worker` container, around every `auto_run` execution | none (3 short turns, latest model) | Pre-flight script review · stall watchdog · post-mortem verdict for the runner sandbox |
+| **main worker** | `worker` container, one RQ process per concurrency slot | `Read` `Write` `Edit` `Bash` `Glob` `Grep` `Agent` | Runs the module pipeline; writes `exploit.py` / `solver.py` / `report.md` in a single `ClaudeSDKClient` session that auto-retries on postjudge feedback |
+| **recon** (peer subagent) | in-process under main, separate context | `Read` `Bash` `Glob` `Grep` (read-only) | Static investigation: disasm walks, decomp triage, libc symbol lookup, ROPgadget / one_gadget filter, source-tree grep. Returns ≤2 KB summary |
+| **judge** (peer subagent + lifecycle gate) | in-process under main + around every `auto_run` execution | `Read` `Bash` `Glob` `Grep` `Agent` (no Write) | Pre-finalize hang/parse review when invoked by main · pre/supervise/post lifecycle around the runner sandbox · pinned to latest model |
+| **debugger** (peer subagent) | in-process under main, separate context | `Read` `Write` `Edit` `Bash` `Glob` `Grep` `Agent` | Dynamic analysis under gdb (GEF) / strace / ltrace / qemu-user. Auto-extracts the chal's libc + ld + NEEDED libs from the Dockerfile's base image via `chal-libc-fix`. Returns ≤2 KB OBSERVED/TRACE/CONCLUSION/CAVEATS shape |
 
 ```
    browser :8000
@@ -66,17 +84,21 @@ Four Claude-driven roles, each with its own context window:
    └──────────┬────────────┘
               │ RQ
               ▼
-   ┌──── main worker  (N RQ procs) ────┐
-   │  main Claude agent → deliverables │
-   │  + heartbeat + token/cost meter   │
-   └──────┬───────────────────┬────────┘
-          │ Task("recon")     │ docker.sock
-          ▼                   ▼
-   ┌── recon subagent ──┐  ┌── sibling sandboxes ──────┐
-   │  in-process,       │  │  decompiler · forensic ·  │
-   │  read-only,        │  │  misc · runner · sage     │
-   │  ≤2 KB summary     │  │  (per-job, removed)       │
-   └────────────────────┘  └───────────────────────────┘
+   ┌──── main worker  (N RQ procs) ────────────────┐
+   │  ClaudeSDKClient session → deliverables       │
+   │  + auto-retry on postjudge feedback           │
+   │  + heartbeat + token/cost meter               │
+   └─┬────────────┬───────────┬───────────┬────────┘
+     │            │           │           │ docker.sock
+     │ recon      │ judge     │ debugger  │
+     ▼            ▼           ▼           ▼
+   ┌─peer subagents (in-process)─┐  ┌─sibling sandboxes─────────┐
+   │ recon    static, read-only  │  │ decompiler · forensic ·   │
+   │ judge    quality gate       │  │ misc · runner · sage      │
+   │ debugger gdb/strace/ltrace  │  │ (per-job, removed)        │
+   │          + chal-libc-fix    │  └───────────────────────────┘
+   │ each returns ≤2 KB summary  │
+   └─────────────────────────────┘
 ```
 
 ### reviewer (`api/routes/retry.py`)
@@ -96,10 +118,33 @@ Four Claude-driven roles, each with its own context window:
   - Token + cost meter — `result.usage` summed across every turn.
   - Soft-timeout watchdog → `meta.awaiting_decision` banner.
 
-### sub worker — two flavors, both transient to the job
+### peer subagents — in-process under main, transient per job
 
-- **recon subagent** — in-process under main. Same model, **separate context window**. Read-only (`Read` / `Bash` / `Glob` / `Grep`); cannot `Write` or `Edit`. Returns a ≤2 KB compact summary so heavy disasm / source greps / ghiant decompilation never pollute main's history. See [Agent architecture](#agent-architecture).
-- **sibling sandboxes** — `decompiler` (Ghidra), `forensic` (TSK + qemu-img + Vol3), `misc` (binwalk + steghide + …), `runner` (exec exploit.py / solver.py), `sage` (optional Coppersmith / LLL). Built once via `--profile tools`, never started by `compose up`. The worker `docker run`s them per job and removes them when done.
+- **recon** — Same model, **separate context window**. Read-only
+  (`Read` / `Bash` / `Glob` / `Grep`); cannot `Write` or `Edit`. Returns
+  a ≤2 KB compact summary so heavy disasm / source greps / ghiant
+  decompilation never pollute main's history. Decomp triage protocol
+  returns FUNCTIONS inventory + ranked CANDIDATES (HIGH/MED/LOW with
+  bug class + file:line) so main only reads the flagged files. See
+  [Agent architecture](#agent-architecture).
+- **judge** — Quality gate. Used by main pre-finalize for hang/parse
+  review, by the orchestrator around every `auto_run` execution. Pinned
+  to `LATEST_JUDGE_MODEL`. Read-only + `Agent` (can delegate to recon).
+- **debugger** — Dynamic analysis. `gdb -batch` (GEF auto-loaded) /
+  strace / ltrace / qemu-user gdbserver. Always patchelfs the binary
+  against the chal's bundled libc first via `chal-libc-fix` so leaked
+  addresses / heap layouts / one_gadget constraints match the remote.
+  Falls back to extracting libc + ld + every `DT_NEEDED` .so directly
+  from the Dockerfile's `FROM` image when no physical libs are bundled
+  (the common Dreamhack / HackTheBox case). See [debugger](#debugger-modules_commonpy-debugger_agent_prompt).
+
+### sibling sandboxes — transient docker containers
+
+`decompiler` (Ghidra), `forensic` (TSK + qemu-img + Vol3), `misc`
+(binwalk + steghide + …), `runner` (exec exploit.py / solver.py),
+`sage` (optional Coppersmith / LLL). Built once via `--profile tools`,
+never started by `compose up`. The worker `docker run`s them per job
+and removes them when done.
 
 ### judge (`modules/_judge.py`)
 
@@ -110,25 +155,24 @@ tool set (`Read` / `Bash` / `Glob` / `Grep`) plus `Agent` so it can
 delegate heavy investigation to recon. **No `Write` / `Edit`** —
 judge cannot patch the script.
 
-**main ↔ judge ↔ sub** triangle:
+**main ↔ peers** quartet:
 
 ```
-            ┌──────────────── main (writer) ────────────────┐
-            │  Read · Write · Edit · Bash · Glob · Grep ·   │
-            │  Agent(subagent_type="recon" | "judge")       │
-            └────────┬───────────────────────────┬──────────┘
-                     │                           │
-       Agent("recon", ...)                Agent("judge", ...)
-                     │                           │
-                     ▼                           ▼
-            ┌── recon ──────────┐       ┌── judge ──────────────┐
-            │  read-only        │       │  read-only + Agent    │
-            │  ≤2 KB summary    │       │  pinned to latest     │
-            └───────────────────┘       │  model                │
-                     ▲                  └────────┬──────────────┘
-                     │                           │
-                     │       Agent("recon", ...) │
-                     └───────────────────────────┘
+   ┌──────────────────── main (writer) ──────────────────────────┐
+   │  Read · Write · Edit · Bash · Glob · Grep · Agent           │
+   │  subagent_type ∈ {recon, judge, debugger}                   │
+   └────┬───────────────┬─────────────────┬──────────────────────┘
+        │ recon         │ judge           │ debugger
+        ▼               ▼                 ▼
+   ┌── recon ─────┐  ┌── judge ──────┐  ┌── debugger ────────┐
+   │ read-only    │  │ read-only +   │  │ Read/Write/Bash +  │
+   │ static       │  │ Agent         │  │ Agent              │
+   │ ≤2 KB        │  │ pinned latest │  │ chal-libc-fix +    │
+   └──────────────┘  │ model         │  │ gdb (GEF) +        │
+        ▲           └──┬─────────────┘  │ strace/ltrace      │
+        │              │                └─┬──────────────────┘
+        │  Agent("recon", ...)            │  Agent("recon", ...)
+        └──────────────┴──────────────────┘
 ```
 
 **Decision flow — main owns the gate, judge is the advisor**
@@ -186,51 +230,140 @@ reverts to plain blocking wait + bare `exit_code`. The `judge`
 subagent stays registered for main — the toggle only gates the
 orchestrator's pre/super/post lifecycle wrapping.
 
+### Auto-retry triangle
+
+The analyzer runs main inside a single `ClaudeSDKClient` session, not
+fire-and-forget `query()`. After main writes its draft and ends the
+turn, the orchestrator runs the sandbox + judge stages — and on a
+non-success postjudge verdict, **injects the retry_hint as a fresh
+user turn back into the same SDK session** (`run_main_agent_session`
+in `modules/_common.py`). Main reads it like any user follow-up,
+patches the script, re-invokes the JUDGE GATE on the patched file,
+and ends the turn again. Cache prefix preserved across the loop.
+
+```
+   main  ──draft──►  orchestrator  ──run──►  judge  ──verdict──┐
+    ▲                                                          │
+    │                                                          ▼
+    └───── new user turn (retry_hint) ◄── postjudge!=success ──┘
+```
+
+Loop terminates on the FIRST hit among:
+- flag captured / postjudge `verdict == "success"`
+- postjudge produced no actionable retry_hint
+- main's SDK session errored / hit `INVESTIGATION_BUDGET`
+- `AUTO_RETRY_MAX` cap reached (when configured to a non-negative N)
+- user pressed Stop / soft / hard timeout
+
+`AUTO_RETRY_MAX` env var (default `-1` = unlimited). Set to `0` to
+disable the loop, or to a positive int to cap. The natural exit
+conditions above mean unlimited is usually safe — same retry_hint
+back-to-back will quickly land on "no actionable hint" and stop.
+
+### debugger (`modules/_common.py` `DEBUGGER_AGENT_PROMPT`)
+
+Dynamic-analysis peer subagent. Main delegates to it whenever the
+answer depends on observed runtime state rather than disasm —
+canary values, leaked addresses, heap chunk layouts at a breakpoint,
+which one_gadget actually fires given post-leak register state.
+
+Workflow inside one debugger turn:
+
+1. **`chal-libc-fix <bin>`** patches the binary's interpreter +
+   RUNPATH so it loads the chal's bundled libc instead of the
+   worker's system libc (Debian glibc 2.41 at the time of writing).
+   Lookup priority:
+   - explicit `--libs <dir>`,
+   - any `Dockerfile COPY libc-* /…` referencing physical files,
+   - any `lib/` / `libs/` / `glibc/` dir with `libc.so.6` + `ld-linux-*`,
+   - **base-image fallback**: if none of the above hit and a
+     Dockerfile `FROM` line is present, `docker pull` the base image
+     and `docker run --rm -v <stage>:/out` to copy out
+     `/lib*/libc.so.6` + `/lib64/ld-linux-*` + every `DT_NEEDED` SONAME
+     (`readelf -d` the binary, then `ldconfig -p` inside the chal
+     image to resolve each name → real path → `cp -L`). This is the
+     common Dreamhack / HackTheBox pattern: bundle = `Dockerfile +
+     prob`, libs only inside the base image.
+2. **One of three gdb session shapes** (the prompt makes this
+   explicit since the Bash tool is one-shot):
+   - **Pattern A** — short `-ex` chain (≤5 commands).
+   - **Pattern B (recommended)** — `gdb -batch -x /tmp/probe.py`
+     where `probe.py` runs `gdb.execute(...)` in sequence, branches
+     on `gdb.parse_and_eval("$reg")`, and uses GEF helpers
+     (`heap chunks`, `vmmap`, `canary`, `pattern …`, `xinfo`). One
+     gdb session, full programmatic control — the closest thing to
+     interactive REPL the SDK supports.
+   - **Pattern C** — `gdbserver` + multiple `gdb -batch` attaches when
+     state must persist across Bash calls.
+3. **Reply ≤2 KB** in the `OBSERVED / TRACE / CONCLUSION / CAVEATS`
+   shape so main can paste the conclusion directly into its
+   reasoning.
+
+GEF (single-file modern gdb plugin) is auto-loaded via
+`/etc/gdb/gdbinit`; `gdb -nx` disables it for plain gdb. Worker also
+ships `gdb-multiarch`, `qemu-aarch64-static` / `qemu-arm-static` for
+foreign-arch chals, `patchelf`, `strace`, `ltrace`.
+
 ## Agent architecture
 
 For web / pwn / crypto / rev jobs, the **main worker** spins up a
-two-tier Claude agent team — main agent (writer) + `recon` subagent
-(read-only sub worker):
+multi-peer Claude agent team — main agent (writer) plus `recon` /
+`judge` / `debugger` subagents, each with its own context window:
 
 ```
-   main agent (writer)                  recon subagent (read-only)
-   ──────────────────                   ──────────────────────────
-   • drives reasoning                   • answers ONE specific
-   • writes exploit.py /                  question per Task call
-     solver.py / report.md              • Read / Bash / Glob / Grep
-   • Read / Write / Edit /              • CANNOT Write / Edit
-     Bash / Glob / Grep / Agent         • returns ≤2 KB summary
-              │                                    ▲
-              │  Task("recon", "<q>") ─────────────┘
-              ▼
-        compact summary
+   main agent (writer)             recon (static, read-only)
+   ───────────────────             ─────────────────────────
+   • drives reasoning              • libc symbol/offset lookup
+   • writes exploit.py /           • decomp triage protocol
+     solver.py / report.md           (FUNCTIONS + CANDIDATES)
+   • Read/Write/Edit/Bash/         • ROPgadget / one_gadget filter
+     Glob/Grep/Agent               • returns ≤2 KB summary
+   • single ClaudeSDKClient
+     session (auto-retries on     judge (quality gate, latest model)
+     postjudge feedback)          ─────────────────────────────────
+              │                   • pre-finalize hang/parse review
+              │                   • orchestrator pre/supervise/post
+              │                     around the runner sandbox
+   Agent("recon" |               • emits retry_hint that loops back
+   "judge" |                       into main's session
+   "debugger", "<q>")
+              │                   debugger (dynamic, observed state)
+              ▼                   ──────────────────────────────────
+        compact summary           • chal-libc-fix base-image extract
+                                  • gdb (GEF) / strace / ltrace /
+                                    qemu-user gdbserver
+                                  • OBSERVED/TRACE/CONCLUSION/CAVEATS
 ```
 
-Same model on both sides — `recon` exists purely so heavy disasm / symbol
-walks / source-tree greps don't pollute the main agent's conversation
-context. The main agent keeps the only Write/Edit hand on the produced
-files, and only the subagent's compact summary lands in main's context.
+Same model on the writer side and recon/debugger so cache prefixes
+align. Judge is pinned to `LATEST_JUDGE_MODEL`. Each peer exists so
+its own working set doesn't pollute main's context window — only the
+≤2 KB summary lands back in main.
 
-`recon` shares the same Bash environment as `main`, so anything in the
-worker image is reachable: cross-arch binutils (`aarch64-linux-gnu-objdump`,
-`-readelf`, `-nm`, plus the `arm-linux-gnueabi-*` family), `qemu-aarch64-
-static` / `qemu-arm-static` (for running foreign-arch ELFs and
-`qemu-aarch64-static -g 1234` gdbserver), `gdb -batch`, `strace`,
-`ltrace`, `patchelf`, `cpio`, `ROPgadget` with `capstone>=5` (ARM64
-gadgets work), `pwntools` (`ELF`, `cyclic`, `asm`, `ROP`), `ghiant`
-(Ghidra-headless wrapper that writes `./decomp/<func>_<addr>.c`), plus
-`jq` / `xxd` / `7z`. The `recon` system prompt ships a copy-pasteable
-invocation guide grouped by intent (ELF/disasm, symbol/offset lookup,
-gadgets, decompilation, cross-arch execution, dynamic analysis, archive
-unpack, source triage), with two end-to-end Q/A format examples so the
-return shape is consistent.
+All peers share the same Bash environment as `main`, so anything in
+the worker image is reachable: cross-arch binutils
+(`aarch64-linux-gnu-{objdump,readelf,nm}`, `arm-linux-gnueabi-*`),
+`qemu-aarch64-static` / `qemu-arm-static` (for running foreign-arch
+ELFs and `qemu-aarch64-static -g 1234` gdbserver), `gdb` / `gdb-multiarch`
+(GEF auto-loaded), `strace`, `ltrace`, `patchelf`, `chal-libc-fix`,
+`cpio`, `ROPgadget` with `capstone>=5`, `one_gadget`, `pwntools`,
+`ghiant` (Ghidra-headless wrapper into `./decomp/`), `ghiant xrefs`
+(cross-reference query against the cached Ghidra project), plus
+`jq` / `xxd` / `7z`. The recon and debugger system prompts ship
+copy-pasteable invocation guides grouped by intent.
 
-Decompiler output is treated as a first-class input: when `./decomp/`
-is empty and raw disasm is dense, the main agent delegates a single
-`Task("recon", "run ghiant on ./bin/<name> and summarize main / vuln /
-read_input / proc_init in ≤12 lines with file:line + key constants")`,
-and re-greps `./decomp/*.c` itself only for the call site recon points
-at — never opening the whole tree.
+**Ghiant project caching**: the first `ghiant <bin>` call decompiles
+into `./decomp/*.c` AND saves the analyzed Ghidra project under
+`<jobdir>/.ghidra_proj/` (~10s extra). All later `ghiant <bin>`
+re-decomp calls and every `ghiant xrefs <bin> <sym|addr>` query
+reuse that project — cold call ~14s, warm call ~7s on a small ELF.
+
+**Decomp triage protocol**: when `./decomp/` is empty and raw disasm
+is dense, main delegates a single recon call ("run ghiant if empty,
+return FUNCTIONS inventory + ranked CANDIDATES with bug class +
+file:line + NEXT recommendation, skip libc/Go-runtime helpers"), and
+reads only the .c files recon flagged. Walking the whole 50-500 file
+tree is reserved for recon; main does the narrow read.
 
 Each turn the main agent emits an `init` SystemMessage whose `session_id`
 the worker captures into `meta.claude_session_id`. On retry / resume
@@ -246,14 +379,21 @@ useful when you want a hard ceiling instead of letting the SDK exhaust
 its context window with `Prompt is too long`. Set
 `INVESTIGATION_BUDGET=<positive int>` in `.env` to enable.
 
-Each module's SYSTEM_PROMPT opens with a 5-line **MISSION** stanza
+Each module's SYSTEM_PROMPT opens with the **MISSION** stanza
 (`mission_block()` in `modules/_common.py`) that tells the model up
-front: write the deliverables to cwd, delegate heavy investigation
-to recon, write a draft within ~10 tool calls, never disassemble
-libc/framework internals, never re-slice saved disasm. Long tool
-catalogues and module-specific workflows follow the mission stanza,
-so the highest-signal guidance lands in the first few hundred
-tokens of context.
+front: write the deliverables to cwd, delegate STATIC investigation
+to recon and DYNAMIC analysis to debugger, mandatory JUDGE GATE
+before finalize, write a draft within ~10 tool calls, never
+disassemble libc/framework internals, never re-slice saved disasm,
+STOP if a Bash result starts with "Output too large (NNN MB)". Long
+tool catalogues and module-specific workflows follow the mission
+stanza, so the highest-signal guidance lands in the first few
+hundred tokens. The pwn prompt also includes a glibc-version-keyed
+heap/FSOP cheat-sheet with standard chain templates (FSOP
+`_IO_wfile_jumps` overflow, tcache poison + safe-linking, house of
+orange, etc.) so heap chals don't waste turns rediscovering common
+facts; user descriptions matching heap/FSOP keywords additionally
+get a 5-step checklist injected into the user-turn.
 
 ## Prerequisites
 
@@ -305,6 +445,7 @@ All knobs live in two places:
    | `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `999999` | per-turn SDK output cap (the model's own ceiling, ~64k for Sonnet/Opus, becomes the effective limit) |
    | `INVESTIGATION_BUDGET` | `0` | tool-call budget after which a web/pwn/crypto/rev job aborts cleanly if no `exploit.py` / `solver.py` was produced. `0` (default) disables the trip-wire; set to a positive int to enable. |
    | `ENABLE_JUDGE` | `1` | wrap every `auto_run` runner execution with the 3-stage judge (pre / stall-supervise / post). Set to `0` to skip judge calls entirely. See [judge](#judge-modules_judgepy). |
+   | `AUTO_RETRY_MAX` | `-1` | postjudge-driven inline retries within a single job. `0` disables the loop (legacy fire-and-forget). Positive int caps at exactly N retries on top of the initial run. `-1` / `inf` / `unlimited` lets the loop run until natural exit (success, no actionable hint, error, user Stop, timeout). See [auto-retry triangle](#auto-retry-triangle). |
 
 2. **Settings tab** in the UI — writes to `/data/settings.json`, overrides `.env`
    without restart for: Anthropic API key, Claude model, Auth token, Job TTL,
@@ -435,13 +576,32 @@ HexTech_CTF_TOOL/
 ### Pwn
 - Requires the `decompiler` image (Ghidra 12.0.4 by default; override
   `GHIDRA_VERSION`/`GHIDRA_BUILD_DATE` in `.env`).
-- Per-job timeline: ~2–3 min decompile + Claude analysis time.
+- Per-job timeline: ~2–3 min initial decompile + Claude analysis time.
+  Subsequent `ghiant` / `ghiant xrefs` calls reuse the cached Ghidra
+  project under `<jobdir>/.ghidra_proj/` (~5–10s warm).
 - Worker container ships cross-arch CLIs the agent expects from Bash:
   `aarch64-linux-gnu-{objdump,nm,readelf}`, `arm-linux-gnueabi-*`,
-  `qemu-aarch64-static` / `qemu-arm-static`, `gdb`, `gdb-multiarch`,
-  `strace`, `ltrace`, `patchelf`, `cpio`, `ROPgadget` (with
-  `capstone>=5` so ARM64 gadget search actually returns hits),
-  `one_gadget`, `pwn checksec`.
+  `qemu-aarch64-static` / `qemu-arm-static`, `gdb` / `gdb-multiarch`
+  with **GEF** auto-loaded (`/etc/gdb/gdbinit`; use `gdb -nx` to
+  disable), `strace`, `ltrace`, `patchelf`, `cpio`, `ROPgadget`
+  (`capstone>=5` so ARM64 gadget search returns hits), `one_gadget`,
+  `pwn checksec`.
+- **`ghiant xrefs <bin> <sym|addr>`** — cross-reference query against
+  the cached Ghidra project. Returns JSON with every reference site
+  (UNCONDITIONAL_CALL / DATA_READ / DATA_WRITE / etc.) — strictly
+  better than grepping `./decomp/*.c` for an address since Ghidra
+  knows the ref_type. Auto-bootstraps full analysis if the cache
+  isn't present yet, so it's safe to call before `ghiant <bin>`.
+- **`chal-libc-fix <bin>`** — patches the binary's interpreter +
+  RUNPATH so it loads the chal's bundled libc instead of the
+  worker's system libc. Auto-discovers libs from (1) `Dockerfile
+  COPY libc-* /…` lines, (2) `lib/` / `libs/` / `glibc/` dirs in
+  the bundle, (3) **the Dockerfile's `FROM` base image** (docker
+  pulls + extracts `libc.so.6` + `ld-linux-*` + every `DT_NEEDED`
+  SONAME via `ldconfig -p`). Critical for heap/FSOP analysis
+  where offsets shift between glibc versions; the debugger
+  subagent calls it automatically before any gdb session. Pass
+  `--no-image` to skip the base-image fallback.
 - **C++ binaries**: full Ghidra demangler (`/opt/ghidra/GPL/DemanglerGnu`)
   + `c++filt` + `nm -C` / `objdump -d -C`. Decompiled output uses
   unmangled names (`MyClass::method()` not `_ZN7MyClass…`).
@@ -451,11 +611,12 @@ HexTech_CTF_TOOL/
   for first-pass triage: `redress info <bin>` reads Go version +
   module + package counts via pclntab, `redress packages`
   / `types` / `source` for deeper recovery.
-- Dynamic analysis is reachable for foreign-arch ELFs too:
+- **Dynamic analysis** for foreign-arch ELFs:
   `qemu-aarch64-static -g 1234 ./bin/x &` followed by
   `gdb-multiarch -batch -ex 'set arch aarch64' -ex 'target remote
-  :1234' -ex 'b *0x...' -ex 'continue' …` lets the recon subagent
-  break/inspect inside QEMU-user without needing a full system VM.
+  :1234' -ex 'b *0x...' -ex 'continue' …` — the debugger subagent
+  uses this pattern to break/inspect inside QEMU-user without a
+  full system VM.
 
 ### Forensic
 - Auto-detects qcow2 / vmdk / vhd / vhdx / e01 / raw / memory / **log**.
@@ -544,6 +705,15 @@ Internally:
 
 ## Retry / Resume
 
+Two flavors:
+
+1. **Inline auto-retry** (no user click) — driven by postjudge inside
+   the same job. See [Auto-retry triangle](#auto-retry-triangle). Cap
+   via `AUTO_RETRY_MAX` env (default unlimited). The same SDK session
+   is reused, so cache prefix is preserved across retries.
+2. **User-triggered retry / resume** — described below. Spawns a NEW
+   job (new id, new RQ enqueue) and forks the prior SDK session.
+
 Web / Pwn / Crypto / Rev jobs can be re-issued at any terminal status
 (`failed`, `no_flag`, `finished`, `stopped`) — and Stop&resume can also
 fire while the job is still `queued` / `running`. Four buttons:
@@ -613,8 +783,24 @@ enqueued in that case.
   classified by prefix and colored:
   `AGENT` (lavender) · `TOOL <name>` (blue + orange tool name) ·
   `TOOL_RESULT` (green) · `TOOL_ERROR` (red) · `THINK` (yellow italic) ·
-  `DONE` (light blue) · `AGENT_ERROR` / `ERROR` (red bold) · system
-  notes (dim italic).
+  `DONE` (light blue) · `AGENT_ERROR` / `ERROR` (red bold) ·
+  `BUDGET_ABORT` / `RUNAWAY_OUTPUT` (amber, raised) · system notes
+  (dim italic). Each line also gets an **agent tag chip** indicating
+  who emitted it: `main` (purple), `recon` (orange), `judge` (green),
+  `debugger` (blue) — subagent lines additionally indented with a `↳`
+  so a delegation reads visually like a nested call.
+- **UTC ↔ Local timestamp toggle**. Run-log titlebar has a button
+  flipping `[HH:MM:SS]` between UTC (default, what the orchestrator
+  writes to disk) and the user's local timezone. Choice persists in
+  `localStorage`; multi-day jobs handle midnight rollover by
+  anchoring on `meta.started_at`.
+- **Runaway-output guard**. When a Bash result starts with "Output
+  too large (NNN MB)" — typical when the binary loops on its prompt
+  past stdin EOF — an explicit `RUNAWAY_OUTPUT detected (NNN MB)`
+  warning line is appended to run.log and rendered in amber. The
+  agent's system prompt also tells it to STOP and re-examine the
+  command (`| head -c 65536`, `| head -200`, `| grep -m1 PATTERN`)
+  rather than acting on the truncated 2 KB preview.
 - **Live elapsed / duration pill**. Right next to the status badge the
   job header carries a colored pill (`⏱ 12m 45s`):
     - yellow with a soft pulse + `running` tag while live (ticks every
