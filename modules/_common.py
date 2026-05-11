@@ -286,12 +286,19 @@ MISSION (read first, follow strictly)
    correctly, (e) signal/abort fired vs SIGSEGV, (f) glibc version
    when the bundled libc isn't labeled. Don't delegate trivial
    static questions — those go to recon.
-3. BUDGET (soft): after ~10 tool calls without a draft {short},
-   STOP investigating and write the draft from your best hypothesis.
-   Iterate after. There's no hard cap — the worker won't abort you —
-   but a long investigation phase eats your conversation context and
-   you'll run out of room to actually finish. Cheap drafts first,
-   refinement later.
+3. BUDGET (soft 10, hard 100):
+   * SOFT — after ~10 tool calls without a draft {short}, STOP
+     investigating and write the draft from your best hypothesis.
+     Iterate after. Cheap drafts first, refinement later.
+   * HARD — at 100 tool calls (configurable via INVESTIGATION_BUDGET
+     env) WITHOUT an artifact, the orchestrator ABORTS the session.
+     You see this as a `BUDGET_ABORT` log line and `agent_error_kind=
+     budget` in meta. At 80% of the cap (default 80) the orchestrator
+     emits `SOFT_EJECT_WARN` — if you see that, DRAFT NOW. Job
+     9d58fe152fba burned 171 turns in analysis without ever writing
+     exploit.py and died OOM at the final gdb spawn; the budget
+     trip-wire is specifically designed to prevent that pattern from
+     repeating.
 
 JUDGE GATE (mandatory before you finalize)
 ------------------------------------------
@@ -1275,8 +1282,8 @@ Hard rules
   strace runs per delegation. If main asks 5 distinct questions in
   one prompt, answer them in one combined gdb session whenever
   possible (single -ex chain) instead of 5 spawns.
-* PROCESS HYGIENE — CRITICAL for heap chals (the two failures
-  1d00be30d4e9 / a914ca943ed2 both OOM'd from spawn fan-out):
+* PROCESS HYGIENE — CRITICAL for heap chals (failures 1d00be30d4e9 /
+  a914ca943ed2 / 9d58fe152fba all OOM'd from spawn fan-out):
     AT MOST ONE inferior process alive at a time.
     BEFORE spawning a new `./prob` / `./bin/<n>` / `gdb -p PID` /
     `gdbserver` / driver script: clean up first.
@@ -1293,10 +1300,34 @@ Hard rules
     kill stale processes between probes, and DO NOT fork driver
     scripts into the background unless you immediately wait/kill
     them at the end of the same Bash call.
+* OUTPUT-REDIRECT QUOTA — CRITICAL. Job 9d58fe152fba died because
+  a `./prob < stdin > /tmp/probe_out3.bin` looped forever after
+  EOF and wrote 4.2 GiB to /tmp before the OOM-killer fired.
+  Stdout-piped-to-claude has a RUNAWAY_OUTPUT guard; STDOUT-REDIRECTED-
+  TO-A-FILE does NOT. Whenever you redirect to a file:
+    1. ALWAYS bound the command with a tight `timeout` AND a stdin
+       that explicitly closes (`< /tmp/probe.in` not `< /dev/stdin`).
+    2. Cap the receiver. Pick ONE:
+         <cmd> | head -c 4194304 > /tmp/out.bin    # 4 MiB cap
+         timeout 5 <cmd> > /tmp/out.bin            # time cap
+       NEVER `<cmd> > /tmp/out.bin` without one of these.
+    3. After any subprocess run, `pkill -9 -f <cmd_pattern>` AND
+       `ps -ef | grep <prob>` to confirm no zombie/defunct procs
+       are accumulating. A `<defunct>` row is a leaked file handle
+       still consuming memory inside the cgroup.
+    4. `du -sh /tmp/probe_*` before each new spawn — if any file
+       exceeds 100 MiB, `rm -f` it and re-run with a `head -c` cap.
 * heap-probe FIRST: when main's question is about heap state at N
   alloc/free, run `heap-probe` (one-shot, single gdb child, JSON
   output) instead of writing a custom driver. It encapsulates the
   spawn hygiene above and is harder to misuse.
+* ENV ALREADY BOOTSTRAPPED. By the time you're called, the
+  orchestrator has already run `chal-libc-fix` for the main agent,
+  so `./.chal-libs/libc.so.6 + ld-*.so + libc_profile.json` and the
+  patchelf'd `./prob` already exist in main's cwd (which is also
+  YOUR cwd if you weren't given a different one). DO NOT re-run
+  chal-libc-fix from the debugger — it wastes a turn and risks
+  re-patching the binary mid-investigation.
 """
 
 
@@ -2275,6 +2306,35 @@ async def run_main_agent_session(
 
     last_sandbox: dict | None = None
 
+    # Soft-eject machinery: at 80% of INVESTIGATION_BUDGET with no
+    # artifact yet, log a single warning so the operator (and the agent
+    # via the prompt's "you saw this warning" rule) knows the hard
+    # abort is nigh. Fires AT MOST ONCE per job to avoid spamming
+    # auto-retry cycles.
+    soft_eject_fired = {"value": False}
+
+    def _maybe_soft_eject(tool_calls: int) -> None:
+        if soft_eject_fired["value"]:
+            return
+        try:
+            cap = int(os.environ.get("INVESTIGATION_BUDGET", "0"))
+        except ValueError:
+            cap = 0
+        if cap <= 0:
+            return
+        threshold = int(cap * 0.8)
+        if tool_calls < threshold:
+            return
+        if any((work_dir / n).is_file() for n in artifact_names):
+            return
+        soft_eject_fired["value"] = True
+        log_fn(
+            f"SOFT_EJECT_WARN: {tool_calls}/{cap} tool calls without "
+            f"{' / '.join(artifact_names)}. Hard abort fires at "
+            f"{cap}. Agent should draft the artifact NOW from its best "
+            f"hypothesis and refine after."
+        )
+
     async with ClaudeSDKClient(options=options) as client:
         await client.query(initial_prompt)
 
@@ -2292,6 +2352,7 @@ async def run_main_agent_session(
                         log_assistant_blocks(job_id, msg, summary)
                     elif isinstance(msg, UserMessage):
                         log_user_blocks(job_id, msg)
+                    _maybe_soft_eject(summary.get("tool_calls", 0))
                     if budget_exceeded(
                         summary.get("tool_calls", 0),
                         work_dir, artifact_names,

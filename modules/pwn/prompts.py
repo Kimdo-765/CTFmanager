@@ -76,31 +76,27 @@ WORKFLOW
    one_gadget retry SIGSEGV'd).
 4. Need to know "where does X get used?" → `ghiant xrefs ./bin/<n>
    <sym_or_addr>`. Cheaper and more accurate than grep.
-5. STAGE THE CHAL LIBC (do this BEFORE any libc-derived offset work).
-   The worker container ships glibc 2.41; most chals run on 2.27 /
-   2.31 / 2.35 / 2.39. Computing offsets against the worker libc
-   produces SILENTLY-WRONG numbers that look right locally and fail
-   on remote. `./bin/` is read-only — patchelf needs a writable copy:
-       cp -r ./bin/<n> ./prob               # for plain ELF, OR
-       unzip -o ./bin/<n>.zip               # for zipped chal bundles
-       chal-libc-fix ./prob                 # path to writable binary
-   chal-libc-fix scans the chal bundle for a bundled libc + ld; if
-   none is physically present, it falls back to extracting them
-   from the Dockerfile's FROM image. Output goes to `./.chal-libs/`
-   (libc.so.6, ld-*.so, plus any other DT_NEEDED lib). The writable
-   binary is patchelf'd in place — DT_INTERP + RUNPATH point at the
-   staged dir, so `process('./prob')` (the extracted copy) already
-   loads them.
-   ALSO emitted on success: `./.chal-libs/libc_profile.json` — a
-   STRUCTURED snapshot of {version, version_tuple, safe_linking,
-   tcache_key, hooks_alive, io_str_jumps_finish_patched,
-   preferred_fsop_chain, recommended_techniques, blacklisted_techniques,
-   symbols, one_gadget}. READ THIS FIRST instead of re-deriving the
-   facts from `strings`/pwn.ELF — and have exploit.py `json.load` it at
-   runtime so the chain auto-branches on safe_linking / tcache_key.
-   If chal-libc-fix exits 1 (musl/distroless base, no glibc): say so
-   in report.md CAVEATS and fall back to the worker libc, flagging
-   the result as remote-untested.
+5. LIBC IS ALREADY STAGED (auto-bootstrap before your first turn).
+   The orchestrator runs `chal-libc-fix` against `./bin/<first ELF>`
+   automatically, populating `./.chal-libs/{libc.so.6, ld-*.so,
+   libc_profile.json}` and patchelf-ing a writable copy at `./prob`.
+   You DO NOT need to call chal-libc-fix again unless you want to
+   re-patch with `--libs <other_dir>` (rare).
+   FIRST THING you should do, even before reading the binary, is
+   `Read ./.chal-libs/libc_profile.json` (or `cat` it via Bash). The
+   profile is the structured glibc-version → feature-flag → technique
+   matrix encoded as data:
+     {version, version_tuple, arch, safe_linking, tcache_key,
+      tcache_present, hooks_alive, io_str_jumps_finish_patched,
+      preferred_fsop_chain, recommended_techniques,
+      blacklisted_techniques, symbols, one_gadget}
+   The `recommended_techniques` / `blacklisted_techniques` lists are
+   already filtered by the actual glibc version — pick from those
+   instead of cross-checking the cheat-sheet matrix yourself.
+   If `./.chal-libs/libc_profile.json` is ABSENT after autoboot
+   (musl/distroless base, no glibc found), the autoboot log line
+   says so; document it in report.md CAVEATS and fall back to the
+   worker libc, flagging the result as remote-untested.
 6. Compute offsets / gadgets from THE STAGED LIBC, not the worker's:
        libc = ELF('./.chal-libs/libc.so.6')   # YES
        libc = ELF('/lib/x86_64-linux-gnu/...') # NO — wrong version

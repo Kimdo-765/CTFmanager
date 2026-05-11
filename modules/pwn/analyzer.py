@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import shutil
+import subprocess
 import traceback
 from pathlib import Path
 from typing import Optional
@@ -26,6 +28,87 @@ from modules.pwn.prompts import SYSTEM_PROMPT, build_user_prompt
 from modules.settings_io import apply_to_env, get_setting
 
 
+def _autobootstrap_libc(
+    staged_bin: Path, work_dir: Path, log_fn, *, timeout_s: int = 180,
+) -> Path | None:
+    """Run `chal-libc-fix` against the first ELF in <staged_bin> BEFORE the
+    agent starts, so ./.chal-libs/libc_profile.json is always on disk when
+    the agent enters its first turn.
+
+    Why: job 9d58fe152fba (and the earlier OOM pair) skipped chal-libc-fix
+    entirely because the model dove into decompile analysis and never
+    looped back to step 5 of the workflow. With the profile missing, the
+    rest of the heap pipeline (scaffold templates, heap-probe, judge
+    failure_code matrix) operate on absent data. Pre-baking it shifts the
+    pipeline from model-action-dependent to deterministic.
+
+    Best-effort: any failure is logged and swallowed; the agent can still
+    try chal-libc-fix manually from its prompt.
+    """
+    elf_candidates: list[Path] = []
+    try:
+        for f in staged_bin.iterdir():
+            if not f.is_file():
+                continue
+            # Quick ELF magic check — avoids running chal-libc-fix against
+            # .zip / .txt / READMEs that often ship in the bin dir.
+            try:
+                head = f.read_bytes()[:4]
+            except Exception:
+                continue
+            if head == b"\x7fELF":
+                elf_candidates.append(f)
+    except Exception as e:
+        log_fn(f"[autoboot] could not enumerate staged binary dir: {e}")
+        return None
+    if not elf_candidates:
+        log_fn("[autoboot] no ELF found in ./bin/ — skipping chal-libc-fix")
+        return None
+    # Patch the first ELF as the canonical chal target. The agent can
+    # patch additional ones if needed. We copy it to ./prob first so the
+    # original bin/ remains pristine for fall-back inspection.
+    elf = elf_candidates[0]
+    prob = work_dir / "prob"
+    try:
+        if not prob.exists() or prob.stat().st_size != elf.stat().st_size:
+            shutil.copy2(elf, prob)
+            prob.chmod(0o755)
+    except Exception as e:
+        log_fn(f"[autoboot] could not stage ./prob: {e}")
+        return None
+    cmd = ["chal-libc-fix", str(prob)]
+    log_fn(f"[autoboot] running: {' '.join(cmd)}")
+    env = os.environ.copy()
+    try:
+        res = subprocess.run(
+            cmd, cwd=str(work_dir), env=env,
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        log_fn(f"[autoboot] chal-libc-fix timed out after {timeout_s}s")
+        return None
+    except FileNotFoundError:
+        log_fn("[autoboot] chal-libc-fix not on PATH (build is older than the patch)")
+        return None
+    except Exception as e:
+        log_fn(f"[autoboot] chal-libc-fix spawn failed: {e}")
+        return None
+    for line in (res.stdout or "").splitlines()[-12:]:
+        log_fn(f"[autoboot] {line}")
+    for line in (res.stderr or "").splitlines()[-6:]:
+        log_fn(f"[autoboot] STDERR: {line}")
+    profile = work_dir / ".chal-libs" / "libc_profile.json"
+    if profile.is_file():
+        log_fn(f"[autoboot] libc_profile.json ready ({profile.stat().st_size} B)")
+        return profile
+    log_fn(
+        f"[autoboot] chal-libc-fix exited {res.returncode} but no "
+        f"libc_profile.json — likely musl/distroless. Agent falls back to "
+        f"worker libc."
+    )
+    return None
+
+
 async def _run_agent(
     job_id: str,
     binary_name: str,
@@ -48,6 +131,15 @@ async def _run_agent(
             f.chmod(0o755)
         except Exception:
             pass
+
+    # Pre-bake ./.chal-libs/libc_profile.json BEFORE the agent's first
+    # turn. The earlier OOM jobs (1d00be30d4e9 / a914ca943ed2 / 9d58fe152fba)
+    # all skipped this step model-side and the rest of the heap pipeline
+    # became dead code as a result. Doing it here makes the profile
+    # data deterministic; the agent only has to READ it.
+    _autobootstrap_libc(
+        staged_bin, work_dir, lambda s: log_line(job_id, s),
+    )
 
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     resume_sid = read_meta(job_id).get("resume_session_id")

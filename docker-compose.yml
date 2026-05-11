@@ -64,9 +64,14 @@ services:
       # (Sonnet/Opus ~64k) becomes the effective limit. Override in
       # .env to throttle if needed.
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: ${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-999999}
-      # Trip-wire: kill investigation-loop runaway before the SDK
-      # exhausts its conversation context. 0 disables.
-      INVESTIGATION_BUDGET: ${INVESTIGATION_BUDGET:-0}
+      # Trip-wire: ABORT the main session when the agent has burned this
+      # many tool calls without producing exploit.py / solver.py. Default
+      # 100 — empirically jobs 1d00be30d4e9 (169 turns), a914ca943ed2
+      # (168 turns), 9d58fe152fba (171 turns) all OOM'd well before the
+      # cap matters. Set to 0 to disable, or higher if you want more
+      # rope. A soft eject ("draft now, refine later") fires at 80% of
+      # this value; the hard abort fires at 100%.
+      INVESTIGATION_BUDGET: ${INVESTIGATION_BUDGET:-100}
       # Max postjudge-driven auto retries within a single job (in
       # addition to the first attempt). When auto_run is on and the
       # sandbox returns a non-success verdict with an actionable
