@@ -286,6 +286,21 @@ MISSION (read first, follow strictly)
    correctly, (e) signal/abort fired vs SIGSEGV, (f) glibc version
    when the bundled libc isn't labeled. Don't delegate trivial
    static questions — those go to recon.
+
+   SPAWN COST WARNING. Each `Agent(subagent_type="debugger", ...)`
+   call spawns a FRESH Claude SDK child process inside the worker
+   container. The parent (you) keeps running. Two SDK processes
+   share the worker's mem_limit (12 GiB by default). Job
+   011a6d486d53 OOM'd at the moment of a debugger spawn because
+   main had already accumulated ~3.6 M cache_read tokens of
+   brute-force output; two SDK processes + that context tipped
+   past the cap. Mitigation:
+     · NEVER spawn debugger if your most recent Bash result was
+       a multi-screen flood (apply rule 5.5 first).
+     · NEVER spawn debugger AND keep a `process('./prob')` running
+       in parallel — kill all probes first.
+     · Batch debugger questions: ONE delegation that answers 3-5
+       questions is much cheaper than 3-5 separate delegations.
 3. BUDGET (soft 10, hard 100):
    * SOFT — after ~10 tool calls without a draft {short}, STOP
      investigating and write the draft from your best hypothesis.
@@ -372,6 +387,25 @@ a single subagent turn.
    libc-side facts) `./.chal-libs/libc_profile.json`.
 5. NO REPEATED slicing of saved disasm: grep what you need once
    and move on.
+5.5. BULK-LOOP OUTPUT — write to file, summarize. Whenever you run a
+   command that produces MORE than ~40 lines (brute-force sweeps,
+   "guess: B_sb=…" alignment scans, byte-by-byte fdpath comparison,
+   strings -a on a libc, full `objdump -d`, etc.) DO NOT let the raw
+   result land in your tool-result. The output is copied verbatim
+   into your conversation context — 200 lines of brute-force "guess:"
+   blocks (as job 011a6d486d53 did right before OOM) eats 30-50 KB of
+   context and pushes the SDK closer to its memory cap. Pattern:
+
+       <cmd> 2>&1 | tee /tmp/sweep.out | head -5   # peek
+       wc -l /tmp/sweep.out                         # size
+       grep -m 1 "winning_pattern" /tmp/sweep.out   # filter
+
+   For brute-force loops in Python, accumulate hits in a list and
+   `print(json.dumps({"hits": hits[:5], "n": len(hits)}))` — emit a
+   summary, not the firehose. If you genuinely need to see the
+   sweep, READ /tmp/sweep.out section by section instead of pulling
+   the whole thing into one tool result.
+
 6. RUNAWAY OUTPUT — STOP, DO NOT ANALYZE. If a Bash tool result
    begins with "Output too large (NNN MB). Full output saved to..."
    the underlying process produced a flood (typically megabytes to
@@ -1274,7 +1308,14 @@ Hard rules
 * Reply ≤2 KB. Long gdb dumps stay in the worker — main only sees
   your synthesis.
 * No Write to ./exploit.py / ./solver.py / ./report.md — those are
-  main's artifacts. (You can Write scratch scripts under /tmp.)
+  main's artifacts. SCRATCH FILES (probe.py, harness drivers, gdb
+  scripts, dump files) MUST go under /tmp/ — ABSOLUTE path. NEVER
+  write to a relative path, NEVER `cd` into main's cwd, NEVER drop
+  a .py / .gdb / .bin / .log into `/data/jobs/<id>/work/`. Job
+  011a6d486d53 had `probe.py` left in main's work dir by an earlier
+  debugger turn; main then re-read it on a later turn and got
+  confused about which file was authoritative. /tmp is isolated;
+  use it.
 * Do NOT run anything for >120s without a heartbeat. If the binary
   hangs, kill it and report ("hung after recv on fd 0; fed N bytes
   before hang").

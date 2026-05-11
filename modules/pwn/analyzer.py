@@ -28,6 +28,70 @@ from modules.pwn.prompts import SYSTEM_PROMPT, build_user_prompt
 from modules.settings_io import apply_to_env, get_setting
 
 
+def _find_elf_or_unzip(staged_bin: Path, work_dir: Path, log_fn) -> list[Path]:
+    """Find ELF binaries in `staged_bin`. If only zip/tar bundles are
+    present (the standard Dreamhack / HackTheBox shape), unzip the first
+    bundle into <work_dir>/chal/ and rescan there. Returns whatever ELFs
+    were found across both passes.
+    """
+    elfs: list[Path] = []
+
+    def _scan(d: Path) -> None:
+        try:
+            for f in d.rglob("*"):
+                if not f.is_file():
+                    continue
+                try:
+                    head = f.read_bytes()[:4]
+                except Exception:
+                    continue
+                if head == b"\x7fELF":
+                    elfs.append(f)
+        except Exception as e:
+            log_fn(f"[autoboot] scan {d} failed: {e}")
+
+    _scan(staged_bin)
+    if elfs:
+        return elfs
+
+    # No raw ELF — look for archives and unpack one.
+    bundles: list[Path] = []
+    try:
+        for f in staged_bin.iterdir():
+            if not f.is_file():
+                continue
+            n = f.name.lower()
+            if (n.endswith(".zip") or n.endswith(".tar")
+                    or n.endswith(".tar.gz") or n.endswith(".tgz")
+                    or n.endswith(".tar.xz") or n.endswith(".tar.bz2")):
+                bundles.append(f)
+    except Exception:
+        pass
+    if not bundles:
+        log_fn("[autoboot] no ELF and no bundle found in ./bin/ — skipping")
+        return []
+    bundle = bundles[0]
+    out_dir = work_dir / "chal"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_fn(f"[autoboot] unpacking {bundle.name} → {out_dir}")
+    try:
+        if bundle.name.lower().endswith(".zip"):
+            import zipfile
+            with zipfile.ZipFile(bundle) as zf:
+                zf.extractall(out_dir)
+        else:
+            import tarfile
+            with tarfile.open(bundle) as tf:
+                tf.extractall(out_dir)
+    except Exception as e:
+        log_fn(f"[autoboot] bundle unpack failed: {e}")
+        return []
+    _scan(out_dir)
+    if not elfs:
+        log_fn(f"[autoboot] bundle {bundle.name} contained no ELF")
+    return elfs
+
+
 def _autobootstrap_libc(
     staged_bin: Path, work_dir: Path, log_fn, *, timeout_s: int = 180,
 ) -> Path | None:
@@ -35,32 +99,24 @@ def _autobootstrap_libc(
     agent starts, so ./.chal-libs/libc_profile.json is always on disk when
     the agent enters its first turn.
 
-    Why: job 9d58fe152fba (and the earlier OOM pair) skipped chal-libc-fix
-    entirely because the model dove into decompile analysis and never
-    looped back to step 5 of the workflow. With the profile missing, the
-    rest of the heap pipeline (scaffold templates, heap-probe, judge
-    failure_code matrix) operate on absent data. Pre-baking it shifts the
-    pipeline from model-action-dependent to deterministic.
+    Why: jobs 9d58fe152fba / 011a6d486d53 (and the earlier OOM pair)
+    skipped chal-libc-fix entirely because the model dove into decompile
+    analysis and never looped back to step 5 of the workflow. With the
+    profile missing, the rest of the heap pipeline (scaffold templates,
+    heap-probe, judge failure_code matrix) operate on absent data.
+    Pre-baking it shifts the pipeline from model-action-dependent to
+    deterministic.
+
+    .zip / .tar bundles (Dreamhack standard) are auto-unpacked into
+    <work_dir>/chal/ first; the first ELF found anywhere under there
+    becomes the chal target. Job 011a6d486d53 hit this case (zip in
+    ./bin/) — autoboot stopped at the ELF magic check and main ended
+    up doing the unpack + chal-libc-fix manually 48 s into the run.
 
     Best-effort: any failure is logged and swallowed; the agent can still
     try chal-libc-fix manually from its prompt.
     """
-    elf_candidates: list[Path] = []
-    try:
-        for f in staged_bin.iterdir():
-            if not f.is_file():
-                continue
-            # Quick ELF magic check — avoids running chal-libc-fix against
-            # .zip / .txt / READMEs that often ship in the bin dir.
-            try:
-                head = f.read_bytes()[:4]
-            except Exception:
-                continue
-            if head == b"\x7fELF":
-                elf_candidates.append(f)
-    except Exception as e:
-        log_fn(f"[autoboot] could not enumerate staged binary dir: {e}")
-        return None
+    elf_candidates = _find_elf_or_unzip(staged_bin, work_dir, log_fn)
     if not elf_candidates:
         log_fn("[autoboot] no ELF found in ./bin/ — skipping chal-libc-fix")
         return None

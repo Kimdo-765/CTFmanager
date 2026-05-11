@@ -50,8 +50,14 @@ services:
     # cgroup limit the OOM stays inside the container; the SDK
     # session ends cleanly with an error_kind we can classify.
     # Override via .env if you have a different RAM budget.
-    mem_limit: ${WORKER_MEM_LIMIT:-8g}
-    memswap_limit: ${WORKER_MEM_LIMIT:-8g}
+    #
+    # Default raised 8g → 12g after job 011a6d486d53: main session
+    # accumulated ~3.6M cache_read tokens then spawned debugger as
+    # a fresh SDK child process. Two SDK instances + main brute-force
+    # output context squeezed past 8g cap right at the debugger spawn.
+    # 12g gives ~50% headroom while still containing pathological loops.
+    mem_limit: ${WORKER_MEM_LIMIT:-12g}
+    memswap_limit: ${WORKER_MEM_LIMIT:-12g}
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
