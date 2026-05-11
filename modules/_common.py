@@ -356,8 +356,13 @@ in source review — judge specifically checks for it. The cost is
 a single subagent turn.
 4. NO LIB INTERNAL DIVE: don't disassemble musl/glibc printf,
    vfprintf, vararg dispatchers, FILE struct internals, framework
-   request dispatchers, or pycryptodome/sympy internals. Use symbol
-   tables + standard library calls.
+   request dispatchers, or pycryptodome/sympy internals. Also skip
+   C++ STL internals (`std::string`, `std::vector`, `std::unordered_map`,
+   `std::__shared_ptr_access<...>`, `std::__cxx11::basic_string`,
+   compiler-generated `~T()` thunks) — they are templated noise and
+   tell you nothing about the chal. Look at the CALL SITE, not the
+   library body. Use symbol tables + standard library calls + (for
+   libc-side facts) `./.chal-libs/libc_profile.json`.
 5. NO REPEATED slicing of saved disasm: grep what you need once
    and move on.
 6. RUNAWAY OUTPUT — STOP, DO NOT ANALYZE. If a Bash tool result
@@ -441,12 +446,32 @@ Web-specific:
 
 TOOLS_PWN = _TOOLS_BASE + """\
 Pwn-specific:
-  - dynamic        : gdb (no extra plugins — use Python scripts via -x),
+  - dynamic        : gdb (GEF auto-loaded; pwndbg available via
+                     GDB_USE_PWNDBG=1 if built into the image),
                      strace, ltrace
   - binary surgery : patchelf, qemu-aarch64-static / qemu-arm-static
                      (run cross-arch ELFs with `qemu-<arch>-static ./bin`)
+  - libc staging   : `chal-libc-fix ./bin/<name>` — patchelf the binary
+                     against the chal's bundled (or Dockerfile-FROM
+                     extracted) libc + ld, staged at ./.chal-libs/.
+                     ALSO emits ./.chal-libs/libc_profile.json with
+                     {version, safe_linking, tcache_key, hooks_alive,
+                      preferred_fsop_chain, symbols, one_gadget}.
+                     RUN THIS BEFORE pwn.ELF() / one_gadget / ROPgadget
+                     against libc — worker libc is glibc 2.41 (wrong).
+  - heap state     : `heap-probe ./prob --input <in> --break <bp>
+                     --dump tcache,fastbin,unsorted,chunks --max-hits N`
+                     gdb-batch harness; emits JSON timeline {events:[...]}
+                     for each breakpoint hit. Cheaper than ad-hoc gdb.
+  - scaffolds      : /opt/scaffold/{heap_menu,fsop_wfile,tcache_poison,
+                     aslr_retry}.py — copy-paste templates for menu /
+                     FSOP / tcache / nibble-race chains. Load
+                     libc_profile.json automatically.
+                       `cp /opt/scaffold/heap_menu.py ./exploit.py`
   - gadgets        : ROPgadget --binary ./bin/<name> --rop / --jop
   - decompiler     : `ghiant <binary> [outdir]` (Ghidra headless, ./decomp/)
+  - libc id (remote-only): `pwn libcdb find <sym> <leak>` — queries
+                     libc-database web API, returns matching versions.
   - Python (import): pwn (pwntools — checksec / ELF / cyclic / asm / shellcraft),
                      Crypto, gmpy2, sympy, z3
 """
@@ -614,6 +639,17 @@ will answer.
   Heap / FSOP probes (main's most expensive failure mode is
   rediscovering glibc-version-specific facts; you can answer most
   of these in <30s of Bash):
+    # PREFERRED: read the structured profile chal-libc-fix already emitted.
+    # ./.chal-libs/libc_profile.json carries version + safe_linking +
+    # tcache_key + hooks_alive + preferred_fsop_chain + symbols +
+    # one_gadget. If it's there, the answer to most "heap essentials"
+    # questions is a one-line `cat`/`jq` against this file — NO need
+    # to re-derive from strings / pwn.ELF / one_gadget yourself.
+    cat ./.chal-libs/libc_profile.json
+    jq '.version, .safe_linking, .preferred_fsop_chain' ./.chal-libs/libc_profile.json
+    jq '.symbols | with_entries(select(.value != null))' ./.chal-libs/libc_profile.json
+    # Only fall through to the manual probes below if the profile is
+    # missing (chal-libc-fix exited 1 — musl/distroless base, etc.).
     # glibc version + linux-vdso + tls hints
     strings <libc> | grep -F 'GLIBC ' | head -3
     # FSOP-relevant offsets in one shot
@@ -627,6 +663,24 @@ will answer.
     one_gadget -l 1 <libc>        # most permissive only
     # tcache layout sanity (look for tcache_perthread_struct sizing)
     aarch64-linux-gnu-readelf -p .rodata <libc> | grep -E 'tcache|chunk'
+
+  Heap state at runtime — standard recipe via the heap-probe wrapper:
+    # Capture tcache/fastbin/unsorted at every `free` hit, up to 10:
+    echo -e 'alloc 0x68 AAA\\nalloc 0x68 BBB\\nfree 0\\nfree 1' > /tmp/menu.in
+    heap-probe ./prob --input /tmp/menu.in \\
+        --break 'free+8' --dump tcache,fastbin,unsorted,chunks \\
+        --max-hits 10 --out /tmp/hs.json
+    jq '.events[].dumps.tcache' /tmp/hs.json | head -40
+    # The output is a JSON timeline {events:[{pc,function,hit,dumps}]},
+    # so you can grep specific events instead of re-running gdb.
+
+  Remote-only libc identification (chal didn't ship a libc bundle):
+    # If main already has a partial leak (e.g. printf, system, or any
+    # libc address with low bytes), `pwn libcdb find` queries the
+    # libc-database web API and returns matching versions + symbols.
+    pwn libcdb find system 0x7f00...410   # last-3-nibble match works
+    # Once a match is identified, download the libc + ld and rerun
+    # `chal-libc-fix ./bin/<n> --libs <download_dir>` to stage them.
 
 Decomp triage protocol — main's #1 use case
 -------------------------------------------
@@ -650,13 +704,21 @@ Required output shape (≤2 KB total):
   CANDIDATES (functions main MUST read next, ranked by suspicion):
     <name> @ <addr> [SEV=HIGH|MED|LOW]
       pattern: <bug class — BoF, fmt-string, UAF, cmd-injection,
-                int-overflow, weak-RNG, hard-coded-key, custom-VM, …>
+                int-overflow, signed/unsigned-confusion, OOB-index,
+                weak-RNG, hard-coded-key, custom-VM, …>
       file: ./decomp/<name>_<addr>.c[:<line>]
       why: <ONE sentence — what makes it suspicious>
+      verify: objdump -d -j .text ./bin/<n> | sed -n '/<addr_hex>:/,/^$/p' | head -60
+              # main runs this BEFORE writing the primitive — assembly
+              # is the truth (movzx/movsx, lea scale+disp, cmp+jXX, vtable slot).
     ...
   Cap at 5 candidates. If nothing looks vulnerable (well-formed code,
   small surface), say so and list the 1-2 functions main should
   read for orientation anyway (usually `main`, `handle_*`, `do_*`).
+  The `verify:` line is MANDATORY when pattern is one of
+  {int-overflow, signed/unsigned-confusion, OOB-index, UAF (C++),
+  heap.*} — those are the bug classes where decompile lies and the
+  exploit fails silently. Plain BoF / fmt-string is fine without it.
 
   NEXT (one-line recommendation):
     "Read ./decomp/<name>_<addr>.c first — <one-line reason>."
@@ -701,13 +763,23 @@ Question + answer format examples (ALWAYS this tight):
          why: printf(name) where name is read_input(0x20) — direct
               fmt-string. Same fn then read(buf, 0x200) into a
               0x100 stack buffer.
+         # plain BoF + fmt-string → verify line not required
+       copy_obj @ 0x104143 [SEV=HIGH]
+         pattern: signed/unsigned-confusion + OOB-index
+         file: ./decomp/copy_obj_00104143.c:71
+         why: ulong idx; sentinel check is `idx == -1` but indexing
+              path does `parent.children[(idx+8)*8]` without bound —
+              wrap-around on negative idx hits the chunk header.
+         verify: objdump -d -j .text ./bin/prob | sed -n '/100143:/,/^$/p' | head -60
+                 # heap chal: confirm `movzx`/`lea rcx+rsi*8+0x40` math
+                 # before sending p64(0xffffffffffffffff).
        read_input @ 0x100ac4 [SEV=LOW]
          pattern: bounded read, looks correct
          file: ./decomp/read_input_00100ac4.c
          why: orientation only — confirms no off-by-one in n.
 
-     NEXT: Read ./decomp/vuln_00100bd0.c first — fmt-string + BoF in
-     same function, two primitives in one shot.
+     NEXT: Read ./decomp/copy_obj_00104143.c first, then run the
+     `verify:` disasm cmd before drafting the OOB primitive.
      ```
 
   Q: "summarize what `vuln()` and `read_input()` do, with buffer
@@ -722,6 +794,40 @@ Question + answer format examples (ALWAYS this tight):
      read_input (./decomp/read_input_00100ac4.c)
        - read(0, dst, n); strips trailing \\n; null-terminates at \\0 or n
      ```
+
+  Q: "heap essentials for ./.chal-libs/libc.so.6: version, feature
+      flags, FSOP recommendation, hooks, key symbols, one_gadget"
+  A: ```
+     # FIRST try the cached profile chal-libc-fix wrote:
+     #   cat ./.chal-libs/libc_profile.json
+     # Falls through to manual probes only when the profile is absent.
+
+     {
+       "version": "2.31",
+       "version_tuple": [2, 31],
+       "safe_linking": false,
+       "tcache_key": false,
+       "hooks_alive": true,
+       "io_str_jumps_finish_patched": false,
+       "preferred_fsop_chain": "_IO_str_jumps __finish (vtable[12])",
+       "symbols": {
+         "system":          "0x55410",
+         "/bin/sh":         "0x1b75aa",
+         "__free_hook":     "0x1eeb28",
+         "__malloc_hook":   "0x1ecb70",
+         "_IO_2_1_stdout_": "0x1ed5a0",
+         "_IO_list_all":    "0x1ed5a0",
+         "_IO_wfile_jumps": "0x1e8f60",
+         "_IO_str_jumps":   "0x1ed560"
+       },
+       "one_gadget": [
+         {"offset": "0x4527a", "constraints": ["[rsp+0x30]==NULL"]},
+         {"offset": "0xf03a4", "constraints": ["[rsp+0x50]==NULL"]}
+       ]
+     }
+     ```
+     Cite by name in the reply ("safe_linking=false → write raw fd")
+     so main can branch its strategy on JSON instead of prose.
 
 Bash gotchas:
 - `cd` PERSISTS across Bash tool calls — use absolute paths or
@@ -876,6 +982,25 @@ don't catch — flag these aggressively when the script touches
   with NO version check. They shift between glibc patch levels.
   Either derive from the supplied libc.so via `pwn.ELF()` at
   runtime, or include an explicit `assert` on libc_base & 0xfff.
+* `pwn.ELF('/lib/x86_64-linux-gnu/libc.so.6')` or any other path
+  pointing at the WORKER's system libc (currently glibc 2.41).
+  Worker libc rarely matches the chal's libc — symbols.system,
+  one_gadget offsets, _IO_list_all, etc. will be silently wrong.
+  Correct path is `./.chal-libs/libc.so.6` (staged by chal-libc-fix).
+  If `./.chal-libs/libc.so.6` doesn't exist on disk yet, that's a
+  HIGH finding too — main skipped the libc-staging step. Recommend
+  running `chal-libc-fix ./bin/<n>` before computing offsets.
+  Postjudge: emit `failure_code=heap.libc_version_mismatch`.
+
+Heap failure_code preamble (post-stage only): when verdict is
+crash / hung / parse_error / unknown AND the script touches heap
+constructs (tcache / fastbin / _IO_* / vtable / FSOP / unsorted),
+populate the `failure_code` field with the BEST-FITTING code from
+the postjudge prompt's catalogue. The orchestrator prepends a
+deterministic prescriptive fix (HEAP_FIX_HINTS in modules._common)
+ahead of your free-form retry_hint, so a precise code is worth more
+than a long paragraph. When in doubt, leave failure_code unset
+rather than guessing — a wrong code prepends a misleading fix.
 * Heap / libc leak NEVER validated before being used as a base.
   An `assert leaked & 0xfff == 0` (libc page-aligned) on the libc
   base prevents one whole class of "the chain ran on garbage".
@@ -920,9 +1045,42 @@ Reply (≤2 KB) with EXACTLY the values main needs, formatted tight:
 
 Tool catalogue (Bash inside the worker container)
 -------------------------------------------------
+* heap-probe — STANDARDIZED heap-state dumper. Use this FIRST when the
+  main agent's question is "what's the tcache / fastbin / unsorted
+  state after N alloc/free" — it wraps gdb-batch + GEF and emits a
+  JSON timeline so you don't re-roll the same harness on every call:
+
+    # Send a sequence of menu inputs, break on every free, dump
+    # tcache + fastbin + unsorted + heap chunks at each hit.
+    cat > /tmp/in <<'EOF'
+    1
+    0
+    0x68
+    AAAA
+    1
+    1
+    0x68
+    BBBB
+    2
+    0
+    2
+    1
+    EOF
+    heap-probe ./prob --input /tmp/in \\
+        --break 'free+8' --dump tcache,fastbin,unsorted,chunks \\
+        --max-hits 6 --out /tmp/hs.json
+    jq '.events[].dumps.tcache' /tmp/hs.json
+
+  --gdb gdb-multiarch for foreign-arch ELFs. Output JSON layout:
+    {"events": [
+       {"pc": "0x...", "function": "free", "hit": 1,
+        "dumps": {"tcache": "...", "fastbin": "...", "unsorted": "..."}},
+       ...], "hits": N}
+
 * gdb / gdb-multiarch — modern (16.x). GEF auto-loads via
-  /etc/gdb/gdbinit; use `gdb -nx` to disable plugins. Common
-  one-shot patterns:
+  /etc/gdb/gdbinit; if the image was built with INSTALL_PWNDBG=1 you
+  can opt into pwndbg via `GDB_USE_PWNDBG=1 gdb …`. Use `gdb -nx` to
+  disable plugins entirely. Common one-shot patterns:
 
     # Break at function entry, dump regs + stack
     gdb -batch -nh \\
@@ -1065,6 +1223,15 @@ Output:
   [chal-libc-fix] glibc version:    2.31
   [chal-libc-fix] staged at:        /data/jobs/.../work/.chal-libs
   [chal-libc-fix] patched: interpreter -> /…/.chal-libs/ld-2.31.so
+  [chal-libc-fix] profile: /data/jobs/.../work/.chal-libs/libc_profile.json (version=2.31)
+
+The profile is a structured snapshot of {version, safe_linking,
+tcache_key, hooks_alive, io_str_jumps_finish_patched,
+preferred_fsop_chain, recommended_techniques, blacklisted_techniques,
+symbols, one_gadget}. When main asks "what's the FSOP path on this
+glibc / does __free_hook still exist / does safe-linking apply",
+`cat ./.chal-libs/libc_profile.json` is the answer — no need to
+re-derive from strings/pwn.ELF.
 
 After patching, `./bin/foo` runs against the staged libc directly
 because `patchelf --set-rpath` baked the staged-libs path into the
@@ -1108,6 +1275,28 @@ Hard rules
   strace runs per delegation. If main asks 5 distinct questions in
   one prompt, answer them in one combined gdb session whenever
   possible (single -ex chain) instead of 5 spawns.
+* PROCESS HYGIENE — CRITICAL for heap chals (the two failures
+  1d00be30d4e9 / a914ca943ed2 both OOM'd from spawn fan-out):
+    AT MOST ONE inferior process alive at a time.
+    BEFORE spawning a new `./prob` / `./bin/<n>` / `gdb -p PID` /
+    `gdbserver` / driver script: clean up first.
+        pkill -9 -f "./prob" 2>/dev/null
+        pkill -9 -f gdbserver 2>/dev/null
+        pkill -9 -f run_driver 2>/dev/null
+        pkill -9 -f probe_driver 2>/dev/null
+        sleep 0.5
+    Each pwntools `process(...)` keeps ~30-80 MB resident; gdb adds
+    another ~150 MB; concurrent inferiors stack quickly past the
+    worker's mem_limit (default 8 GB) and trip the cgroup OOM-killer
+    on the bundled `claude` CLI — your whole job dies with exit
+    code -9 before you can finish the report. Use one Bash call to
+    kill stale processes between probes, and DO NOT fork driver
+    scripts into the background unless you immediately wait/kill
+    them at the end of the same Bash call.
+* heap-probe FIRST: when main's question is about heap state at N
+  alloc/free, run `heap-probe` (one-shot, single gdb child, JSON
+  output) instead of writing a custom driver. It encapsulates the
+  spawn hygiene above and is harder to misuse.
 """
 
 
@@ -1490,19 +1679,86 @@ def classify_agent_error(message: str) -> str | None:
         return "timeout"
     if "auth" in low or "401" in low or "credential" in low:
         return "auth"
+    if "exit code -9" in low or "sigkill" in low or "killed by signal 9" in low:
+        return "oom_or_killed"
     return "unknown"
 
 
+# Approximate per-million-token prices in USD (Anthropic public pricing,
+# 2026-Q2). Only used as a FALLBACK when the SDK's authoritative
+# `ResultMessage.total_cost_usd` never arrives — the typical case is
+# SIGKILL / OOM on the bundled `claude` CLI before it can emit the
+# final accounting message, which historically left meta.cost_usd at
+# $0.00 even for runs that obviously spent dollars (see the
+# 1d00be30d4e9 / a914ca943ed2 OOM jobs).
+# Tuple shape: (input, cache_create, cache_read, output) per Mtok.
+_MODEL_RATES_USD_PER_MTOK = {
+    "opus":   (15.0, 18.75, 1.50, 75.0),
+    "sonnet": (3.0,  3.75,  0.30, 15.0),
+    "haiku":  (1.0,  1.25,  0.10, 5.0),
+}
+
+
+def _rates_for_model(model: str | None) -> tuple[float, float, float, float]:
+    if model:
+        low = model.lower()
+        for needle, rates in _MODEL_RATES_USD_PER_MTOK.items():
+            if needle in low:
+                return rates
+    # Unknown — default to opus rates (conservative upper bound so
+    # the fallback never under-reports a real spend).
+    return _MODEL_RATES_USD_PER_MTOK["opus"]
+
+
+def estimate_cost_from_tokens(
+    tokens: dict | None, model: str | None,
+) -> float:
+    """Rough cost estimate from accumulated agent_tokens + model name.
+
+    Schema (see `_accumulate_tokens` and `_TOKEN_KEYS`):
+      tokens = {
+        "input_tokens":               int,
+        "output_tokens":              int,
+        "cache_creation_input_tokens": int,
+        "cache_read_input_tokens":    int,
+      }
+    Any missing key is treated as 0. Returns 0.0 if `tokens` is empty.
+    """
+    if not isinstance(tokens, dict) or not tokens:
+        return 0.0
+    inp = float(tokens.get("input_tokens") or 0)
+    out = float(tokens.get("output_tokens") or 0)
+    cw = float(tokens.get("cache_creation_input_tokens") or 0)
+    cr = float(tokens.get("cache_read_input_tokens") or 0)
+    r_in, r_cw, r_cr, r_out = _rates_for_model(model)
+    return ((inp * r_in) + (cw * r_cw) + (cr * r_cr) + (out * r_out)) / 1_000_000.0
+
+
 def extract_cost(claude_summary: dict | None) -> float:
-    """Pull total_cost_usd out of an agent summary dict, returning 0.0 if absent."""
+    """Pull total_cost_usd out of an agent summary dict, returning 0.0 if absent.
+
+    Preference order:
+      1. summary['result']['total_cost_usd']  (authoritative — ResultMessage)
+      2. summary['cost_usd']                  (mirrored by run_main_agent_session
+                                               when ResultMessage was lost)
+      3. estimate from summary['agent_tokens'] + summary['model']
+         (last-resort fallback so SIGKILL'd runs still show a non-zero,
+         estimated spend instead of $0.00).
+    """
     if not isinstance(claude_summary, dict):
         return 0.0
     res = claude_summary.get("result")
     if isinstance(res, dict):
         v = res.get("total_cost_usd")
-        if isinstance(v, (int, float)):
+        if isinstance(v, (int, float)) and v > 0:
             return float(v)
-    return 0.0
+    direct = claude_summary.get("cost_usd")
+    if isinstance(direct, (int, float)) and direct > 0:
+        return float(direct)
+    return estimate_cost_from_tokens(
+        claude_summary.get("agent_tokens"),
+        claude_summary.get("model"),
+    )
 
 
 def format_tool_result(content: Any, is_error: bool | None = None) -> str:
@@ -1738,6 +1994,128 @@ def auto_retry_max() -> int:
     return max(0, n)
 
 
+# Heap-specific failure code → prescriptive fix snippet. Kept here next
+# to _format_postjudge_user_turn so the model's textual retry_hint is
+# always sharpened by a deterministic "this code → this exact fix"
+# preamble. The keys mirror _VALID_HEAP_FAILURE_CODES in modules._judge.
+HEAP_FIX_HINTS: dict[str, str] = {
+    "heap.libc_version_mismatch": (
+        "FIX: Use ./.chal-libs/libc.so.6 (NOT the worker's system "
+        "libc) for ALL offset / one_gadget / ROPgadget queries. If "
+        "./.chal-libs/libc.so.6 doesn't exist yet, run "
+        "`chal-libc-fix ./bin/<n>` first — it writes "
+        "./.chal-libs/libc_profile.json with version + safe_linking + "
+        "tcache_key + hooks_alive flags you can `json.load` in your "
+        "exploit. Worker libc is glibc 2.41 which almost never matches "
+        "the chal."
+    ),
+    "heap.unaligned_libc_base": (
+        "FIX: Validate every libc base before using it. Add "
+        "`assert (leaked & 0xfff) == EXPECTED_PAGE_OFF` immediately "
+        "after the leak. If the assert fires, your sym_offset is wrong "
+        "for this glibc — re-derive from ./.chal-libs/libc.so.6 via "
+        "pwn.ELF() OR delegate the offset lookup to recon (one-shot "
+        "JSON of symbol→offset)."
+    ),
+    "heap.safe_linking_missing": (
+        "FIX: glibc >= 2.32 uses safe-linking. tcache fd value MUST be "
+        "`target_addr ^ (heap_chunk_addr >> 12)` — NOT raw target. "
+        "Leak a heap address FIRST (e.g. write a freed-chunk's fd back "
+        "via show()), then XOR. Use "
+        "`from scaffold.tcache_poison import safe_link; "
+        "fd = safe_link(target, chunk_addr)` — it branches on the "
+        "libc_profile.json safe_linking flag automatically."
+    ),
+    "heap.safe_linking_misapplied": (
+        "FIX: glibc <= 2.31 has NO safe-linking. Drop the XOR — write "
+        "the raw target address as the freed chunk's fd. Verify the "
+        "glibc version via `./.chal-libs/libc_profile.json` "
+        "(`safe_linking: false`) before re-writing."
+    ),
+    "heap.hook_on_modern_libc": (
+        "FIX: `__free_hook` / `__malloc_hook` / `__realloc_hook` were "
+        "REMOVED in glibc 2.34. Switch your AAW target to one of: "
+        "(a) `_IO_list_all` overwrite + FSOP via _IO_wfile_jumps "
+        "overflow → _IO_wdoallocbuf (see /opt/scaffold/fsop_wfile.py), "
+        "(b) `__exit_funcs` (needs PTR_MANGLE stack/TLS leak), or "
+        "(c) `_rtld_global._dl_rtld_lock_recursive`. Read "
+        "./.chal-libs/libc_profile.json → `preferred_fsop_chain` for "
+        "the recommended path on this glibc version."
+    ),
+    "heap.str_finish_patched": (
+        "FIX: `_IO_str_jumps` __finish chain was patched in glibc "
+        "2.37. Switch to `_IO_wfile_jumps` overflow → `_IO_wdoallocbuf` "
+        "→ `_wide_vtable->__doallocate` = your gadget. Use "
+        "`scaffold.fsop_wfile.build_full_chain(fake_file_addr=..., "
+        "doallocate_addr=...)` which returns the body WITHOUT the "
+        "vtable pointer; flip the vtable separately, LAST."
+    ),
+    "heap.vtable_write_order_violated": (
+        "FIX: FSOP vtable pointer MUST be the LAST write of the "
+        "chain. Order: (1) write _IO_FILE_plus body, (2) write "
+        "_wide_data, (3) write _wide_vtable / __doallocate, (4) write "
+        "/bin/sh if you need it, (5) ONLY NOW flip vtable = "
+        "_IO_wfile_jumps. Any incidental stdio (prompt loop, log "
+        "print) between the vtable flip and the trigger fires "
+        "_IO_wfile_overflow on partial state and SIGSEGVs. The "
+        "/opt/scaffold/fsop_wfile.py helpers enforce this — "
+        "build_full_chain() leaves the vtable slot zeroed."
+    ),
+    "heap.tcache_key_not_bypassed": (
+        "FIX: glibc >= 2.35 adds a `key` field at offset +0x08 of "
+        "every tcache chunk. Double-free aborts with `free(): double "
+        "free detected in tcache 2`. Pattern: `free(victim); "
+        "edit(victim, p64(0))  # zero the key via UAF; "
+        "free(victim)`. The key-bypass check is helper-available in "
+        "/opt/scaffold/tcache_poison.py::needs_key_bypass(). After "
+        "that, normal tcache poison resumes."
+    ),
+    "heap.aslr_unstable": (
+        "FIX: Wrap your exploit in a reconnect loop — most heap "
+        "chains succeed 1/16 (nibble race). Move the body into "
+        "`def exploit_one(): ...` that opens its own tube each call, "
+        "returns the flag on success or None on failure. Then call "
+        "`from scaffold.aslr_retry import aslr_retry; "
+        "flag = aslr_retry(exploit_one, max_attempts=64)`. "
+        "`expected_attempts_for(1/16)` ≈ 72 — pick a bound that fits "
+        "in the 300s runner timeout."
+    ),
+    "heap.unaligned_tcache_target": (
+        "FIX: tcache poison target MUST be 0x10-aligned on glibc "
+        ">= 2.32 — otherwise `malloc(): unaligned tcache chunk "
+        "detected` aborts. Either pick a 0x10-aligned offset within "
+        "the target struct, OR target the `key` field "
+        "(tcache_perthread_struct + 8 * slot) which IS aligned, OR "
+        "use a different primitive (large-bin / unsorted)."
+    ),
+    "heap.whitespace_in_address": (
+        "FIX: A critical address contains 0x09/0x0a/0x0b/0x0c/0x0d/"
+        "0x20 and the chal's input path is `cin >>` / "
+        "`getline(cin, ...)` — that TRUNCATES on whitespace, so your "
+        "field write smashes the wrong byte. Mitigations: re-roll "
+        "ASLR (wrap with aslr_retry), pick a different gadget with "
+        "no whitespace in its critical byte, or switch primitive "
+        "to one that uses `read()` instead. Document the constraint "
+        "in report.md."
+    ),
+    "heap.interactive_in_sandbox": (
+        "FIX: `p.interactive()` blocks on stdin and the runner "
+        "sandbox has no TTY → the supervise watchdog kills it "
+        "before flag exfil. Replace with explicit "
+        "`p.sendline(b'cat /flag*'); print(p.recvrepeat(2.0)"
+        ".decode(errors='replace'))`. Use the `if sys.stdin.isatty(): "
+        "p.interactive()` guard if you want local-debug ergonomics."
+    ),
+    "heap.unbounded_recv": (
+        "FIX: Every `recvuntil` / `recv` / `recvline` / `readuntil` "
+        "MUST have an explicit `timeout=` argument. Mismatched "
+        "prompts otherwise hang the supervise watchdog into a kill. "
+        "Add `context.timeout = 10` at the top of the script and "
+        "`timeout=context.timeout` on EVERY recv-family call."
+    ),
+}
+
+
 def _format_postjudge_user_turn(
     *,
     attempt_idx: int,
@@ -1755,6 +2133,7 @@ def _format_postjudge_user_turn(
     verdict = judge.get("verdict") or "unknown"
     summary = (judge.get("summary") or "").strip()
     retry_hint = (judge.get("retry_hint") or "").strip()
+    failure_code = (judge.get("failure_code") or "").strip().lower() or None
     exit_code = sandbox_result.get("exit_code")
     stdout = (sandbox_result.get("stdout") or "")[-2000:]
     stderr = (sandbox_result.get("stderr") or "")[-2000:]
@@ -1766,6 +2145,19 @@ def _format_postjudge_user_turn(
             "  · supervise judge killed the container due to stalled output\n"
         )
     cap_str = "∞" if max_attempts < 0 else str(max_attempts)
+
+    # Prescriptive fix snippet for the heap failure code, prepended
+    # ahead of the model's free-form retry_hint. The deterministic
+    # FIX line is shorter to act on than the model-authored paragraph
+    # and avoids the retry-hint drift we sometimes see where each
+    # retry phrases the same issue differently.
+    fix_preamble = ""
+    if failure_code and failure_code in HEAP_FIX_HINTS:
+        fix_preamble = (
+            f"\n=== prescriptive fix (failure_code={failure_code}) ===\n"
+            f"{HEAP_FIX_HINTS[failure_code]}\n"
+        )
+
     return (
         f"🔁 AUTO-RETRY {attempt_idx}/{cap_str} — postjudge feedback\n"
         f"\n"
@@ -1774,7 +2166,9 @@ def _format_postjudge_user_turn(
         f"  · exit_code: {exit_code}\n"
         f"  · postjudge verdict: {verdict}\n"
         f"  · postjudge summary: {summary or '(empty)'}\n"
-        f"{timeout_marker}"
+        + (f"  · failure_code: {failure_code}\n" if failure_code else "")
+        + f"{timeout_marker}"
+        f"{fix_preamble}"
         f"\n"
         f"=== retry hint (from postjudge — apply this) ===\n"
         f"{retry_hint or '(judge produced no actionable hint; debug from the tails below)'}\n"
@@ -1849,6 +2243,29 @@ async def run_main_agent_session(
     Caller is responsible for the carry / flag-scan / meta-finalize
     steps after this returns.
     """
+    def _snapshot_cost(summary: dict, label: str) -> None:
+        """Mirror heartbeat-accumulated tokens into `summary` so
+        extract_cost's fallback can estimate a real spend when the
+        SDK's ResultMessage never arrives (SIGKILL / BUDGET_ABORT /
+        exception)."""
+        try:
+            tokens_now = _token_state.get(job_id) or {}
+            if not tokens_now:
+                return
+            summary["agent_tokens"] = dict(tokens_now)
+            est = estimate_cost_from_tokens(
+                tokens_now, summary.get("model"),
+            )
+            if est > 0 and not summary.get("cost_usd"):
+                summary["cost_usd"] = est
+                log_fn(
+                    f"COST_FALLBACK [{label}]: ResultMessage missing; "
+                    f"estimated ${est:.4f} from "
+                    f"{sum(tokens_now.values())} accumulated tokens"
+                )
+        except Exception:
+            pass
+
     from claude_agent_sdk import (
         AssistantMessage, ClaudeSDKClient, ResultMessage, UserMessage,
     )
@@ -1886,6 +2303,7 @@ async def run_main_agent_session(
                         )
                         summary["agent_error"] = "investigation budget exceeded"
                         summary["agent_error_kind"] = "budget"
+                        _snapshot_cost(summary, "BUDGET_ABORT")
                         return last_sandbox
                     if isinstance(msg, ResultMessage):
                         summary["result"] = {
@@ -1900,7 +2318,15 @@ async def run_main_agent_session(
                 kind = classify_agent_error(msg_text)
                 summary["agent_error"] = msg_text
                 summary["agent_error_kind"] = kind
-                log_fn(f"AGENT_ERROR ({kind}): {msg_text[:400]}")
+                # SIGKILL on the bundled `claude` CLI surfaces here as
+                # `Command failed with exit code -9`. Reclassify so the
+                # job's error_kind isn't lost as "unknown".
+                if kind in (None, "unknown") and (
+                    "exit code -9" in msg_text or "killed" in msg_text.lower()
+                ):
+                    summary["agent_error_kind"] = "oom_or_killed"
+                log_fn(f"AGENT_ERROR ({summary['agent_error_kind']}): {msg_text[:400]}")
+                _snapshot_cost(summary, "AGENT_ERROR")
                 return last_sandbox
 
             # ---- Decide whether to feed postjudge back to main ----

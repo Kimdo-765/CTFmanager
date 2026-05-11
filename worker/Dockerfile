@@ -94,21 +94,40 @@ RUN ARCH=$(dpkg --print-architecture) \
 
 # GEF — modern gdb plugin (heap visualizer, vmmap, pattern, checksec,
 # ROP helpers, ARM/MIPS/PowerPC support). Single Python file, no
-# heavy deps — the right default for a debugger subagent. The agent
-# can opt into pwndbg via `pip install pwndbg && python -m pwndbg
-# --install` if it really needs the pwndbg-specific UX, but GEF
-# covers 95% of CTF dynamic analysis. Source it conditionally so
-# `gdb -nx` still gets a clean default-gdb shell.
+# heavy deps — the right default for a debugger subagent. GEF covers
+# 95% of CTF dynamic analysis. Source it conditionally so `gdb -nx`
+# still gets a clean default-gdb shell.
+#
+# pwndbg can be installed alongside as an OPTIONAL alternative; toggle
+# at runtime via `GDB_USE_PWNDBG=1`. Useful when GEF's tcache /
+# fastbin output is hard to parse (pwndbg's `bins` / `vis_heap_chunks`
+# is more visual). Defaults OFF so the build doesn't regress for users
+# who don't care.
+ARG INSTALL_PWNDBG=1
 RUN curl -fsSL https://gef.blah.cat/py -o /opt/gef.py \
+ && if [ "$INSTALL_PWNDBG" = "1" ]; then \
+        echo "[pwndbg] installing alongside GEF (opt-in via GDB_USE_PWNDBG=1)"; \
+        git clone --depth 1 https://github.com/pwndbg/pwndbg /opt/pwndbg \
+         && (cd /opt/pwndbg && ./setup.sh) \
+        || { \
+            echo "[WARN] pwndbg install failed; GEF will be the only plugin" 1>&2; \
+            rm -rf /opt/pwndbg; \
+        }; \
+    fi \
  && printf '%s\n' \
-        '# Auto-load GEF unless GDB was started with -nx.' \
+        '# Auto-load GEF (default) or pwndbg when GDB_USE_PWNDBG=1.' \
+        '# Disable both with GDB_NO_GEF=1 or `gdb -nx`.' \
         'python' \
         'import os' \
         'if not os.environ.get("GDB_NO_GEF"):' \
-        '    gdb.execute("source /opt/gef.py")' \
+        '    if (os.environ.get("GDB_USE_PWNDBG")' \
+        '            and os.path.isfile("/opt/pwndbg/gdbinit.py")):' \
+        '        gdb.execute("source /opt/pwndbg/gdbinit.py")' \
+        '    else:' \
+        '        gdb.execute("source /opt/gef.py")' \
         'end' \
     > /etc/gdb/gdbinit \
- && echo "GEF installed at /opt/gef.py, autoloaded via /etc/gdb/gdbinit"
+ && echo "GEF at /opt/gef.py; pwndbg at /opt/pwndbg (if installed). autoloaded via /etc/gdb/gdbinit"
 
 COPY worker /app/worker
 
@@ -126,6 +145,19 @@ RUN ln -sf /app/worker/ghiant_cli.py /usr/local/bin/ghiant \
 # matches remote behavior.
 RUN ln -sf /app/worker/chal_libc_fix.py /usr/local/bin/chal-libc-fix \
  && chmod +x /app/worker/chal_libc_fix.py
+
+# Expose `heap-probe` — gdb harness that dumps tcache / fastbin /
+# unsorted / chunks at each breakpoint hit as a JSON timeline. Lets
+# the debugger subagent answer "what does the heap look like after N
+# alloc/free?" in ONE Bash call instead of an ad-hoc gdb session.
+RUN ln -sf /app/worker/heap_probe.py /usr/local/bin/heap-probe \
+ && chmod +x /app/worker/heap_probe.py
+
+# Copy-paste exploit scaffolds for heap-pwn chals. The main agent does
+# `cp /opt/scaffold/heap_menu.py ./exploit.py` and edits the TODOs.
+# Scaffolds load ./.chal-libs/libc_profile.json automatically, so the
+# version-matrix branching is data-driven instead of prose-driven.
+COPY scaffold /opt/scaffold
 
 ENV PYTHONPATH=/app
 

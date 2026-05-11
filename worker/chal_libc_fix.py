@@ -43,6 +43,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -52,6 +53,7 @@ from pathlib import Path
 
 
 STAGE_DIRNAME = ".chal-libs"
+PROFILE_FILENAME = "libc_profile.json"
 
 
 def _run(cmd: list[str], check: bool = True) -> str:
@@ -395,6 +397,247 @@ def stage_libs(libc: Path, ld: Path, jobdir: Path) -> tuple[Path, Path, Path]:
     return stage, stage / libc.name, stage / ld.name
 
 
+def _version_tuple(version: str | None) -> list[int] | None:
+    if not version:
+        return None
+    m = re.match(r"^(\d+)\.(\d+)", version)
+    if not m:
+        return None
+    return [int(m.group(1)), int(m.group(2))]
+
+
+def _binary_arch(elf: Path) -> str:
+    try:
+        out = subprocess.run(
+            ["readelf", "-h", str(elf)],
+            capture_output=True, text=True, check=False,
+        ).stdout
+    except Exception:
+        return "unknown"
+    m = re.search(r"Machine:\s+(.*)", out)
+    if not m:
+        return "unknown"
+    machine = m.group(1).strip()
+    if "X86-64" in machine:
+        return "x86_64"
+    if "AArch64" in machine:
+        return "aarch64"
+    if "ARM" in machine:
+        return "arm"
+    if "Intel 80386" in machine or "Intel 80386" in machine:
+        return "i386"
+    return machine
+
+
+_TARGET_SYMBOLS = (
+    "system", "execve", "dup2", "read", "write", "exit",
+    "_IO_2_1_stdout_", "_IO_2_1_stderr_", "_IO_2_1_stdin_",
+    "_IO_list_all", "_IO_wfile_jumps", "_IO_str_jumps",
+    "__free_hook", "__malloc_hook", "__realloc_hook",
+    "environ", "_rtld_global", "_rtld_global_ro",
+    "__libc_argv", "stdin", "stdout", "stderr",
+)
+
+
+def _extract_symbols(libc: Path) -> dict:
+    """Use pwntools ELF if available, otherwise fall back to `nm -D` parsing.
+    Returns dict[name -> "0x..." | None]; on outright failure returns
+    {"_error": "<reason>"} so the profile is still emitted with a
+    diagnostic instead of silently lacking the symbols block.
+    """
+    try:
+        # Suppress pwntools log spam — it pollutes our stdout otherwise.
+        import logging as _logging
+        _logging.disable(_logging.CRITICAL)
+        from pwn import ELF
+        e = ELF(str(libc), checksec=False)
+        out: dict = {}
+        for sym in _TARGET_SYMBOLS:
+            v = e.symbols.get(sym)
+            out[sym] = hex(v) if isinstance(v, int) and v > 0 else None
+        try:
+            sh = next(e.search(b"/bin/sh\x00"))
+            out["/bin/sh"] = hex(sh)
+        except StopIteration:
+            out["/bin/sh"] = None
+        return out
+    except Exception as ex:
+        # Fall back to nm -D so we at least catch the public symbols.
+        try:
+            res = subprocess.run(
+                ["nm", "-D", str(libc)],
+                capture_output=True, text=True, check=False,
+            ).stdout
+        except Exception:
+            return {"_error": str(ex)[:200]}
+        out = {sym: None for sym in _TARGET_SYMBOLS}
+        out["/bin/sh"] = None
+        for line in res.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            addr_hex, _kind, name = parts[0], parts[1], parts[-1]
+            if name in out and re.fullmatch(r"[0-9a-fA-F]+", addr_hex):
+                out[name] = "0x" + addr_hex.lstrip("0").lower() or "0x0"
+        return out
+
+
+_ONE_GADGET_HEAD = re.compile(r"^(0x[0-9a-f]+)\s+(.*)$")
+
+
+def _extract_one_gadget(libc: Path) -> list[dict]:
+    """Run one_gadget and parse human output into list[{offset, exec, constraints}].
+    Returns [] if the gem isn't available or parsing fails.
+    """
+    try:
+        res = subprocess.run(
+            ["one_gadget", str(libc)],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return []
+    if res.returncode != 0:
+        return []
+    gadgets: list[dict] = []
+    current: dict | None = None
+    in_constraints = False
+    for raw in res.stdout.splitlines():
+        line = raw.rstrip()
+        m = _ONE_GADGET_HEAD.match(line)
+        if m:
+            if current:
+                gadgets.append(current)
+            current = {
+                "offset": m.group(1),
+                "exec": m.group(2).strip(),
+                "constraints": [],
+            }
+            in_constraints = False
+            continue
+        stripped = line.strip()
+        if not stripped:
+            in_constraints = False
+            continue
+        if stripped.lower().startswith("constraints"):
+            in_constraints = True
+            continue
+        if in_constraints and current is not None:
+            current["constraints"].append(stripped)
+    if current:
+        gadgets.append(current)
+    return gadgets
+
+
+def _derive_features(version_tuple: list[int] | None) -> dict:
+    """Map glibc (major, minor) → tcache/FSOP/hook feature flags.
+
+    All booleans default to None when the version couldn't be detected
+    so the agent knows the answer is unknown and must verify manually.
+    """
+    if not version_tuple or len(version_tuple) < 2:
+        return {
+            "safe_linking": None,
+            "tcache_key": None,
+            "tcache_present": None,
+            "hooks_alive": None,
+            "io_str_jumps_finish_patched": None,
+            "preferred_fsop_chain": "unknown — identify glibc version first",
+            "recommended_techniques": [],
+            "blacklisted_techniques": [],
+        }
+    major, minor = version_tuple[0], version_tuple[1]
+    if (major, minor) < (2, 26):
+        v_floor = "pre-2.26"
+    else:
+        v_floor = f"{major}.{minor}"
+    safe_linking = (major, minor) >= (2, 32)
+    tcache_key = (major, minor) >= (2, 35)
+    tcache_present = (major, minor) >= (2, 26)
+    hooks_alive = (major, minor) < (2, 34)
+    str_finish_patched = (major, minor) >= (2, 37)
+
+    recommend: list[str] = []
+    blacklist: list[str] = []
+    fsop = ""
+
+    if tcache_present:
+        recommend.append("tcache poison" + (
+            " — write target ^ (heap_chunk>>12) (safe-linking XOR)"
+            if safe_linking else " — write raw target (no XOR)"
+        ))
+        if tcache_key:
+            recommend.append(
+                "tcache key bypass — overwrite tcache_perthread_struct[i].key "
+                "via UAF / overlap before double-free"
+            )
+    if hooks_alive:
+        recommend.append("__free_hook / __malloc_hook overwrite (simplest win)")
+    else:
+        blacklist.append("__free_hook / __malloc_hook (removed in glibc 2.34)")
+    recommend.append("unsorted bin attack → libc leak from main_arena.bins")
+    recommend.append("large-bin attack (house of orange / botcake / einherjar)")
+
+    if not hooks_alive and not str_finish_patched:
+        fsop = "_IO_str_jumps __finish chain (cheap; valid on 2.34-2.36)"
+        recommend.append("FSOP via _IO_str_jumps __finish (vtable[12])")
+    elif str_finish_patched:
+        fsop = "_IO_wfile_jumps overflow → _IO_wdoallocbuf → _wide_vtable->__doallocate"
+        recommend.append("FSOP via _IO_wfile_jumps + _wide_data crafted chain")
+        blacklist.append("_IO_str_jumps __finish (patched in glibc 2.37)")
+    else:
+        fsop = "__free_hook / __malloc_hook (hooks still alive on this version)"
+
+    return {
+        "version_floor": v_floor,
+        "safe_linking": safe_linking,
+        "tcache_key": tcache_key,
+        "tcache_present": tcache_present,
+        "hooks_alive": hooks_alive,
+        "io_str_jumps_finish_patched": str_finish_patched,
+        "preferred_fsop_chain": fsop,
+        "recommended_techniques": recommend,
+        "blacklisted_techniques": blacklist,
+    }
+
+
+def emit_profile(
+    stage_dir: Path,
+    libc: Path,
+    ld: Path,
+    binary: Path,
+    version: str | None,
+) -> Path | None:
+    """Write <stage_dir>/libc_profile.json synthesising version-derived
+    feature flags + symbol/one_gadget extracts. Best-effort: any failure
+    inside is swallowed so the patchelf workflow itself stays robust.
+    """
+    try:
+        v_tuple = _version_tuple(version)
+        features = _derive_features(v_tuple)
+        symbols = _extract_symbols(libc)
+        one_gadget = _extract_one_gadget(libc)
+        profile = {
+            "schema_version": 1,
+            "version": version,
+            "version_tuple": v_tuple,
+            "arch": _binary_arch(binary),
+            "libc_path": str(libc),
+            "ld_path": str(ld),
+            "binary_path": str(binary),
+            **features,
+            "symbols": symbols,
+            "one_gadget": one_gadget,
+        }
+        out = stage_dir / PROFILE_FILENAME
+        out.write_text(json.dumps(profile, indent=2))
+        return out
+    except Exception as e:
+        sys.stderr.write(
+            f"[chal-libc-fix] profile emit failed (non-fatal): {e}\n"
+        )
+        return None
+
+
 def already_patched(binary: Path, staged_ld: Path, stage_dir: Path) -> bool:
     interp = _run(["patchelf", "--print-interpreter", str(binary)], check=False).strip()
     rpath = _run(["patchelf", "--print-rpath", str(binary)], check=False).strip()
@@ -533,6 +776,18 @@ def main() -> int:
     print("[chal-libc-fix] gdb-ready (no env tweaks needed):", flush=True)
     print(f"  gdb {binary}", flush=True)
     print(f"  ./{binary.name}     # runs against staged libc directly", flush=True)
+
+    # Emit libc_profile.json — version-derived feature flags + symbols
+    # + one_gadget. Consumed by the main agent / judge / exploit.py so
+    # the version → technique mapping is structured data, not text
+    # rediscovery on every turn. Best-effort: emit failure is non-fatal.
+    profile_path = emit_profile(stage, staged_libc, staged_ld, binary, version)
+    if profile_path:
+        print(
+            f"[chal-libc-fix] profile: {profile_path} "
+            f"(version={version or 'unknown'})",
+            flush=True,
+        )
     return 0
 
 
