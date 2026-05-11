@@ -126,7 +126,8 @@ Reply with EXACTLY ONE compact JSON object on the FIRST line, no
 markdown:
 {{"verdict": "success"|"partial"|"hung"|"parse_error"|"network_error"|"crash"|"timeout"|"unknown",
  "summary": "<=200 chars",
- "retry_hint": "<=600 chars; empty when verdict==success"}}
+ "retry_hint": "<=600 chars; empty when verdict==success",
+ "failure_code": "<one of the heap codes below; OMIT or null when verdict==success or no heap code applies>"}}
 
 Verdict guide:
   success       — a flag was clearly captured (FLAG{{}}/HTB{{}}/
@@ -139,6 +140,47 @@ Verdict guide:
   crash         — unhandled exception or non-zero exit + traceback.
   timeout       — runner's own timeout fired.
   unknown       — none of the above.
+
+failure_code (optional — populate ONLY for heap/FSOP-class scripts
+when the failure shape clearly matches one of the codes below. Leave
+null/omit for non-heap chals or generic bugs. The orchestrator
+prepends a prescriptive fix snippet per code on top of your
+retry_hint, so picking the right code makes the next attempt much
+more targeted):
+
+  heap.libc_version_mismatch       — script used worker libc paths
+                                     (`/lib/x86_64-linux-gnu/libc.so.6`)
+                                     or skipped `chal-libc-fix` entirely.
+  heap.unaligned_libc_base         — leaked address used as libc base
+                                     without `& 0xfff` validation; offsets
+                                     evidently mismatched.
+  heap.safe_linking_missing        — glibc>=2.32 chain wrote raw target
+                                     into a freed chunk's fd (no XOR).
+  heap.safe_linking_misapplied     — glibc<=2.31 chain applied the XOR
+                                     mask (no safe-linking on that version).
+  heap.hook_on_modern_libc         — `__free_hook` / `__malloc_hook` used
+                                     on glibc>=2.34 (removed in 2.34).
+  heap.str_finish_patched          — `_IO_str_jumps` __finish chain on
+                                     glibc>=2.37 (path patched).
+  heap.vtable_write_order_violated — FSOP vtable written before
+                                     `_wide_data` / `_wide_vtable` /
+                                     payload landed → SIGSEGV on next stdio.
+  heap.tcache_key_not_bypassed     — double-free into tcache on glibc>=2.35
+                                     without zeroing the chunk key first
+                                     (aborts with `double free detected in tcache 2`).
+  heap.aslr_unstable               — chain depends on nibble matching
+                                     (1/16 or worse), no reconnect retry.
+  heap.unaligned_tcache_target     — tcache poison target not 0x10-aligned
+                                     (`unaligned tcache chunk detected`).
+  heap.whitespace_in_address       — critical address contains \\x09/\\x0a/
+                                     \\x0b/\\x0c/\\x0d/\\x20 and input path
+                                     uses cin>> / getline → truncates.
+  heap.interactive_in_sandbox      — `p.interactive()` after RCE inside
+                                     the runner sandbox (no TTY → supervise
+                                     kills it).
+  heap.unbounded_recv              — recvuntil / recv / recvline missing
+                                     explicit `timeout=` → hung forever
+                                     on prompt mismatch.
 
 retry_hint MUST be a single paragraph the next agent can act on
 without seeing this judgment. Empty string when verdict==success.
@@ -437,6 +479,26 @@ _VALID_VERDICTS = {
     "network_error", "crash", "timeout", "unknown",
 }
 
+# Heap-specific failure codes the postjudge may emit. The orchestrator
+# uses these in `_format_postjudge_user_turn` to prepend a prescriptive
+# fix snippet ahead of the model-authored retry_hint. Keep this in sync
+# with HEAP_FIX_HINTS in modules._common.
+_VALID_HEAP_FAILURE_CODES = {
+    "heap.libc_version_mismatch",
+    "heap.unaligned_libc_base",
+    "heap.safe_linking_missing",
+    "heap.safe_linking_misapplied",
+    "heap.hook_on_modern_libc",
+    "heap.str_finish_patched",
+    "heap.vtable_write_order_violated",
+    "heap.tcache_key_not_bypassed",
+    "heap.aslr_unstable",
+    "heap.unaligned_tcache_target",
+    "heap.whitespace_in_address",
+    "heap.interactive_in_sandbox",
+    "heap.unbounded_recv",
+}
+
 
 def postjudge_run(
     jd: Path,
@@ -480,7 +542,21 @@ def postjudge_run(
     if verdict == "success":
         retry_hint = ""
 
+    # Heap failure code is optional. Reject anything outside the known
+    # set so a model-typoed code doesn't leak into the retry pipeline
+    # and confuse the prescriptive-hint lookup.
+    raw_code = parsed.get("failure_code")
+    failure_code: str | None = None
+    if isinstance(raw_code, str):
+        candidate = raw_code.strip().lower()
+        if candidate in _VALID_HEAP_FAILURE_CODES:
+            failure_code = candidate
+    if verdict == "success":
+        failure_code = None
+
     log_fn(f"[judge] postjudge verdict={verdict} summary={summary[:160]}")
+    if failure_code:
+        log_fn(f"[judge] postjudge failure_code={failure_code}")
     if retry_hint:
         log_fn(f"[judge] postjudge retry_hint={retry_hint[:200]}")
 
@@ -491,5 +567,6 @@ def postjudge_run(
         "verdict": verdict,
         "summary": summary,
         "retry_hint": retry_hint,
+        "failure_code": failure_code,
         "raw": raw,
     }

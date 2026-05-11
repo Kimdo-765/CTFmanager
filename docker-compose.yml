@@ -42,6 +42,16 @@ services:
     build:
       context: .
       dockerfile: worker/Dockerfile
+    # Cap worker memory so a runaway heap-chal exploit loop or a
+    # debugger subagent spawning concurrent ./prob + gdb instances
+    # can't trigger the host OOM-killer (which kills the bundled
+    # `claude` CLI as the largest process — surfaced as
+    # `Command failed with exit code -9` and a lost run). With a
+    # cgroup limit the OOM stays inside the container; the SDK
+    # session ends cleanly with an error_kind we can classify.
+    # Override via .env if you have a different RAM budget.
+    mem_limit: ${WORKER_MEM_LIMIT:-8g}
+    memswap_limit: ${WORKER_MEM_LIMIT:-8g}
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0

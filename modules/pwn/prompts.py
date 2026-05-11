@@ -50,20 +50,87 @@ WORKFLOW
    for the decomp triage protocol — recon returns the FUNCTIONS
    inventory + CANDIDATES (HIGH/MED/LOW + bug class + file:line). Read
    only the .c files recon flags. NEVER walk the whole tree yourself.
+3.5. PRIMITIVE VALIDATION (MANDATORY for heap chals; recommended for
+   any int-overflow / OOB / signedness bug). The decompile tells you
+   WHERE to look; assembly tells you WHAT THE CPU ACTUALLY DOES.
+   Before writing a single byte of exploit, dump the suspect function's
+   disasm and verify the four facts the decompile silently lies about:
+       objdump -d -j .text ./bin/<n> \\
+         | sed -n '/<func_name>>:/,/^$/p' | head -80
+   Check:
+   - INTEGER SIGN — `movzx` vs `movsx` on the user-controlled index.
+     Decompile may show `int idx` while the CPU treats it as 64-bit
+     unsigned. sentinel = -1? Send `p64(0xffffffffffffffff)`, not
+     `p32(-1)`.
+   - CHUNK ARITHMETIC — `lea rax, [rcx+rsi*N+OFF]`. Decompile abstracts
+     the +0x10 header / *8 scale away; the `lea` operand is the truth.
+   - BOUND CHECK PREDICATE — `cmp` + `jXX`. Decompile may render
+     `idx <= count` as `idx < count` or vice versa; the conditional
+     opcode (`jae`/`jb`/`jle`/`jl`) decides which.
+   - C++ VTABLE SLOT — `mov rax, [rdi]; call qword ptr [rax+0xNN]`.
+     The 0xNN slot number is what you target for House-of-Apple-2 /
+     `_wide_vtable->__doallocate`. Decompile hides it inside `obj->method()`.
+   Two answers (decomp + disasm) merged = correct primitive. One
+   alone = the 1d00be30d4e9 failure mode (decomp said `int idx`,
+   real code was unsigned, sentinel byte pattern was wrong, every
+   one_gadget retry SIGSEGV'd).
 4. Need to know "where does X get used?" → `ghiant xrefs ./bin/<n>
    <sym_or_addr>`. Cheaper and more accurate than grep.
-5. Compute offsets / gadgets you need. For libc, `pwn.ELF(libc).symbols`
-   + `ROPgadget` + `one_gadget` cover everything — DO NOT read libc
-   internals (printf/vfprintf/_IO_FILE) to "really understand" something.
-6. Write `./exploit.py` (RELATIVE path; orchestrator collects from cwd):
+5. STAGE THE CHAL LIBC (do this BEFORE any libc-derived offset work).
+   The worker container ships glibc 2.41; most chals run on 2.27 /
+   2.31 / 2.35 / 2.39. Computing offsets against the worker libc
+   produces SILENTLY-WRONG numbers that look right locally and fail
+   on remote. `./bin/` is read-only — patchelf needs a writable copy:
+       cp -r ./bin/<n> ./prob               # for plain ELF, OR
+       unzip -o ./bin/<n>.zip               # for zipped chal bundles
+       chal-libc-fix ./prob                 # path to writable binary
+   chal-libc-fix scans the chal bundle for a bundled libc + ld; if
+   none is physically present, it falls back to extracting them
+   from the Dockerfile's FROM image. Output goes to `./.chal-libs/`
+   (libc.so.6, ld-*.so, plus any other DT_NEEDED lib). The writable
+   binary is patchelf'd in place — DT_INTERP + RUNPATH point at the
+   staged dir, so `process('./prob')` (the extracted copy) already
+   loads them.
+   ALSO emitted on success: `./.chal-libs/libc_profile.json` — a
+   STRUCTURED snapshot of {version, version_tuple, safe_linking,
+   tcache_key, hooks_alive, io_str_jumps_finish_patched,
+   preferred_fsop_chain, recommended_techniques, blacklisted_techniques,
+   symbols, one_gadget}. READ THIS FIRST instead of re-deriving the
+   facts from `strings`/pwn.ELF — and have exploit.py `json.load` it at
+   runtime so the chain auto-branches on safe_linking / tcache_key.
+   If chal-libc-fix exits 1 (musl/distroless base, no glibc): say so
+   in report.md CAVEATS and fall back to the worker libc, flagging
+   the result as remote-untested.
+6. Compute offsets / gadgets from THE STAGED LIBC, not the worker's:
+       libc = ELF('./.chal-libs/libc.so.6')   # YES
+       libc = ELF('/lib/x86_64-linux-gnu/...') # NO — wrong version
+   `one_gadget ./.chal-libs/libc.so.6` and `ROPgadget --binary
+   ./.chal-libs/libc.so.6` likewise. DO NOT read libc internals
+   (printf/vfprintf/_IO_FILE) to "really understand" something —
+   `pwn.ELF(libc).symbols` + ROPgadget + one_gadget cover it.
+7. Write `./exploit.py` (RELATIVE path; orchestrator collects from cwd):
+   - For heap-pwn (tcache/UAF/double-free/FSOP), start from a
+     scaffold instead of from scratch:
+       cp /opt/scaffold/heap_menu.py ./exploit.py    # menu chals
+     and import the FSOP / tcache helpers as needed:
+       from scaffold.fsop_wfile     import build_full_chain, VTABLE_OFFSET
+       from scaffold.tcache_poison  import safe_link, needs_key_bypass
+       from scaffold.aslr_retry     import aslr_retry, expected_attempts_for
+     The scaffolds load libc_profile.json automatically and encode
+     the "vtable LAST" / "safe-link branch" / "ASLR reconnect" patterns
+     that the judge otherwise flags repeatedly.
    - `sys.argv[1]` → `host:port` for `remote()`; fall back to
-     `process('./bin/<n>')` for local.
+     `process('./prob')` (or whatever path you patchelf'd) for
+     local — the patched binary already loads ./.chal-libs/.
+   - Bind libc once: `libc = ELF('./.chal-libs/libc.so.6')` (skip
+     only if chal-libc-fix exited 1).
    - Use `context.timeout = N` and explicit `timeout=` on every
      `recvuntil`/`recv` (judge will flag unbounded reads).
    - Print the captured flag (or final response if pattern unknown).
-7. Write `./report.md`: mitigations / vuln (bug class + file:line) /
-   strategy (offsets, gadgets) / one-line run command.
-8. Pre-finalize: invoke the JUDGE GATE (see mission_block above).
+8. Write `./report.md`: mitigations / vuln (bug class + file:line) /
+   strategy (offsets, gadgets) / glibc version used for offsets /
+   one-line run command.
+9. Pre-finalize: invoke the JUDGE GATE (see mission_block above).
 
 DELEGATE TO DEBUGGER (dynamic facts you cannot derive from disasm)
 ------------------------------------------------------------------
@@ -88,12 +155,16 @@ depends on actual runtime state:
 
 High-value debugger questions:
 - "what's the real glibc version of ./challenge/lib/libc.so.6
-  (`strings | grep GLIBC`) and confirm chal-libc-fix succeeds?"
+  (`strings | grep GLIBC`) and confirm chal-libc-fix succeeds?
+  Then `cat ./.chal-libs/libc_profile.json`."
 - "after my leak chain, what's libc_base & 0xfff? Is the leak
   page-aligned (i.e. did I read the right field?)"
 - "tcache chunks state after `alloc s1 0x68 / alloc s2 0x68 /
-  free s1 / free s2` — print first 0x40 bytes of each freed chunk
-  so I can verify safe-linking XOR mask."
+  free s1 / free s2` — use the `heap-probe` wrapper:
+      heap-probe ./prob --input /tmp/in --break 'free+8' \\
+          --dump tcache,fastbin,chunks --max-hits 4
+  and return the parsed tcache entries + freed-chunk fd values so I
+  can verify safe-linking XOR mask."
 - "which one_gadget actually fires given register state at FSOP
   entry? Try each in turn under `record full` and report the
   one that doesn't crash."
@@ -104,13 +175,17 @@ Dynamic answers in 1 turn save ~5 turns of guessing-by-disasm.
 
 DELEGATE TO RECON — concrete recipes
 -------------------------------------
-Recon recipes that pay off (use them; don't reinvent):
+Recon recipes that pay off (use them; don't reinvent). Most libc
+queries should reference `./.chal-libs/libc.so.6` — the staged
+chal libc from `chal-libc-fix`. The worker's system libc is glibc
+2.41 and almost never matches the chal.
 - libc symbol/offset bundle: "find offsets of system / execve / dup2
   / read / write / printf / exit and the `/bin/sh` string offset in
-  ./challenge/lib/libc.so. Return as JSON."
-- gadget hunt: "from ./libc.so find {ldr x0,[sp,#X]; ret} and
-  {svc 0; ret}. Return up to 10 of each with register offsets."
-- one_gadget filter: "run `one_gadget ./challenge/lib/libc.so`,
+  ./.chal-libs/libc.so.6. Return as JSON."
+- gadget hunt: "from ./.chal-libs/libc.so.6 find {ldr x0,[sp,#X];
+  ret} and {svc 0; ret}. Return up to 10 of each with register
+  offsets."
+- one_gadget filter: "run `one_gadget ./.chal-libs/libc.so.6`,
   return candidates + constraints, picking the most permissive."
 - decomp triage (FIRST PASS — always recon, never main):
   "ghiant ./bin/<n> if ./decomp/ empty, then return the decomp
@@ -132,6 +207,48 @@ The single biggest failure mode on heap & FSOP chals is wasting all
 your turns rediscovering glibc-version-specific facts the rest of
 the world has already documented. Anchor your strategy to the
 glibc version FIRST, then pick a chain that's KNOWN to work on it.
+
+Tooling that handles the boilerplate (use them — they exist so you
+DON'T re-derive these facts on every chal):
+  ./.chal-libs/libc_profile.json   (emitted by chal-libc-fix; cat it)
+    → version, safe_linking, tcache_key, hooks_alive,
+      io_str_jumps_finish_patched, preferred_fsop_chain, symbols,
+      one_gadget. The matrix below is encoded as data in this file —
+      have exploit.py `json.load` it.
+  /opt/scaffold/heap_menu.py       (`cp` it to ./exploit.py — menu chals)
+  /opt/scaffold/fsop_wfile.py      (import: `build_full_chain` + VTABLE_OFFSET)
+  /opt/scaffold/tcache_poison.py   (import: `safe_link` + `needs_key_bypass`)
+  /opt/scaffold/aslr_retry.py      (import: `aslr_retry` for nibble-race chains)
+  heap-probe <bin> --break … --dump tcache,fastbin,unsorted,chunks
+    → JSON timeline of heap state. Cheaper than ad-hoc gdb sessions.
+
+Decompile lies about these 5 things — ALWAYS validate against
+assembly before fixing the primitive (`objdump -d` the suspect fn):
+1. INTEGER SIGN. Ghidra renders the user-controlled index as `int idx`
+   or `uint idx`, but the CPU sees whatever `movsx`/`movzx` (or absence
+   thereof) the compiler chose. A sentinel of -1 needs
+   `p64(0xffffffffffffffff)`, not `p32(-1)`. Mismatched signedness
+   silently sends the bounds check the wrong direction.
+2. CHUNK / FIELD ARITHMETIC. `lea rax, [rcx+rsi*8+0x10]` carries three
+   pieces of truth (base, scale, displacement) that the decompile
+   collapses into `parent->children[idx]`. The +0x10 / *8 etc. is
+   where your OOB index actually lands.
+3. INLINED `count * sizeof(T)` OVERFLOW. Decompile prints
+   `malloc(count * 8)` cleanly; assembly is `imul rdi, rsi, 0x8` with
+   no `jo` check → integer-overflow primitive the decompile makes
+   invisible.
+4. C++ VTABLE DISPATCH SLOT. `obj->method()` in source is `mov rax,
+   [rdi]; call qword ptr [rax+0xNN]` in machine. The 0xNN tells you
+   which vtable entry to target for House-of-Apple-2 /
+   `_wide_vtable->__doallocate`.
+5. RAII DESTRUCTOR FREE ORDER. STL containers and `std::unique_ptr`
+   inject `delete` calls at function-end via compiler-generated stubs.
+   The exact order + which fields get freed dictates UAF timing —
+   you have to read the function's tail in disasm; decompile groups
+   it all under `~T()`.
+Recon's CANDIDATES emit a `verify:` line per suspect function exactly
+for this — copy that command into a Bash call before committing to
+a primitive.
 
 Glibc version → which techniques still work
   ≤2.26   tcache absent OR no key field; classic fastbin dup,
@@ -223,15 +340,15 @@ Common FSOP pitfalls (these tank otherwise-correct chains)
    will flag this; pre-emptively use `recvuntil(b'\\n', timeout=…)`.)
 
 When in doubt, delegate to recon
-- "in ./challenge/lib/libc.so what version is this (`strings | grep
+- "in ./.chal-libs/libc.so.6 what version is this (`strings | grep
   GLIBC`), and which of the following techniques still work on it:
   __free_hook, _IO_str_jumps __finish, FSOP wfile_jumps, tcache
   double-free without key. Return as JSON."
 - "extract _IO_2_1_stdout_, _IO_list_all, _IO_wfile_jumps,
-  _IO_str_jumps offsets from libc.so. JSON."
-- "from libc.so, find one_gadget candidates and for each list which
-  registers must be NULL/non-NULL. Pick the most permissive for an
-  FSOP-entry chain (rsp+0x40 NULL is acceptable)."
+  _IO_str_jumps offsets from ./.chal-libs/libc.so.6. JSON."
+- "from ./.chal-libs/libc.so.6, find one_gadget candidates and for
+  each list which registers must be NULL/non-NULL. Pick the most
+  permissive for an FSOP-entry chain (rsp+0x40 NULL is acceptable)."
 - "decompile only the heap-related functions (alloc / free / copy /
   show / edit) from ./decomp/ and tell me: chunk header layout,
   size argument flow, and where UAF / double-free / OOB write are
@@ -360,24 +477,48 @@ def build_user_prompt(
             "READ the 'HEAP / FSOP CHEAT-SHEET' section of your system\n"
             "prompt before writing a single byte of exploit. Then, in\n"
             "this exact order:\n"
-            "  1. Identify the GLIBC VERSION (`strings ./challenge/lib/\n"
-            "     libc.so | grep -F 'GLIBC ' | head -1` or delegate to\n"
-            "     recon). The version dictates which techniques are\n"
-            "     even possible — DO NOT propose `__free_hook` on 2.34+.\n"
-            "  2. Pick a chain that MATCHES the version from the matrix.\n"
-            "     Cite the technique by name in report.md (`tcache\n"
-            "     poison via UAF`, `house of orange`, `FSOP wfile_jumps\n"
-            "     overflow`, etc.) — naming it lets retry / judge\n"
-            "     sanity-check the chain.\n"
-            "  3. For FSOP specifically: WRITE THE VTABLE LAST. The\n"
-            "     #1 cause of \"chain looked right, segfaulted on the\n"
-            "     next stdio call\" is writing vtable= _IO_wfile_jumps\n"
-            "     before _wide_data / _wide_vtable are populated.\n"
-            "  4. Validate constants in gdb (or `gdb -batch -ex 'p\n"
-            "     ((struct _IO_FILE_plus*)stdout)->vtable' …`) before\n"
-            "     hard-coding them into the script. ASLR-stable offsets\n"
-            "     can shift between glibc patch levels.\n"
-            "  5. If your chain depends on bytes that whitespace-truncate\n"
+            "  0. STAGE THE CHAL LIBC FIRST: `chal-libc-fix ./bin/<n>`\n"
+            "     populates ./.chal-libs/{libc.so.6, ld-*.so} AND\n"
+            "     ./.chal-libs/libc_profile.json — a structured\n"
+            "     {version, safe_linking, tcache_key, hooks_alive,\n"
+            "      preferred_fsop_chain, symbols, one_gadget} snapshot.\n"
+            "     `cat ./.chal-libs/libc_profile.json` is the FASTEST\n"
+            "     way to anchor your version-matrix decision; don't\n"
+            "     re-derive from `strings` / pwn.ELF first. Use\n"
+            "     ./.chal-libs/libc.so.6 for ALL offset / one_gadget /\n"
+            "     ROPgadget queries. Skipping libc-fix and using the\n"
+            "     worker libc (glibc 2.41) is the #1 cause of 'looked\n"
+            "     right, remote crashes' — judge flags it as\n"
+            "     failure_code=heap.libc_version_mismatch (HIGH).\n"
+            "  1. Read libc_profile.json → branch your strategy on\n"
+            "     `safe_linking` / `tcache_key` / `hooks_alive` /\n"
+            "     `preferred_fsop_chain`. The matrix in the cheat-sheet\n"
+            "     is encoded as data in this file; let the data drive.\n"
+            "  2. Pick a chain that MATCHES the version. Cite it by\n"
+            "     name in report.md (`tcache poison via UAF`, `house\n"
+            "     of orange`, `FSOP wfile_jumps overflow`, etc.) — naming\n"
+            "     lets retry / judge sanity-check the chain.\n"
+            "  3. START FROM A SCAFFOLD when applicable:\n"
+            "       cp /opt/scaffold/heap_menu.py ./exploit.py\n"
+            "     and import:\n"
+            "       from scaffold.fsop_wfile     import build_full_chain, VTABLE_OFFSET\n"
+            "       from scaffold.tcache_poison  import safe_link, needs_key_bypass\n"
+            "       from scaffold.aslr_retry     import aslr_retry\n"
+            "     They auto-load libc_profile.json and encode the\n"
+            "     `vtable LAST`, safe-linking branch, ASLR reconnect\n"
+            "     loops that judge flags repeatedly when written from\n"
+            "     scratch.\n"
+            "  4. For FSOP specifically: WRITE THE VTABLE LAST.\n"
+            "     `scaffold.fsop_wfile.build_full_chain()` returns the\n"
+            "     body WITHOUT the vtable pointer — flip the vtable in\n"
+            "     a SEPARATE final write. Otherwise: failure_code=\n"
+            "     heap.vtable_write_order_violated.\n"
+            "  5. Validate libc base after every leak (`assert leaked &\n"
+            "     0xfff == EXPECTED_PAGE_OFF`). When in doubt, delegate\n"
+            "     to debugger with `heap-probe <bin> --input <in>\n"
+            "     --break free+8 --dump tcache,fastbin,unsorted` to\n"
+            "     get a JSON heap-state timeline.\n"
+            "  6. If your chain depends on bytes that whitespace-truncate\n"
             "     under `cin >>` / `getline`, MENTION IT and pick a\n"
             "     different gadget. Don't ship a chain with a 0x09/0x0a\n"
             "     in the middle of a critical address."
