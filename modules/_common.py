@@ -401,7 +401,7 @@ a single subagent turn.
        grep -m 1 "winning_pattern" /tmp/sweep.out   # filter
 
    For brute-force loops in Python, accumulate hits in a list and
-   `print(json.dumps({"hits": hits[:5], "n": len(hits)}))` — emit a
+   `print(json.dumps({{"hits": hits[:5], "n": len(hits)}}))` — emit a
    summary, not the firehose. If you genuinely need to see the
    sweep, READ /tmp/sweep.out section by section instead of pulling
    the whole thing into one tool result.
