@@ -393,7 +393,14 @@ heap/FSOP cheat-sheet with standard chain templates (FSOP
 `_IO_wfile_jumps` overflow, tcache poison + safe-linking, house of
 orange, etc.) so heap chals don't waste turns rediscovering common
 facts; user descriptions matching heap/FSOP keywords additionally
-get a 5-step checklist injected into the user-turn.
+get a step-by-step checklist injected into the user-turn that
+points at `./.chal-libs/libc_profile.json` (structured glibc
+feature flags emitted by `chal-libc-fix`), `/opt/scaffold/*.py`
+(copy-paste exploit templates that auto-branch on those flags),
+the `heap-probe` JSON-timeline gdb wrapper, and the
+`failure_code` → `HEAP_FIX_HINTS` prescriptive-preamble path on
+the auto-retry user turn. See the [Pwn](#pwn) module section for
+the full pipeline.
 
 ## Prerequisites
 
@@ -435,6 +442,7 @@ All knobs live in two places:
    |---|---|---|
    | `HOST_DATA_DIR` | `./data` | absolute host path for sibling-container bind mounts |
    | `WORKER_CONCURRENCY` | `3` | parallel job slots |
+   | `WORKER_MEM_LIMIT` | `8g` | cgroup memory cap on the worker container. Caps debugger spawn-fanout / heap-chal retry loops so OOM stays inside the container instead of triggering the host OOM-killer (which historically killed the bundled `claude` CLI with `exit code -9`). Set to `0` to disable, or a higher value if your host RAM allows. |
    | `JOB_TTL_DAYS` | `7` | auto-delete jobs older than N days (`0`=keep) |
    | `JOB_TIMEOUT` | `6000` | soft job timeout in seconds — see [Timeout & soft-deadline decision](#timeout--soft-deadline-decision) |
    | `WEB_PORT` | `8000` | host port |
@@ -602,6 +610,75 @@ HexTech_CTF_TOOL/
   where offsets shift between glibc versions; the debugger
   subagent calls it automatically before any gdb session. Pass
   `--no-image` to skip the base-image fallback.
+  **Also emits `./.chal-libs/libc_profile.json`** — a structured
+  snapshot of `{version, version_tuple, arch, safe_linking,
+  tcache_key, tcache_present, hooks_alive,
+  io_str_jumps_finish_patched, preferred_fsop_chain,
+  recommended_techniques, blacklisted_techniques, symbols,
+  one_gadget}`. Main agent / judge / `exploit.py` all `json.load`
+  this instead of re-deriving glibc-version facts from `strings`
+  every retry. Recommended/blacklisted technique lists drive the
+  matrix-based branching (e.g. `__free_hook` is blacklisted on
+  glibc ≥ 2.34; `_IO_str_jumps __finish` on ≥ 2.37).
+- **`/opt/scaffold/` exploit templates** for heap chals (copied
+  into the worker image at build time):
+  - `heap_menu.py` — menu-driven (alloc / free / edit / show)
+    chal scaffold. `cp /opt/scaffold/heap_menu.py ./exploit.py`,
+    then fill the prompt strings + exploit body. Auto-loads
+    `libc_profile.json`, ships `safe_link()`, `assert_libc_base()`,
+    `assert_heap_base()` helpers.
+  - `fsop_wfile.py` — `_IO_FILE_plus` / `_IO_wide_data` /
+    `_wide_vtable` builders for glibc ≥ 2.34 FSOP. Encodes the
+    "vtable LAST" invariant by returning the body with the
+    vtable slot zeroed — caller flips the vtable pointer
+    separately AFTER the rest of the chain is in place.
+  - `tcache_poison.py` — `safe_link()` / `alignment_ok()` /
+    `needs_key_bypass()` / `assert_techniques_match()` — auto-
+    branches on `safe_linking` / `tcache_key` from the profile.
+  - `aslr_retry.py` — `aslr_retry(exploit_one, max_attempts=64)`
+    + `expected_attempts_for(success_rate)` for nibble-race
+    chains (typical 1/16 success → ~72 attempts).
+- **`heap-probe <bin> --break <bp> --dump tcache,fastbin,unsorted,chunks`**
+  — gdb-batch harness that emits a JSON timeline of heap state at
+  each breakpoint hit. Standardizes the "alloc a few, free a few,
+  inspect tcache" recipe so the debugger subagent doesn't re-roll
+  the gdb session every call. JSON shape:
+  `{events: [{pc, function, hit, dumps: {tcache, fastbin, …}}, …]}`.
+  Use `--gdb gdb-multiarch` for aarch64/arm.
+- **pwndbg opt-in**: image build defaults to `INSTALL_PWNDBG=1`,
+  installing pwndbg alongside GEF at `/opt/pwndbg/`. Switch at
+  runtime via `GDB_USE_PWNDBG=1 gdb …` (otherwise GEF auto-loads).
+  Use `--build-arg INSTALL_PWNDBG=0` if you want a leaner image.
+- **`scaffold.aslr_retry` + `heap-probe` + spawn hygiene** —
+  `DEBUGGER_AGENT_PROMPT` mandates AT MOST ONE inferior process
+  alive at a time (`pkill -9 -f ./prob; pkill -9 -f gdbserver`
+  before any new spawn). Two-phase rule plus the worker's
+  `mem_limit` (8 GiB default; `WORKER_MEM_LIMIT` env to override)
+  prevent the OOM-on-debugger-fanout failure that historically
+  killed long heap runs with `exit code -9`.
+- **Decompile-vs-assembly workflow** (WORKFLOW step 3.5 in
+  `modules/pwn/prompts.py`): for heap / int-overflow / signedness
+  / OOB-index chals, *primitive validation* is mandatory before
+  writing exploit code. Recon's CANDIDATES output now carries a
+  `verify: objdump -d …` line per HIGH/MED candidate of those bug
+  classes; main MUST run that disasm to confirm `movzx`/`movsx`,
+  `lea` scale+displacement, `cmp`+`jXX` predicate, and C++ vtable
+  slot number before locking in the primitive. Skipping this step
+  is the documented cause of the 1d00be30d4e9 / a914ca943ed2
+  failures (decompile said `int idx`, real code was unsigned,
+  sentinel byte pattern wrong, all one_gadget retries SIGSEGV'd).
+- **Postjudge `failure_code` classification** for heap chals (13
+  codes: `heap.libc_version_mismatch`, `unaligned_libc_base`,
+  `safe_linking_missing`, `safe_linking_misapplied`,
+  `hook_on_modern_libc`, `str_finish_patched`,
+  `vtable_write_order_violated`, `tcache_key_not_bypassed`,
+  `aslr_unstable`, `unaligned_tcache_target`,
+  `whitespace_in_address`, `interactive_in_sandbox`,
+  `unbounded_recv`). When postjudge emits one, the orchestrator
+  prepends a deterministic prescriptive fix snippet
+  (`HEAP_FIX_HINTS` in `modules/_common.py`) ahead of the model-
+  authored `retry_hint` in the next auto-retry user turn, so the
+  fix is harder for main to phrase away.
 - **C++ binaries**: full Ghidra demangler (`/opt/ghidra/GPL/DemanglerGnu`)
   + `c++filt` + `nm -C` / `objdump -d -C`. Decompiled output uses
   unmangled names (`MyClass::method()` not `_ZN7MyClass…`).
