@@ -217,11 +217,19 @@ async def _run_agent(
         log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")
     # Flag heap-shaped chals so the orchestrator's scaffold-missing
     # trip-wire (SCAFFOLD_NUDGE in run_main_agent_session) can fire
-    # only when relevant. Detection is the same keyword heuristic
-    # the user-prompt builder uses, applied to {description + retry_hint}.
+    # only when relevant. Detection layered:
+    #   1. keyword match against description + retry hint (cheap, definitive)
+    #   2. fallback: ANY pwn-module run assumes heap-possible (job
+    #      0bb10f235507 had description="" so the keyword match
+    #      returned False and SCAFFOLD_NUDGE never fired despite the
+    #      chal being a glibc 2.39 heap chal). Pwn workloads are
+    #      heap-capable by default; non-heap chals (pure BoF / ROP)
+    #      ignore the nudge cheaply.
+    heap_kw = looks_heap_advanced(description or "")
     summary: dict = {
         "messages": 0, "tool_calls": 0, "model": model,
-        "heap_chal": looks_heap_advanced(description or ""),
+        "heap_chal": True,                       # pwn module default
+        "heap_chal_keyword_match": heap_kw,
     }
 
     soft_timeout = int(read_meta(job_id).get("job_timeout") or 0)

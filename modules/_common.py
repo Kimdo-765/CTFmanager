@@ -315,6 +315,15 @@ MISSION (read first, follow strictly)
      trip-wire is specifically designed to prevent that pattern from
      repeating.
 
+   * FINAL DRAFT — if you DO reach the HARD cap with no artifact, the
+     orchestrator now injects `FINAL_DRAFT_USER_TURN` (a "write
+     anything now" prompt) instead of aborting immediately. You get
+     ONE more turn to land a draft from your current best guess —
+     even a skeleton script + best-known offsets. ONLY if that turn
+     ALSO produces no artifact does the job abort. Drafting → sandbox
+     → postjudge → retry is the path to a flag; sitting at 100 tool
+     calls of analysis is not.
+
 3.5. CONTEXT COMPACTION GUARD (independent of #3, fires on memory not
    tool-call count):
    * SOFT — at 8 M accumulated `cache_read_input_tokens` (configurable
@@ -1682,6 +1691,44 @@ shot per job; it won't re-warn. The HARD abort fires at 100 calls.
 """
 
 
+FINAL_DRAFT_USER_TURN = """\
+🛑 LAST CHANCE — INVESTIGATION BUDGET EXHAUSTED. You have made 100
+tool calls without writing `./exploit.py`. The orchestrator was about
+to abort the job entirely, but is giving you ONE MORE TURN to land a
+draft from your CURRENT understanding (even an incomplete or
+speculative one). DO NOT investigate further this turn — just write.
+
+What to write THIS TURN, in order, AND THEN END YOUR TURN:
+
+  1. Open `./exploit.py` (Write tool). Use `/opt/scaffold/heap_menu.py`
+     as a starting point if the chal is menu-driven — even just
+     `cp /opt/scaffold/heap_menu.py ./exploit.py` and edit the prompt
+     strings is good enough. If you have no scaffold candidate, write
+     a pwntools skeleton with your best-known offsets / one_gadget /
+     trigger sequence. The script DOES NOT have to succeed; it has
+     to EXIST so the orchestrator can sandbox it, surface the failure
+     to postjudge, and feed you a real retry hint next round.
+
+  2. Open `./report.md` and write WHAT YOU KNOW so far: vuln class,
+     primitive class, glibc version, candidate technique, one-line
+     run command. Even a draft report saves the next agent (or you
+     in the next /retry) from re-doing the analysis.
+
+  3. END YOUR TURN. The sandbox runs, postjudge fires, and the
+     auto-retry loop hands you actionable feedback — that is the
+     channel that turns a partial exploit into a working one. The
+     #1 reason chals fail is "exploit.py never written" — past 100
+     tool calls of analysis is sunk cost; the only path to a flag is
+     a runnable script + postjudge iteration.
+
+If genuinely nothing can be drafted (chal is opaque even to your best
+guess), explicitly `Bash(rm -f ./exploit.py)` and write the report
+explaining what you tried — the orchestrator will mark the job
+no_flag instead of failed, which is still better than `budget` with
+empty artifacts.
+"""
+
+
 SCAFFOLD_MISSING_USER_TURN = """\
 🪜 SCAFFOLD NUDGE — this is a HEAP / FSOP / tcache / UAF challenge
 (detected from your description or recon's CANDIDATES) but you've
@@ -2799,6 +2846,14 @@ async def run_main_agent_session(
     compaction_warn_pending = {"value": False}
     compaction_ceiling_hit = {"value": False}
 
+    # Final-draft last-chance guard. When budget_exceeded fires WITHOUT
+    # an artifact, we inject FINAL_DRAFT_USER_TURN and give main ONE
+    # more turn to write the draft. Only after that turn also fails to
+    # produce an artifact do we actually abort. Used at most once per
+    # session — the second failure is hard.
+    final_draft_pending = {"value": False}
+    final_draft_used = {"value": False}
+
     async with ClaudeSDKClient(options=options) as client:
         await client.query(initial_prompt)
 
@@ -2852,10 +2907,30 @@ async def run_main_agent_session(
                         summary.get("tool_calls", 0),
                         work_dir, artifact_names,
                     ):
+                        # FIRST budget overrun: queue the FINAL_DRAFT
+                        # user-turn instead of aborting. Main gets one
+                        # more turn to land an artifact from current
+                        # understanding. SECOND overrun (final_draft
+                        # already used → still no artifact) → hard abort.
+                        if not final_draft_used["value"]:
+                            final_draft_used["value"] = True
+                            final_draft_pending["value"] = True
+                            log_fn(
+                                "BUDGET_LAST_CHANCE: "
+                                f"{summary.get('tool_calls', 0)} tool "
+                                f"calls, no {' / '.join(artifact_names)}. "
+                                f"Injecting FINAL_DRAFT user-turn — "
+                                "main gets one more turn to write the "
+                                "draft before hard abort."
+                            )
+                            # Break out of the receive loop so the
+                            # turn-boundary inject block runs.
+                            break
                         log_fn(
                             "BUDGET_ABORT: investigation budget exceeded "
                             f"({summary.get('tool_calls', 0)} tool calls, "
-                            f"no {' / '.join(artifact_names)}). Stopping early."
+                            f"no {' / '.join(artifact_names)} even after "
+                            "FINAL_DRAFT push). Stopping."
                         )
                         summary["agent_error"] = "investigation budget exceeded"
                         summary["agent_error_kind"] = "budget"
@@ -2884,6 +2959,16 @@ async def run_main_agent_session(
                 log_fn(f"AGENT_ERROR ({summary['agent_error_kind']}): {msg_text[:400]}")
                 _snapshot_cost(summary, "AGENT_ERROR")
                 return last_sandbox
+
+            # ---- FINAL_DRAFT last-chance injection ----
+            # Highest priority — budget already overrun and the
+            # alternative is aborting the whole job. Always inject if
+            # pending, regardless of other guards.
+            if final_draft_pending["value"]:
+                final_draft_pending["value"] = False
+                log_fn("[orchestrator] injecting FINAL_DRAFT last-chance user-turn")
+                await client.query(FINAL_DRAFT_USER_TURN)
+                continue
 
             # ---- Compaction soft warning injection ----
             # If we crossed the SOFT threshold inside the just-ended
