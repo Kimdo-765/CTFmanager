@@ -301,28 +301,27 @@ MISSION (read first, follow strictly)
        in parallel — kill all probes first.
      · Batch debugger questions: ONE delegation that answers 3-5
        questions is much cheaper than 3-5 separate delegations.
-3. BUDGET (soft 10, hard 100):
+3. BUDGET (soft 10, FINAL_DRAFT trigger ~150, fallback safety net):
    * SOFT — after ~10 tool calls without a draft {short}, STOP
      investigating and write the draft from your best hypothesis.
      Iterate after. Cheap drafts first, refinement later.
-   * HARD — at 100 tool calls (configurable via INVESTIGATION_BUDGET
-     env) WITHOUT an artifact, the orchestrator ABORTS the session.
-     You see this as a `BUDGET_ABORT` log line and `agent_error_kind=
-     budget` in meta. At 80% of the cap (default 80) the orchestrator
-     emits `SOFT_EJECT_WARN` — if you see that, DRAFT NOW. Job
-     9d58fe152fba burned 171 turns in analysis without ever writing
-     exploit.py and died OOM at the final gdb spawn; the budget
-     trip-wire is specifically designed to prevent that pattern from
-     repeating.
-
-   * FINAL DRAFT — if you DO reach the HARD cap with no artifact, the
-     orchestrator now injects `FINAL_DRAFT_USER_TURN` (a "write
-     anything now" prompt) instead of aborting immediately. You get
-     ONE more turn to land a draft from your current best guess —
-     even a skeleton script + best-known offsets. ONLY if that turn
-     ALSO produces no artifact does the job abort. Drafting → sandbox
-     → postjudge → retry is the path to a flag; sitting at 100 tool
-     calls of analysis is not.
+   * SOFT_EJECT — at 80% of INVESTIGATION_BUDGET (default 150 → trip
+     at 120) the orchestrator injects `SOFT_EJECT_USER_TURN` as a
+     user-turn. If you see "TOOL-CALL BUDGET ALERT" in your context,
+     you're past 80% — DRAFT NOW.
+   * FINAL_DRAFT — at 100% (default 150) the orchestrator injects
+     `FINAL_DRAFT_USER_TURN` — "write anything; even a skeleton
+     script will do; sandbox + postjudge does the rest". You get one
+     full turn to react.
+   * FALLBACK ARTIFACT — if THAT turn also fails to produce
+     exploit.py, the orchestrator drops a probe-only skeleton
+     (loaded from `_FALLBACK_EXPLOIT_TEMPLATE`) so the sandbox +
+     postjudge cycle still fires. The job ends as `no_flag` or
+     `partial` instead of `failed`. This safety net guarantees the
+     job NEVER aborts due to budget alone — but a fallback artifact
+     reaching production is a sign of analysis failure; if you see
+     `agent_error_kind=budget_fallback` in any prior run, please
+     draft earlier next time.
 
 3.5. CONTEXT COMPACTION GUARD (independent of #3, fires on memory not
    tool-call count):
@@ -2576,6 +2575,119 @@ def _pick_present_artifact(
     return None
 
 
+# Minimal pwntools skeleton the orchestrator drops in when budget /
+# compaction / OOM fires WITHOUT main producing an exploit.py. The
+# scaffold's only job is to land SOMETHING runnable so the sandbox +
+# postjudge path activates, which means the next auto-retry hand-off
+# carries an actionable artifact instead of an empty failed job.
+# Loads libc_profile.json if present so re-entries inherit the staged
+# glibc symbols + how2heap recommendation.
+_FALLBACK_EXPLOIT_TEMPLATE = '''\
+#!/usr/bin/env python3
+"""Auto-generated fallback exploit — main session exhausted its budget /
+hit OOM before drafting a real exploit. This skeleton exists ONLY so
+the sandbox + postjudge cycle can fire and feed a real retry hint
+into the next attempt. Replace with proper chain on /retry.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+from pwn import ELF, context, log, p64, process, remote, u64  # noqa: F401
+
+context.log_level = "info"
+context.timeout = 10
+
+BIN = "./prob"
+
+
+def make_tube():
+    if len(sys.argv) >= 2 and ":" in sys.argv[1]:
+        host, port = sys.argv[1].rsplit(":", 1)
+        return remote(host, int(port))
+    return process(BIN)
+
+
+# Profile-driven branch (filled by chal-libc-fix autoboot).
+PROFILE_PATH = Path("./.chal-libs/libc_profile.json")
+profile = None
+if PROFILE_PATH.is_file():
+    try:
+        profile = json.loads(PROFILE_PATH.read_text())
+        log.info(f"libc: {profile.get('version')} | "
+                 f"recommended: {(profile.get('recommended_techniques') or [None])[0]}")
+    except Exception as e:
+        log.warn(f"profile read failed: {e}")
+
+p = make_tube()
+
+# TODO(auto-fallback): the analysis phase never landed a real exploit;
+# this script connects, probes, and exits. Replace the body below with
+# a real chain on /retry — the postjudge feedback for THIS run will
+# carry actionable hints.
+try:
+    banner = p.recv(timeout=2)
+    log.info(f"banner: {banner[:200]!r}")
+    p.sendline(b"help")
+    follow = p.recv(timeout=2)
+    log.info(f"after help: {follow[:200]!r}")
+except Exception as e:
+    log.warn(f"probe error: {e}")
+finally:
+    p.close()
+'''
+
+_FALLBACK_REPORT_TEMPLATE = '''\
+# Fallback report (auto-generated)
+
+**Status**: `exploit_status: aborted` — main session exhausted its tool-call
+budget / hit OOM / hit compaction ceiling without producing a working
+exploit. The orchestrator dropped a probe-only skeleton at `./exploit.py`
+so the sandbox + postjudge cycle still fires.
+
+## What the auto-fallback knows
+
+- libc version: see `./.chal-libs/libc_profile.json` (`version` field)
+- recommended chain: same JSON, `recommended_techniques`
+- how2heap PoC for this glibc: `how2heap.dir`
+
+## What the auto-fallback does NOT know
+
+- the chal's input protocol (menu structure, prompt strings)
+- the specific vulnerable function
+- the offsets / one_gadget choice
+
+## Next step
+
+Click **/retry** in the UI. The postjudge feedback for the probe run
+will feed into the next attempt's user-turn so analysis resumes from
+where the budget hit. The retry SDK session is forked so prior
+reasoning context carries over.
+'''
+
+
+def write_fallback_artifacts(work_dir: Path, log_fn) -> None:
+    """Drop a probe-only exploit.py + report.md when main's session
+    ends WITHOUT producing them. Best-effort: any write error is logged
+    and swallowed (the caller's downstream code handles "no artifact"
+    fine — this is purely an upgrade to "no_flag / partial" status
+    instead of "failed").
+    """
+    try:
+        ex = work_dir / "exploit.py"
+        if not ex.is_file():
+            ex.write_text(_FALLBACK_EXPLOIT_TEMPLATE)
+            log_fn(f"[orchestrator] wrote fallback ./exploit.py ({len(_FALLBACK_EXPLOIT_TEMPLATE)} B)")
+        rp = work_dir / "report.md"
+        if not rp.is_file():
+            rp.write_text(_FALLBACK_REPORT_TEMPLATE)
+            log_fn(f"[orchestrator] wrote fallback ./report.md ({len(_FALLBACK_REPORT_TEMPLATE)} B)")
+    except Exception as e:
+        log_fn(f"[orchestrator] fallback artifact write failed: {e}")
+
+
 # Schema for findings.json — checked AFTER main writes it; missing/wrong
 # fields produce a "findings.json invalid: ..." warning that gets folded
 # into the next auto-retry user-turn so main fixes it on the retry.
@@ -2883,17 +2995,23 @@ async def run_main_agent_session(
                             "cache_read_input_tokens") or 0)
                         log_fn(
                             f"COMPACTION_CEILING: cache_read={cr:,} crossed "
-                            f"hard ceiling. Ending main session so the "
-                            f"retry loop can fork a fresh session before "
-                            f"OOM kills the SDK."
+                            f"hard ceiling. Writing fallback artifact + "
+                            f"ending main session so the sandbox path "
+                            "still fires before OOM kills the SDK."
                         )
+                        if not _pick_present_artifact(work_dir, artifact_names):
+                            write_fallback_artifacts(work_dir, log_fn)
+                            summary["fallback_artifact_used"] = True
                         summary["agent_error"] = (
                             f"context compaction ceiling reached "
                             f"(cache_read={cr})"
                         )
                         summary["agent_error_kind"] = "compaction_ceiling"
                         _snapshot_cost(summary, "COMPACTION_CEILING")
-                        return last_sandbox
+                        # Break so sandbox + postjudge still runs with
+                        # the fallback artifact; the job ends as
+                        # no_flag/partial instead of failed.
+                        break
                     elif cstate == "warn" and mark_compaction_warned(job_id):
                         compaction_warn_pending["value"] = True
                         cr = int((_token_state.get(job_id) or {}).get(
@@ -2939,28 +3057,37 @@ async def run_main_agent_session(
                         }
                         log_fn(f"DONE: {summary['result']}")
                         # Post-FINAL_DRAFT artifact verdict: main has
-                        # had one full turn since the inject (the inject
-                        # block flipped final_draft_pending=False before
-                        # this turn began). If we're still missing the
-                        # artifact, the hard abort fires NOW with main
-                        # off the hook for a re-spawn loop.
+                        # had one full turn since the inject. If we're
+                        # still missing the artifact, drop a probe-only
+                        # fallback so the sandbox + postjudge cycle
+                        # still fires. The job ends as no_flag (or
+                        # finished/partial if the probe surfaces useful
+                        # output) instead of aborted/failed — which is
+                        # the contract the user asked for ("abort 자체
+                        # 가 없게").
                         if (final_draft_used["value"]
                                 and not final_draft_pending["value"]
                                 and not _pick_present_artifact(
                                     work_dir, artifact_names)):
                             log_fn(
-                                "BUDGET_ABORT: investigation budget "
-                                f"exceeded ({summary.get('tool_calls', 0)} "
-                                f"tool calls, no "
-                                f"{' / '.join(artifact_names)} even "
-                                "after FINAL_DRAFT push). Stopping."
+                                "BUDGET_FALLBACK: main never produced "
+                                f"{' / '.join(artifact_names)} after "
+                                "FINAL_DRAFT push — dropping probe-only "
+                                "skeleton so sandbox still runs."
+                            )
+                            write_fallback_artifacts(
+                                work_dir, log_fn,
                             )
                             summary["agent_error"] = (
-                                "investigation budget exceeded"
+                                "budget exhausted; fallback artifact used"
                             )
-                            summary["agent_error_kind"] = "budget"
-                            _snapshot_cost(summary, "BUDGET_ABORT")
-                            return last_sandbox
+                            summary["agent_error_kind"] = "budget_fallback"
+                            summary["fallback_artifact_used"] = True
+                            _snapshot_cost(summary, "BUDGET_FALLBACK")
+                            # Break the receive loop and let the
+                            # sandbox / postjudge / auto-retry path
+                            # downstream pick up the fallback artifact.
+                            break
             except Exception as e:
                 msg_text = str(e)
                 kind = classify_agent_error(msg_text)
@@ -2975,7 +3102,27 @@ async def run_main_agent_session(
                     summary["agent_error_kind"] = "oom_or_killed"
                 log_fn(f"AGENT_ERROR ({summary['agent_error_kind']}): {msg_text[:400]}")
                 _snapshot_cost(summary, "AGENT_ERROR")
-                return last_sandbox
+                # OOM/SIGKILL/timeout: write fallback artifact so the
+                # sandbox + postjudge cycle still fires before we end.
+                # Status downgrades from `failed` to `no_flag/partial`
+                # depending on the probe outcome — much friendlier UX
+                # than "Command failed with exit code -9 (no artifact)".
+                if (summary["agent_error_kind"] in
+                        ("oom_or_killed", "compaction_ceiling", "timeout")
+                        and not _pick_present_artifact(
+                            work_dir, artifact_names)):
+                    log_fn(
+                        f"[orchestrator] {summary['agent_error_kind']} "
+                        "fired without artifact — writing fallback so "
+                        "sandbox still runs"
+                    )
+                    write_fallback_artifacts(work_dir, log_fn)
+                    summary["fallback_artifact_used"] = True
+                    # Fall through to the sandbox/postjudge dispatch
+                    # block AFTER the except so the cycle completes.
+                    pass
+                else:
+                    return last_sandbox
 
             # ---- FINAL_DRAFT last-chance injection ----
             # Highest priority — budget already overrun and the
