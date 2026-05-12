@@ -2903,39 +2903,33 @@ async def run_main_agent_session(
                             f"soft threshold. Will inject finalize-now "
                             f"user-turn after main's current turn ends."
                         )
-                    if budget_exceeded(
+                    # Budget check is SUPPRESSED during the FINAL_DRAFT
+                    # turn — `tool_calls` and missing-artifact state
+                    # carry over from the previous turn, so re-running
+                    # the check immediately would fire on the very first
+                    # msg of main's response and abort before main can
+                    # write anything (job 13a3fc9993ee — BUDGET_ABORT
+                    # fired in the same wall-clock second as FINAL_DRAFT
+                    # was injected, no chance for the model to react).
+                    # Once main's ResultMessage arrives we check the
+                    # artifact instead.
+                    if not final_draft_used["value"] and budget_exceeded(
                         summary.get("tool_calls", 0),
                         work_dir, artifact_names,
                     ):
-                        # FIRST budget overrun: queue the FINAL_DRAFT
-                        # user-turn instead of aborting. Main gets one
-                        # more turn to land an artifact from current
-                        # understanding. SECOND overrun (final_draft
-                        # already used → still no artifact) → hard abort.
-                        if not final_draft_used["value"]:
-                            final_draft_used["value"] = True
-                            final_draft_pending["value"] = True
-                            log_fn(
-                                "BUDGET_LAST_CHANCE: "
-                                f"{summary.get('tool_calls', 0)} tool "
-                                f"calls, no {' / '.join(artifact_names)}. "
-                                f"Injecting FINAL_DRAFT user-turn — "
-                                "main gets one more turn to write the "
-                                "draft before hard abort."
-                            )
-                            # Break out of the receive loop so the
-                            # turn-boundary inject block runs.
-                            break
+                        final_draft_used["value"] = True
+                        final_draft_pending["value"] = True
                         log_fn(
-                            "BUDGET_ABORT: investigation budget exceeded "
-                            f"({summary.get('tool_calls', 0)} tool calls, "
-                            f"no {' / '.join(artifact_names)} even after "
-                            "FINAL_DRAFT push). Stopping."
+                            "BUDGET_LAST_CHANCE: "
+                            f"{summary.get('tool_calls', 0)} tool "
+                            f"calls, no {' / '.join(artifact_names)}. "
+                            f"Injecting FINAL_DRAFT user-turn — "
+                            "main gets one more turn to write the "
+                            "draft before hard abort."
                         )
-                        summary["agent_error"] = "investigation budget exceeded"
-                        summary["agent_error_kind"] = "budget"
-                        _snapshot_cost(summary, "BUDGET_ABORT")
-                        return last_sandbox
+                        # Break out of the receive loop so the
+                        # turn-boundary inject block runs.
+                        break
                     if isinstance(msg, ResultMessage):
                         summary["result"] = {
                             "duration_ms": msg.duration_ms,
@@ -2944,6 +2938,29 @@ async def run_main_agent_session(
                             "is_error": msg.is_error,
                         }
                         log_fn(f"DONE: {summary['result']}")
+                        # Post-FINAL_DRAFT artifact verdict: main has
+                        # had one full turn since the inject (the inject
+                        # block flipped final_draft_pending=False before
+                        # this turn began). If we're still missing the
+                        # artifact, the hard abort fires NOW with main
+                        # off the hook for a re-spawn loop.
+                        if (final_draft_used["value"]
+                                and not final_draft_pending["value"]
+                                and not _pick_present_artifact(
+                                    work_dir, artifact_names)):
+                            log_fn(
+                                "BUDGET_ABORT: investigation budget "
+                                f"exceeded ({summary.get('tool_calls', 0)} "
+                                f"tool calls, no "
+                                f"{' / '.join(artifact_names)} even "
+                                "after FINAL_DRAFT push). Stopping."
+                            )
+                            summary["agent_error"] = (
+                                "investigation budget exceeded"
+                            )
+                            summary["agent_error_kind"] = "budget"
+                            _snapshot_cost(summary, "BUDGET_ABORT")
+                            return last_sandbox
             except Exception as e:
                 msg_text = str(e)
                 kind = classify_agent_error(msg_text)
