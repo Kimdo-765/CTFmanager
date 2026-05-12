@@ -101,8 +101,17 @@ services:
       # cleanly so the auto-retry loop forks a fresh session before the
       # SDK CLI gets OOM-killed (the documented failure mode of jobs
       # 011a6d486d53 / 7c4a6a4c7581). Set SOFT=0 to disable both.
-      CONTEXT_COMPACTION_THRESHOLD: ${CONTEXT_COMPACTION_THRESHOLD:-8000000}
-      CONTEXT_COMPACTION_HARD_CEILING: ${CONTEXT_COMPACTION_HARD_CEILING:-14000000}
+      #
+      # HARD lowered 14M → 10M after job ff8240803dc2: real RAM usage
+      # crossed the 12g cgroup limit at ~11.3M cache_read tokens, well
+      # below the prior 14M ceiling, so the orchestrator never got a
+      # chance to fork cleanly — the CLI was SIGKILLed by the kernel
+      # first. The new ceiling fires the clean-abort path at 10M so
+      # we always beat the OS OOM-killer to it. SOFT stays at 6M so the
+      # warning fires comfortably before the ceiling, giving main one
+      # full turn to finalize without subagents.
+      CONTEXT_COMPACTION_THRESHOLD: ${CONTEXT_COMPACTION_THRESHOLD:-6000000}
+      CONTEXT_COMPACTION_HARD_CEILING: ${CONTEXT_COMPACTION_HARD_CEILING:-10000000}
     volumes:
       - ./data:/data
       - ./modules:/app/modules:ro

@@ -2999,8 +2999,15 @@ async def run_main_agent_session(
                             f"ending main session so the sandbox path "
                             "still fires before OOM kills the SDK."
                         )
-                        if not _pick_present_artifact(work_dir, artifact_names):
-                            write_fallback_artifacts(work_dir, log_fn)
+                        # write_fallback_artifacts is idempotent — calls
+                        # are no-ops on files that already exist, so we
+                        # always call it unconditionally to guarantee
+                        # report.md gets drafted even when main wrote
+                        # exploit.py but not the report companion.
+                        exploit_missing = not (work_dir / "exploit.py").is_file()
+                        report_missing = not (work_dir / "report.md").is_file()
+                        write_fallback_artifacts(work_dir, log_fn)
+                        if exploit_missing or report_missing:
                             summary["fallback_artifact_used"] = True
                         summary["agent_error"] = (
                             f"context compaction ceiling reached "
@@ -3008,6 +3015,15 @@ async def run_main_agent_session(
                         )
                         summary["agent_error_kind"] = "compaction_ceiling"
                         _snapshot_cost(summary, "COMPACTION_CEILING")
+                        # We're at the OOM doorstep — don't feed any
+                        # more user-turn injections into this session.
+                        # Clearing the pending flags lets us skip past
+                        # the post-loop client.query blocks straight to
+                        # sandbox dispatch.
+                        final_draft_pending["value"] = False
+                        compaction_warn_pending["value"] = False
+                        soft_eject_pending["value"] = False
+                        scaffold_nudge_pending["value"] = False
                         # Break so sandbox + postjudge still runs with
                         # the fallback artifact; the job ends as
                         # no_flag/partial instead of failed.
@@ -3102,25 +3118,47 @@ async def run_main_agent_session(
                     summary["agent_error_kind"] = "oom_or_killed"
                 log_fn(f"AGENT_ERROR ({summary['agent_error_kind']}): {msg_text[:400]}")
                 _snapshot_cost(summary, "AGENT_ERROR")
-                # OOM/SIGKILL/timeout: write fallback artifact so the
-                # sandbox + postjudge cycle still fires before we end.
-                # Status downgrades from `failed` to `no_flag/partial`
-                # depending on the probe outcome — much friendlier UX
-                # than "Command failed with exit code -9 (no artifact)".
-                if (summary["agent_error_kind"] in
-                        ("oom_or_killed", "compaction_ceiling", "timeout")
-                        and not _pick_present_artifact(
-                            work_dir, artifact_names)):
-                    log_fn(
-                        f"[orchestrator] {summary['agent_error_kind']} "
-                        "fired without artifact — writing fallback so "
-                        "sandbox still runs"
-                    )
+                # OOM/SIGKILL/timeout: keep the run alive. Even if main
+                # already wrote exploit.py, the receive loop blew up
+                # before we could dispatch the sandbox — so we MUST fall
+                # through to the sandbox/postjudge block below instead of
+                # returning early (job ff8240803dc2: exploit.py present
+                # but sandbox=null because this branch short-circuited).
+                # write_fallback_artifacts is idempotent — it only writes
+                # files that are actually missing — so a partial drop
+                # (e.g. main wrote exploit.py but not report.md) still
+                # gets a companion report drafted.
+                if summary["agent_error_kind"] in (
+                    "oom_or_killed", "compaction_ceiling", "timeout",
+                ):
+                    exploit_missing = not (work_dir / "exploit.py").is_file()
+                    report_missing = not (work_dir / "report.md").is_file()
                     write_fallback_artifacts(work_dir, log_fn)
-                    summary["fallback_artifact_used"] = True
-                    # Fall through to the sandbox/postjudge dispatch
-                    # block AFTER the except so the cycle completes.
-                    pass
+                    if exploit_missing or report_missing:
+                        summary["fallback_artifact_used"] = True
+                        log_fn(
+                            f"[orchestrator] {summary['agent_error_kind']}"
+                            " fired — wrote fallback ("
+                            f"exploit.py {'missing' if exploit_missing else 'kept'}"
+                            f", report.md {'missing' if report_missing else 'kept'}"
+                            ") so sandbox still runs"
+                        )
+                    else:
+                        log_fn(
+                            f"[orchestrator] {summary['agent_error_kind']}"
+                            " fired but main already produced both "
+                            "artifacts — proceeding to sandbox"
+                        )
+                    # SDK client is dead after this exception (the
+                    # underlying `claude` CLI got SIGKILLed). Clear any
+                    # pending user-turn injections so the post-loop
+                    # blocks below don't try `client.query(...)` on a
+                    # broken transport and crash a second time. We want
+                    # to land in the sandbox/postjudge dispatch instead.
+                    final_draft_pending["value"] = False
+                    compaction_warn_pending["value"] = False
+                    soft_eject_pending["value"] = False
+                    scaffold_nudge_pending["value"] = False
                 else:
                     return last_sandbox
 
@@ -3209,6 +3247,22 @@ async def run_main_agent_session(
                 log_fn(
                     f"[orchestrator] auto-run turn {attempt} succeeded "
                     f"(flags={len(flags_now)}, verdict={verdict}) — exiting loop"
+                )
+                return last_sandbox
+
+            # If the SDK client died on this attempt (OOM / SIGKILL /
+            # timeout / compaction-ceiling), the transport is dead and
+            # any `client.query(retry_hint)` below would crash again.
+            # The sandbox + judge we just ran is the rescue value of
+            # this job — surface it and stop instead of trying to feed
+            # postjudge back into a broken session.
+            if summary["agent_error_kind"] in (
+                "oom_or_killed", "compaction_ceiling", "timeout",
+            ):
+                log_fn(
+                    f"[orchestrator] client died this attempt "
+                    f"({summary['agent_error_kind']}); surfacing sandbox "
+                    f"verdict={verdict} without further retries"
                 )
                 return last_sandbox
 
