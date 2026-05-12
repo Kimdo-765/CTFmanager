@@ -209,8 +209,21 @@ DON'T re-derive these facts on every chal):
   ./.chal-libs/libc_profile.json   (emitted by chal-libc-fix; cat it)
     → version, safe_linking, tcache_key, hooks_alive,
       io_str_jumps_finish_patched, preferred_fsop_chain, symbols,
-      one_gadget. The matrix below is encoded as data in this file —
-      have exploit.py `json.load` it.
+      one_gadget, **how2heap**.{dir, techniques[]}. The matrix below
+      is encoded as data in this file — have exploit.py `json.load` it.
+  /opt/how2heap/glibc_<VER>/       (shellphish/how2heap PoC corpus)
+    → ALWAYS-CURRENT PoC C source for every well-known technique on
+      THIS glibc. Profile's how2heap.dir points at the right version
+      dir; how2heap.techniques lists every .c file you can crib from.
+      Example:
+        # JSON says preferred FSOP is wfile_jumps overflow + version is 2.39
+        cat /opt/how2heap/glibc_2.39/house_of_apple2.c    # not present
+        cat /opt/how2heap/glibc_2.39/house_of_tangerine.c # if listed
+      Use these instead of reinventing chain math — they encode the
+      exact byte-level layout, offsets, and trigger order that work on
+      that glibc. If the technique you want is NOT in
+      profile.how2heap.techniques, your glibc DOESN'T support it
+      cleanly; pick a listed one.
   /opt/scaffold/heap_menu.py       (`cp` it to ./exploit.py — menu chals)
   /opt/scaffold/fsop_wfile.py      (import: `build_full_chain` + VTABLE_OFFSET)
   /opt/scaffold/tcache_poison.py   (import: `safe_link` + `needs_key_bypass`)

@@ -600,6 +600,64 @@ def _derive_features(version_tuple: list[int] | None) -> dict:
     }
 
 
+_HOW2HEAP_ROOT = Path("/opt/how2heap")
+
+
+def _how2heap_techniques(version_tuple: list[int] | None) -> dict:
+    """Return {dir, techniques: [name, ...]} of how2heap PoCs that
+    apply to this glibc version. Snaps to the highest available
+    version_dir <= the chal's version so a 2.40 chal still gets the
+    2.39 corpus when 2.40 isn't shipped. Best-effort: returns
+    `{"available": False, ...}` if /opt/how2heap is missing.
+    """
+    if not _HOW2HEAP_ROOT.is_dir():
+        return {"available": False, "reason": "/opt/how2heap missing in image"}
+    try:
+        dirs = sorted(
+            (d for d in _HOW2HEAP_ROOT.iterdir()
+             if d.is_dir() and d.name.startswith("glibc_")),
+            key=lambda d: tuple(int(x) for x in d.name[len("glibc_"):].split(".")),
+        )
+    except Exception:
+        return {"available": False, "reason": "scan failed"}
+    if not dirs:
+        return {"available": False, "reason": "no glibc_* dirs under /opt/how2heap"}
+    target = None
+    if version_tuple and len(version_tuple) >= 2:
+        major, minor = version_tuple[0], version_tuple[1]
+        target = (major, minor)
+        chosen = None
+        for d in dirs:
+            try:
+                d_tuple = tuple(int(x) for x in d.name[len("glibc_"):].split("."))
+            except Exception:
+                continue
+            if d_tuple <= target:
+                chosen = d
+            else:
+                break
+        if chosen is None:
+            chosen = dirs[0]  # below the corpus' floor — use oldest
+    else:
+        chosen = dirs[-1]
+    techniques: list[str] = []
+    try:
+        for f in chosen.iterdir():
+            if f.suffix == ".c":
+                techniques.append(f.stem)
+    except Exception:
+        pass
+    techniques.sort()
+    return {
+        "available": True,
+        "dir": str(chosen),
+        "techniques": techniques,
+        "matched_version": chosen.name[len("glibc_"):],
+        "corpus_floor": dirs[0].name[len("glibc_"):],
+        "corpus_ceiling": dirs[-1].name[len("glibc_"):],
+    }
+
+
 def emit_profile(
     stage_dir: Path,
     libc: Path,
@@ -616,8 +674,9 @@ def emit_profile(
         features = _derive_features(v_tuple)
         symbols = _extract_symbols(libc)
         one_gadget = _extract_one_gadget(libc)
+        how2heap = _how2heap_techniques(v_tuple)
         profile = {
-            "schema_version": 1,
+            "schema_version": 2,  # +how2heap field
             "version": version,
             "version_tuple": v_tuple,
             "arch": _binary_arch(binary),
@@ -627,6 +686,7 @@ def emit_profile(
             **features,
             "symbols": symbols,
             "one_gadget": one_gadget,
+            "how2heap": how2heap,
         }
         out = stage_dir / PROFILE_FILENAME
         out.write_text(json.dumps(profile, indent=2))
