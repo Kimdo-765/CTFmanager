@@ -1429,17 +1429,23 @@ function _colorizeRunLogLine(line, anchor, state) {
 
   // Per-line agent tag: analyzers prefix lines with "[main] " /
   // "[recon] " / "[judge] " / "[debugger] " right after the
-  // timestamp. Strip the tag and render it as a colored chip;
-  // subagent lines (recon / judge / debugger) get a slight indent
-  // so the delegation reads visually like a nested call.
+  // timestamp. The isolated subagent path tags with a per-spawn
+  // counter, e.g. "[recon#1] " — both forms should colorize the
+  // chip identically (the # suffix is just the spawn index).
+  // Strip the tag and render it as a colored chip; subagent lines
+  // (recon / judge / debugger) get a slight indent so the
+  // delegation reads visually like a nested call.
   let agentChip = "";
   let isSubagent = false;
-  const tagMatch = rest.match(/^\[(main|recon|judge|debugger)\]\s+([\s\S]*)$/);
+  const tagMatch = rest.match(
+    /^\[(main|recon|judge|debugger)(#\d+)?\]\s+([\s\S]*)$/,
+  );
   if (tagMatch) {
     const tag = tagMatch[1];
+    const idxSuffix = tagMatch[2] || "";
     isSubagent = tag !== "main";
-    rest = tagMatch[2];
-    agentChip = `<span class="rl-agent-tag rl-agent-tag-${tag}">${tag}</span>`;
+    rest = tagMatch[3];
+    agentChip = `<span class="rl-agent-tag rl-agent-tag-${tag}">${tag}${idxSuffix}</span>`;
   }
 
   const indent = isSubagent ? '<span class="rl-recon-indent">↳ </span>' : "";
