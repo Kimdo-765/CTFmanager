@@ -220,17 +220,26 @@ patchelfs the binary against the chal's bundled libc (via
 `chal-libc-fix`) FIRST, so leak addresses / heap layouts / one_gadget
 constraints match the remote — gdb on the worker's system libc
 (currently glibc 2.41) would lie. Use the debugger when the answer
-depends on actual runtime state:
+depends on actual runtime state.
 
-  Agent(
-    description="<observable, ≤8 words>",
+INVOCATION — the team uses an isolated subagent pattern. main calls
+the MCP tool `mcp__team__spawn_subagent(subagent_type, prompt)` which
+launches the debugger in its OWN claude CLI subprocess. The subagent
+runs to completion and returns its FINAL response text as the tool
+result. main never sees the subagent's full conversation history —
+only the summary it chose to write. (Legacy `Agent(...)` is also
+available if `USE_ISOLATED_SUBAGENTS=0`, but you should prefer the
+isolated MCP tool: it's the only way the worker survives a
+multi-spawn heap-pwn run without OOMing.)
+
+  mcp__team__spawn_subagent(
     subagent_type="debugger",
     prompt=(
-      "GOAL: leak format and libc base after the 3rd printf\\n"
-      "BINARY: ./bin/prob\\n"
-      "INPUT: send 'name=%17$p\\\\n' then 'show'\\n"
-      "BREAKPOINTS: at vuln+0x42, dump rax/rdi + stack +0x28\\n"
-      "CONSTRAINTS: chal libc bundled at ./challenge/lib/libc.so.6\\n"
+      "GOAL: leak format and libc base after the 3rd printf\n"
+      "BINARY: ./bin/prob\n"
+      "INPUT: send 'name=%17$p\\n' then 'show'\n"
+      "BREAKPOINTS: at vuln+0x42, dump rax/rdi + stack +0x28\n"
+      "CONSTRAINTS: chal libc bundled at ./challenge/lib/libc.so.6\n"
     ),
   )
 

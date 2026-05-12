@@ -243,9 +243,9 @@ MISSION (read first, follow strictly)
 1. WRITE: produce {deliverables} in your CURRENT WORKING DIRECTORY
    using RELATIVE paths. The orchestrator collects only files at cwd.
 2. DELEGATE STATIC investigation to the read-only `recon` subagent
-   via the `Agent` tool:
-       Agent(
-         description="<short purpose, ≤8 words>",
+   via the isolated MCP tool (preferred — runs in its own subprocess
+   so its context never accumulates into yours):
+       mcp__team__spawn_subagent(
          subagent_type="recon",
          prompt="<one specific question with the path(s) to look at>"
        )
@@ -263,8 +263,7 @@ MISSION (read first, follow strictly)
    produces — gdb on the worker's system libc would lie. Call it
    when you need OBSERVED runtime state that disasm can't tell you:
 
-       Agent(
-         description="<observable, ≤8 words>",
+       mcp__team__spawn_subagent(
          subagent_type="debugger",
          prompt=(
            "GOAL: <what fact do you need? e.g. 'libc base after the
@@ -287,20 +286,30 @@ MISSION (read first, follow strictly)
    when the bundled libc isn't labeled. Don't delegate trivial
    static questions — those go to recon.
 
-   SPAWN COST WARNING. Each `Agent(subagent_type="debugger", ...)`
-   call spawns a FRESH Claude SDK child process inside the worker
-   container. The parent (you) keeps running. Two SDK processes
-   share the worker's mem_limit (12 GiB by default). Job
-   011a6d486d53 OOM'd at the moment of a debugger spawn because
-   main had already accumulated ~3.6 M cache_read tokens of
-   brute-force output; two SDK processes + that context tipped
-   past the cap. Mitigation:
-     · NEVER spawn debugger if your most recent Bash result was
-       a multi-screen flood (apply rule 5.5 first).
-     · NEVER spawn debugger AND keep a `process('./prob')` running
-       in parallel — kill all probes first.
-     · Batch debugger questions: ONE delegation that answers 3-5
-       questions is much cheaper than 3-5 separate delegations.
+   SUBAGENT ISOLATION CONTRACT. The MCP tool
+   `mcp__team__spawn_subagent` launches the subagent as its own
+   `claude` CLI subprocess. When the subagent finishes, the
+   subprocess dies — its full investigation conversation is GONE.
+   You receive only the subagent's final text response as the tool
+   result. This is intentional: it's the only way the worker survives
+   a multi-spawn heap-pwn run without OOMing on a single-process
+   heap (the prior `Agent(subagent_type=...)` path accumulated the
+   subagent's whole context into your heap, which is what killed
+   jobs 011a6d486d53 / 7c4a6a4c7581 / ff8240803dc2 / 5c5334381583 /
+   c4f49803edfe).
+
+   Practical implications:
+     · Ask SPECIFIC questions — the subagent has no memory of your
+       prior turns. Give it the file paths, the offsets, the inputs.
+     · Batch questions — ONE spawn that answers 3-5 things is much
+       cheaper than 3-5 spawns. Each spawn has fixed fork overhead
+       (~2-3 s + cold prompt cache).
+     · You can still spawn multiple subagents per run (cap default
+       is 2). The cap fires post-turn warning at count == cap and
+       hard-breaks the receive loop at count > cap.
+     · If the legacy `Agent` tool is still in your tool list
+       (USE_ISOLATED_SUBAGENTS=0), prefer the MCP form anyway —
+       isolation is strictly the safer path.
 3. BUDGET (soft 10, FINAL_DRAFT trigger ~150, fallback safety net):
    * SOFT — after ~10 tool calls without a draft {short}, STOP
      investigating and write the draft from your best hypothesis.
@@ -1564,6 +1573,270 @@ def build_judge_agents(model: str | None) -> dict:
 # (recon + judge), which means existing main agents pick up judge as
 # a peer subagent automatically. No analyzer code change needed.
 build_recon_agents = build_team_agents
+
+
+# ─────────────────────────────────────────────────────────────
+# Isolated subagent path (process-per-subagent via MCP)
+# ─────────────────────────────────────────────────────────────
+# Verified empirically (see memory/worker_fork_oom.md): the SDK runs
+# ALL agent contexts inside a single `claude` CLI Node.js process.
+# When main spawns `Agent(subagent_type=...)`, the subagent's
+# conversation accumulates into main's process heap. A few heap-pwn
+# subagent spawns push the combined cache_read past 5 M tokens and
+# the V8 heap past the cgroup mem_limit → SIGKILL → job dies.
+#
+# The MCP-based path below replaces the built-in `Agent` tool with a
+# custom `spawn_subagent` MCP tool. Each call to that tool creates a
+# FRESH `ClaudeSDKClient` (= fresh `claude` CLI subprocess) for the
+# subagent. The subagent runs to completion, returns its final text
+# response, and the subprocess dies. main only ever sees the final
+# text as a tool_result — the subagent's full conversation never
+# touches main's heap. This is what "main / recon / debugger /
+# judge are independent agents" means at the OS process level.
+
+_AGENT_PROMPT_BY_TYPE = {
+    # Filled lazily — RECON_AGENT_PROMPT etc. are defined later in
+    # this file, after the prompt constants block. The lookup uses
+    # globals() at call time so we don't have a circular reference.
+    "recon": "RECON_AGENT_PROMPT",
+    "debugger": "DEBUGGER_AGENT_PROMPT",
+    "judge": "JUDGE_AGENT_PROMPT",
+}
+
+_AGENT_TOOLS_BY_TYPE = {
+    "recon": ["Read", "Bash", "Glob", "Grep"],
+    "debugger": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+    # judge has no Agent tool here — in isolated mode, subagents can't
+    # cascade-spawn further subagents (preserves the "ONE level deep"
+    # invariant the original AgentDefinition-based path enforced via
+    # the SDK's recursive-Agent block).
+    "judge": ["Read", "Bash", "Glob", "Grep"],
+}
+
+
+def make_standalone_options(
+    agent_type: str,
+    model: str | None,
+    work_dir,
+    job_id: str,
+    extra_env: dict | None = None,
+):
+    """Build `ClaudeAgentOptions` for a subagent running as a STANDALONE
+    session — i.e. it IS the main of its own SDK client, not a sub-
+    conversation inside another client. Used by the spawn_subagent MCP
+    tool to fork a fresh `claude` CLI subprocess per subagent
+    invocation, which keeps the parent main's heap from accumulating
+    the subagent's full conversation context.
+    """
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    if agent_type not in _AGENT_PROMPT_BY_TYPE:
+        raise ValueError(f"unknown agent_type {agent_type!r}")
+    prompt_name = _AGENT_PROMPT_BY_TYPE[agent_type]
+    prompt = globals().get(prompt_name)
+    if not prompt:
+        raise RuntimeError(
+            f"agent prompt {prompt_name} not yet defined — module init "
+            f"order bug; ensure prompts load before "
+            f"make_standalone_options is called"
+        )
+    tools = list(_AGENT_TOOLS_BY_TYPE[agent_type])
+    sub_model = (
+        LATEST_JUDGE_MODEL if agent_type == "judge"
+        else (model or LATEST_JUDGE_MODEL)
+    )
+    env = {"JOB_ID": job_id, "AGENT_ROLE": agent_type}
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items()})
+    return ClaudeAgentOptions(
+        system_prompt=prompt,
+        model=sub_model,
+        cwd=str(work_dir),
+        allowed_tools=tools,
+        permission_mode="bypassPermissions",
+        env=env,
+    )
+
+
+def make_spawn_subagent_mcp(
+    model: str | None,
+    work_dir,
+    job_id: str,
+    log_fn,
+    summary: dict,
+):
+    """Build the MCP server that hosts the `spawn_subagent` tool. Each
+    invocation of the tool launches a FRESH `ClaudeSDKClient` for the
+    requested subagent and returns its final text response. The
+    subprocess dies as soon as the subagent finishes, so main's heap
+    stays lean.
+
+    Returns a tuple ``(mcp_config, tool_name_full)`` where:
+      * ``mcp_config`` goes into ``ClaudeAgentOptions(mcp_servers={...})``
+      * ``tool_name_full`` (``"mcp__team__spawn_subagent"``) goes into
+        ``allowed_tools=[...]`` and is what the prompt tells main to
+        call.
+    """
+    from claude_agent_sdk import (
+        create_sdk_mcp_server,
+        tool,
+        ClaudeSDKClient,
+        AssistantMessage,
+        UserMessage,
+        ResultMessage,
+    )
+
+    server_name = "team"
+
+    @tool(
+        "spawn_subagent",
+        (
+            "Spawn an INDEPENDENT subagent (recon / debugger / judge) "
+            "in its own SDK session (= its own claude CLI subprocess). "
+            "The subagent runs to completion, then returns its FINAL "
+            "text response as the tool result. Use this in place of "
+            "the built-in `Agent` tool whenever you want process-"
+            "isolated memory — main's heap will not grow with the "
+            "subagent's investigation context. Parameters: "
+            "subagent_type ∈ {recon, debugger, judge}; "
+            "prompt is the question/task you want the subagent to "
+            "answer (keep it specific and bounded — the subagent's "
+            "session ends when it finishes the response)."
+        ),
+        {"subagent_type": str, "prompt": str},
+    )
+    async def spawn_subagent(args: dict) -> dict:
+        sub_type = (args.get("subagent_type") or "").strip().lower()
+        sub_prompt = args.get("prompt") or ""
+        if sub_type not in _AGENT_PROMPT_BY_TYPE:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"ERROR: unknown subagent_type {sub_type!r}. "
+                        f"Valid: recon, debugger, judge."
+                    ),
+                }],
+                "isError": True,
+            }
+        if not sub_prompt.strip():
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": "ERROR: empty prompt — pass a specific question.",
+                }],
+                "isError": True,
+            }
+
+        # Bump the spawn count exactly like the old Agent path did, so
+        # SUBAGENT_SPAWN_CAP still gates excessive delegation. The cap
+        # check itself runs in run_main_agent_session's receive loop;
+        # we just keep the counter accurate.
+        summary["subagent_spawns"] = (
+            int(summary.get("subagent_spawns", 0)) + 1
+        )
+        spawn_idx = summary["subagent_spawns"]
+        log_fn(
+            f"[orchestrator] isolated subagent #{spawn_idx} spawning "
+            f"({sub_type})"
+        )
+
+        sub_options = make_standalone_options(
+            sub_type, model, work_dir, job_id,
+        )
+        # Collect final text + record tool activity on a per-subagent
+        # tag so the run.log lines stay self-describing.
+        tag = f"{sub_type}#{spawn_idx}"
+        chunks: list[str] = []
+        sub_summary: dict = {}
+        try:
+            async with ClaudeSDKClient(options=sub_options) as sub_client:
+                await sub_client.query(sub_prompt)
+                async for msg in sub_client.receive_response():
+                    # Logging mirrors log_assistant_blocks but tagged
+                    # by the isolated subagent's identity. We don't
+                    # call log_assistant_blocks because that helper
+                    # mutates main's `summary["tool_calls"]` counter,
+                    # and we want subagent tool calls counted on the
+                    # subagent's own ledger.
+                    if isinstance(msg, AssistantMessage):
+                        for block in (getattr(msg, "content", None) or []):
+                            kind = type(block).__name__
+                            if kind == "TextBlock":
+                                txt = getattr(block, "text", "") or ""
+                                if txt.strip():
+                                    chunks.append(txt)
+                                    log_line(
+                                        job_id,
+                                        f"[{tag}] AGENT: {txt[:500]}",
+                                    )
+                            elif kind == "ToolUseBlock":
+                                nm = getattr(block, "name", "?")
+                                inp = getattr(block, "input", None) or {}
+                                try:
+                                    preview = json.dumps(inp)[:200]
+                                except Exception:
+                                    preview = str(inp)[:200]
+                                log_line(
+                                    job_id,
+                                    f"[{tag}] TOOL {nm}: {preview}",
+                                )
+                    elif isinstance(msg, UserMessage):
+                        log_user_blocks(job_id, msg)
+                    elif isinstance(msg, ResultMessage):
+                        # Bill the subagent's cost to the main job.
+                        cost = (
+                            getattr(msg, "total_cost_usd", None)
+                            or getattr(msg, "cost_usd", None)
+                            or 0.0
+                        )
+                        if cost:
+                            sub_summary["cost_usd"] = float(cost)
+                            summary["cost_usd"] = (
+                                float(summary.get("cost_usd", 0.0))
+                                + float(cost)
+                            )
+        except Exception as e:
+            log_fn(
+                f"[orchestrator] isolated {tag} crashed: {e!r} — "
+                f"returning error to main"
+            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"SUBAGENT_ERROR ({sub_type}): {type(e).__name__}: "
+                        f"{str(e)[:400]}"
+                    ),
+                }],
+                "isError": True,
+            }
+
+        final = "\n".join(chunks).strip()
+        if not final:
+            final = (
+                f"(subagent {sub_type} returned no text — likely hit "
+                f"its own budget or token limit. Treat as no useful "
+                f"output.)"
+            )
+        cost_note = (
+            f" cost=${sub_summary.get('cost_usd', 0):.4f}"
+            if sub_summary.get("cost_usd")
+            else ""
+        )
+        log_fn(
+            f"[orchestrator] isolated {tag} done — "
+            f"{len(final)} B response{cost_note}"
+        )
+        return {"content": [{"type": "text", "text": final}]}
+
+    server = create_sdk_mcp_server(
+        name=server_name,
+        version="1.0.0",
+        tools=[spawn_subagent],
+    )
+    tool_name_full = f"mcp__{server_name}__spawn_subagent"
+    return server, tool_name_full
 
 
 def budget_exceeded(tool_calls: int, work_dir: Path, expected: tuple[str, ...]) -> bool:

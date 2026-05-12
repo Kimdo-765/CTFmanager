@@ -16,6 +16,7 @@ from modules._common import (
     extract_cost,
     job_dir,
     log_line,
+    make_spawn_subagent_mcp,
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
@@ -199,38 +200,73 @@ async def _run_agent(
 
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     resume_sid = read_meta(job_id).get("resume_session_id")
-    options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
-        model=model,
-        cwd=str(work_dir),
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent"],
-        permission_mode="bypassPermissions",
-        env={"JOB_ID": job_id},
-        resume=resume_sid,
-        fork_session=bool(resume_sid),
-        agents=build_recon_agents(model),
-    )
-    user_prompt = build_user_prompt(binary_name, target, description, auto_run)
-
-    log_line(job_id, f"Launching Claude agent (model={model})")
-    if resume_sid:
-        log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")
-    # Flag heap-shaped chals so the orchestrator's scaffold-missing
-    # trip-wire (SCAFFOLD_NUDGE in run_main_agent_session) can fire
-    # only when relevant. Detection layered:
-    #   1. keyword match against description + retry hint (cheap, definitive)
-    #   2. fallback: ANY pwn-module run assumes heap-possible (job
-    #      0bb10f235507 had description="" so the keyword match
-    #      returned False and SCAFFOLD_NUDGE never fired despite the
-    #      chal being a glibc 2.39 heap chal). Pwn workloads are
-    #      heap-capable by default; non-heap chals (pure BoF / ROP)
-    #      ignore the nudge cheaply.
+    # Heap detection moved up so we can decide subagent-isolation
+    # before constructing options.
     heap_kw = looks_heap_advanced(description or "")
     summary: dict = {
         "messages": 0, "tool_calls": 0, "model": model,
         "heap_chal": True,                       # pwn module default
         "heap_chal_keyword_match": heap_kw,
     }
+    # Isolated subagent path. Each `spawn_subagent(...)` MCP call
+    # launches a NEW `claude` CLI subprocess for the subagent and
+    # discards it on return — main's heap never accumulates the
+    # subagent's investigation context. Env var
+    # `USE_ISOLATED_SUBAGENTS=0` reverts to the SDK's built-in
+    # `Agent` tool path (one Node.js process, all conversations
+    # share heap) for fast rollback.
+    use_isolated = os.environ.get(
+        "USE_ISOLATED_SUBAGENTS", "1") != "0"
+    if use_isolated:
+        mcp_server, spawn_tool = make_spawn_subagent_mcp(
+            model=model,
+            work_dir=work_dir,
+            job_id=job_id,
+            log_fn=lambda s: log_line(job_id, s),
+            summary=summary,
+        )
+        options = ClaudeAgentOptions(
+            system_prompt=SYSTEM_PROMPT,
+            model=model,
+            cwd=str(work_dir),
+            allowed_tools=[
+                "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+                spawn_tool,
+            ],
+            permission_mode="bypassPermissions",
+            env={"JOB_ID": job_id, "USE_ISOLATED_SUBAGENTS": "1"},
+            resume=resume_sid,
+            fork_session=bool(resume_sid),
+            mcp_servers={"team": mcp_server},
+        )
+        log_line(
+            job_id,
+            "[orchestrator] subagent isolation: ON "
+            f"(tool={spawn_tool})",
+        )
+    else:
+        options = ClaudeAgentOptions(
+            system_prompt=SYSTEM_PROMPT,
+            model=model,
+            cwd=str(work_dir),
+            allowed_tools=[
+                "Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent",
+            ],
+            permission_mode="bypassPermissions",
+            env={"JOB_ID": job_id, "USE_ISOLATED_SUBAGENTS": "0"},
+            resume=resume_sid,
+            fork_session=bool(resume_sid),
+            agents=build_recon_agents(model),
+        )
+        log_line(
+            job_id,
+            "[orchestrator] subagent isolation: OFF (legacy in-process)",
+        )
+    user_prompt = build_user_prompt(binary_name, target, description, auto_run)
+
+    log_line(job_id, f"Launching Claude agent (model={model})")
+    if resume_sid:
+        log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")
 
     soft_timeout = int(read_meta(job_id).get("job_timeout") or 0)
     watchdog = asyncio.create_task(soft_timeout_watchdog(job_id, soft_timeout))
