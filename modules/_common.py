@@ -305,8 +305,9 @@ MISSION (read first, follow strictly)
        cheaper than 3-5 spawns. Each spawn has fixed fork overhead
        (~2-3 s + cold prompt cache).
      · You can still spawn multiple subagents per run (cap default
-       is 2). The cap fires post-turn warning at count == cap and
-       hard-breaks the receive loop at count > cap.
+       is 4 — typical heap-pwn workflow is ~2 recon + 1 debugger +
+       1 judge). The cap fires post-turn warning at count == cap
+       and hard-breaks the receive loop at count > cap.
      · If the legacy `Agent` tool is still in your tool list
        (USE_ISOLATED_SUBAGENTS=0), prefer the MCP form anyway —
        isolation is strictly the safer path.
@@ -3293,9 +3294,9 @@ async def run_main_agent_session(
 
     def _maybe_subagent_cap() -> None:
         try:
-            cap = int(os.environ.get("SUBAGENT_SPAWN_CAP", "2"))
+            cap = int(os.environ.get("SUBAGENT_SPAWN_CAP", "4"))
         except ValueError:
-            cap = 2
+            cap = 4
         if cap <= 0:
             return
         count = int(summary.get("subagent_spawns", 0))
@@ -3360,9 +3361,9 @@ async def run_main_agent_session(
                         count = int(summary.get("subagent_spawns", 0))
                         try:
                             cap = int(os.environ.get(
-                                "SUBAGENT_SPAWN_CAP", "2"))
+                                "SUBAGENT_SPAWN_CAP", "4"))
                         except ValueError:
-                            cap = 2
+                            cap = 4
                         exploit_missing = not (work_dir / "exploit.py").is_file()
                         report_missing = not (work_dir / "report.md").is_file()
                         write_fallback_artifacts(work_dir, log_fn)
