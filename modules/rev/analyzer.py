@@ -6,14 +6,13 @@ from pathlib import Path
 from typing import Optional
 
 import anyio
-from claude_agent_sdk import ClaudeAgentOptions
 
 from modules._common import (
-    build_recon_agents,
     collect_outputs,
     extract_cost,
     job_dir,
     log_line,
+    make_main_session_options,
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
@@ -49,25 +48,21 @@ async def _run_agent(
 
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     resume_sid = read_meta(job_id).get("resume_session_id")
-    options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
+    summary: dict = {"messages": 0, "tool_calls": 0, "model": model}
+    options = make_main_session_options(
+        job_id=job_id,
+        work_dir=work_dir,
         model=model,
-        cwd=str(work_dir),
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent"],
-        permission_mode="bypassPermissions",
-        # JOB_ID lets the `ghiant` Bash wrapper find the job dir for the
-        # decompiler bind-mount.
-        env={"JOB_ID": job_id},
-        resume=resume_sid,
-        fork_session=bool(resume_sid),
-        agents=build_recon_agents(model),
+        system_prompt=SYSTEM_PROMPT,
+        base_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        summary=summary,
+        resume_sid=resume_sid,
     )
     user_prompt = build_user_prompt(binary_name, description, auto_run)
 
     log_line(job_id, f"Launching Claude agent (model={model})")
     if resume_sid:
         log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")
-    summary: dict = {"messages": 0, "tool_calls": 0, "model": model}
 
     soft_timeout = int(read_meta(job_id).get("job_timeout") or 0)
     watchdog = asyncio.create_task(soft_timeout_watchdog(job_id, soft_timeout))

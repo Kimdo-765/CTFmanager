@@ -2,18 +2,16 @@ import asyncio
 import json
 import os
 import traceback
-from pathlib import Path
 from typing import Optional
 
 import anyio
-from claude_agent_sdk import ClaudeAgentOptions
 
 from modules._common import (
-    build_recon_agents,
     collect_outputs,
     extract_cost,
     job_dir,
     log_line,
+    make_main_session_options,
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
@@ -40,20 +38,16 @@ async def _run_agent(
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     add_dirs = [src_root] if src_root else []
     resume_sid = read_meta(job_id).get("resume_session_id")
-    options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
+    summary: dict = {"messages": 0, "tool_calls": 0, "model": model}
+    options = make_main_session_options(
+        job_id=job_id,
+        work_dir=work_dir,
         model=model,
-        cwd=str(work_dir),
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent"],
-        permission_mode="bypassPermissions",
+        system_prompt=SYSTEM_PROMPT,
+        base_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        summary=summary,
         add_dirs=add_dirs,
-        # JOB_ID lets retry/resume preambles (and the agent) anchor on
-        # the current job's directory rather than the prior session's
-        # baked-in absolute paths.
-        env={"JOB_ID": job_id},
-        resume=resume_sid,
-        fork_session=bool(resume_sid),
-        agents=build_recon_agents(model),
+        resume_sid=resume_sid,
     )
     if resume_sid:
         log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")
@@ -64,8 +58,6 @@ async def _run_agent(
 
     soft_timeout = int(read_meta(job_id).get("job_timeout") or 0)
     watchdog = asyncio.create_task(soft_timeout_watchdog(job_id, soft_timeout))
-
-    summary: dict = {"messages": 0, "tool_calls": 0, "model": model}
 
     sandbox_result: Optional[dict] = None
 

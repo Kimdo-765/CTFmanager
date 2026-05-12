@@ -372,8 +372,7 @@ costs bounded — but it lets you fix obvious bugs without forcing the
 human to click /retry.
 
 Call:
-    Agent(
-      description="prejudge exploit",
+    mcp__team__spawn_subagent(
       subagent_type="judge",
       prompt="review ./exploit.py (or ./solver.py) for hang/parse
               risks: recvuntil-without-timeout, wrong prompt
@@ -1035,9 +1034,8 @@ itself instead of asking main to paste it.
 
 Delegating to recon: when the answer requires heavy investigation
 (libc symbol lookup, ROPgadget search, ghiant decompile, multi-file
-source grep), call recon yourself:
-  Agent(
-    description="<short purpose, ≤8 words>",
+source grep), call recon yourself via the isolated MCP tool:
+  mcp__team__spawn_subagent(
     subagent_type="recon",
     prompt="<one specific question with the path(s) to look at>"
   )
@@ -1659,6 +1657,86 @@ def make_standalone_options(
     )
 
 
+def make_main_session_options(
+    *,
+    job_id: str,
+    work_dir,
+    model: str,
+    system_prompt: str,
+    base_tools: list,
+    summary: dict,
+    add_dirs: list | None = None,
+    resume_sid: str | None = None,
+    extra_env: dict | None = None,
+):
+    """Build ``ClaudeAgentOptions`` for a main agent session. Selects
+    isolated-subagent (MCP) vs legacy in-process (``agents=``) path
+    based on ``USE_ISOLATED_SUBAGENTS`` (default ON). All four module
+    analyzers (pwn / web / crypto / rev) share this builder so the
+    isolation behavior is uniform.
+
+    Args:
+      base_tools: the per-module tool set (Read/Write/Bash/...) WITHOUT
+        the subagent-spawn tool. The builder appends either
+        ``mcp__team__spawn_subagent`` or ``Agent`` depending on the
+        active path.
+      summary: the main session's summary dict; passed through to the
+        MCP tool so per-spawn cost + counter increments roll up.
+    """
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    use_isolated = os.environ.get(
+        "USE_ISOLATED_SUBAGENTS", "1") != "0"
+    log_fn_local = lambda s: log_line(job_id, s)
+    env = {"JOB_ID": job_id}
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items()})
+
+    if use_isolated:
+        mcp_server, spawn_tool = make_spawn_subagent_mcp(
+            model=model,
+            work_dir=work_dir,
+            job_id=job_id,
+            log_fn=log_fn_local,
+            summary=summary,
+        )
+        env["USE_ISOLATED_SUBAGENTS"] = "1"
+        options = ClaudeAgentOptions(
+            system_prompt=system_prompt,
+            model=model,
+            cwd=str(work_dir),
+            allowed_tools=[*base_tools, spawn_tool],
+            permission_mode="bypassPermissions",
+            add_dirs=add_dirs or [],
+            env=env,
+            resume=resume_sid,
+            fork_session=bool(resume_sid),
+            mcp_servers={"team": mcp_server},
+        )
+        log_fn_local(
+            "[orchestrator] subagent isolation: ON "
+            f"(tool={spawn_tool})"
+        )
+    else:
+        env["USE_ISOLATED_SUBAGENTS"] = "0"
+        options = ClaudeAgentOptions(
+            system_prompt=system_prompt,
+            model=model,
+            cwd=str(work_dir),
+            allowed_tools=[*base_tools, "Agent"],
+            permission_mode="bypassPermissions",
+            add_dirs=add_dirs or [],
+            env=env,
+            resume=resume_sid,
+            fork_session=bool(resume_sid),
+            agents=build_recon_agents(model),
+        )
+        log_fn_local(
+            "[orchestrator] subagent isolation: OFF (legacy in-process)"
+        )
+    return options
+
+
 def make_spawn_subagent_mcp(
     model: str | None,
     work_dir,
@@ -1729,14 +1807,14 @@ def make_spawn_subagent_mcp(
                 "isError": True,
             }
 
-        # Bump the spawn count exactly like the old Agent path did, so
-        # SUBAGENT_SPAWN_CAP still gates excessive delegation. The cap
-        # check itself runs in run_main_agent_session's receive loop;
-        # we just keep the counter accurate.
-        summary["subagent_spawns"] = (
-            int(summary.get("subagent_spawns", 0)) + 1
-        )
-        spawn_idx = summary["subagent_spawns"]
+        # NOTE: the spawn counter is incremented in log_assistant_blocks
+        # the moment main's ToolUseBlock(mcp__team__spawn_subagent)
+        # is yielded — that lets _maybe_subagent_cap() set the break
+        # flag before this function even gets called. Do NOT increment
+        # here or we'd double-count. By the time we're inside this
+        # function, summary["subagent_spawns"] already reflects this
+        # spawn.
+        spawn_idx = int(summary.get("subagent_spawns", 0))
         log_fn(
             f"[orchestrator] isolated subagent #{spawn_idx} spawning "
             f"({sub_type})"
@@ -2036,22 +2114,27 @@ why you skipped them. This nudge fires once per job.
 
 
 SUBAGENT_CAP_USER_TURN = """\
-🛑 SUBAGENT SPAWN CAP REACHED — you've already spawned the maximum
-number of subagents for this run. DO NOT call the `Agent` tool again
-this session. Each Agent(subagent_type=...) call forks a fresh
-`claude` CLI subprocess inside the worker container. With your
-accumulated cache_read context, a third concurrent CLI is the
-documented cause of the OOM that killed jobs 011a6d486d53 /
-7c4a6a4c7581 / ff8240803dc2 / 5c5334381583 — even when the token
-count looked safe (3.1 M cache_read in 5c5334).
+🛑 SUBAGENT SPAWN CAP REACHED — you've spawned the budgeted number
+of subagents for this run. DO NOT call `mcp__team__spawn_subagent`
+(or the legacy `Agent` tool) again this session.
+
+Why this cap exists: each subagent invocation adds its
+final-text reply to your conversation history, and (in the
+legacy in-process path) the subagent's intermediate tool
+calls accumulate into the same Node.js heap that runs you.
+Across a heap-pwn run that produced enough delegations to
+push the worker past its cgroup limit, jobs 011a6d486d53 /
+7c4a6a4c7581 / ff8240803dc2 / 5c5334381583 / c4f49803edfe
+all SIGKILLed at a spawn moment. The cap is the budget, not
+a punishment — you've used what you were given.
 
 What to do INSTEAD:
 
 1. Any debugger work you'd have delegated → run inline with
    `bash -lc 'gdb -batch -nx -x /tmp/probe.gdb ./prob'`. The
    `chal-libc-fix` patchelf has already aligned the binary to the
-   chal's libc, so an inline gdb session is functionally identical
-   to a debugger subagent — minus the second SDK process.
+   chal's libc, so an inline gdb session gives you the same facts
+   without a fresh subagent context.
 
 2. Any recon question → grep / Read on the existing decomp/*.c
    files directly. The decompiler already ran during autoboot and
@@ -2061,8 +2144,9 @@ What to do INSTEAD:
    The fallback safety net is still active — but landing a real
    exploit before any further analysis is the cheaper path.
 
-This warning fires ONCE per job. Ignoring it raises the OOM risk
-back to its pre-cap level.
+This warning fires ONCE per job. If you ignore it and try another
+spawn, the orchestrator hard-breaks the receive loop on the next
+spawn attempt and falls back to sandbox dispatch immediately.
 """
 
 
@@ -2553,12 +2637,20 @@ def log_assistant_blocks(job_id: str, msg, summary: dict) -> None:
             name = getattr(block, "name", "?")
             inp = getattr(block, "input", None) or {}
             # Tally subagent spawns so the orchestrator's spawn-cap
-            # guard can fire a "no more Agent calls" user-turn before
-            # the next concurrent SDK CLI fork triggers an OOM.
-            # Only main's Agent calls count (subagents shouldn't be
-            # spawning their own Agents anyway, but the is_main gate
-            # makes that intent explicit).
-            if is_main and name == "Agent":
+            # guard fires BEFORE the SDK executes the tool — the
+            # increment runs in log_assistant_blocks (= as soon as we
+            # see the ToolUseBlock yielded), so _maybe_subagent_cap()
+            # at the bottom of the receive loop body can set the
+            # break flag in the same iteration. By the time the SDK
+            # tries to execute the tool, the receive loop has already
+            # exited and the SDK context manager closes (= MCP tool
+            # is never called, legacy Agent dispatch is interrupted).
+            # The MCP tool function intentionally does NOT increment
+            # the counter (avoids double count). Both legacy `Agent`
+            # and MCP `mcp__team__spawn_subagent` count the same way.
+            if is_main and (
+                name == "Agent" or name == "mcp__team__spawn_subagent"
+            ):
                 summary["subagent_spawns"] = (
                     int(summary.get("subagent_spawns", 0)) + 1
                 )
@@ -3266,11 +3358,15 @@ async def run_main_agent_session(
             f"user-turn after current turn ends."
         )
 
-    # Subagent-spawn hard cap. Each Agent(subagent_type=...) call
-    # forks a fresh `claude` CLI subprocess. Two concurrent SDK CLIs
-    # routinely peak past the worker cgroup limit at fork time, even
-    # when each one's cache_read is below the compaction thresholds
-    # (job 5c5334381583: 3.1 M tokens, OOMed at debugger spawn).
+    # Subagent-spawn hard cap. With the isolated MCP path each
+    # `spawn_subagent` invocation runs in its own claude CLI
+    # subprocess, but the subagent's final-text reply still grows
+    # main's conversation history (a few KB per spawn). With the
+    # legacy in-process `Agent` path the subagent's WHOLE context
+    # accumulates into main's Node.js heap. Either way, unbounded
+    # delegation eventually pushes the worker past its cgroup
+    # mem_limit. Jobs 011a/7c4a/ff82/5c53/c4f4 all OOMed at a
+    # spawn moment under the legacy path.
     #
     # Two-stage enforcement:
     #

@@ -42,33 +42,36 @@ services:
     build:
       context: .
       dockerfile: worker/Dockerfile
-    # Cap worker memory so a runaway heap-chal exploit loop or a
-    # debugger subagent spawning concurrent ./prob + gdb instances
-    # can't trigger the host OOM-killer (which kills the bundled
-    # `claude` CLI as the largest process — surfaced as
-    # `Command failed with exit code -9` and a lost run). With a
-    # cgroup limit the OOM stays inside the container; the SDK
-    # session ends cleanly with an error_kind we can classify.
-    # Override via .env if you have a different RAM budget.
+    # Cap worker memory so a runaway heap-chal exploit loop or
+    # cumulative subagent context bloat can't trigger the host
+    # OOM-killer. With a cgroup limit the OOM stays inside the
+    # container; the SDK session ends cleanly with an error_kind
+    # we can classify, the fallback artifact path runs, and the
+    # sandbox + judge cycle still completes. Override via .env
+    # for hosts with different RAM budgets.
     #
-    # Default raised 8g → 12g after job 011a6d486d53: main session
-    # accumulated ~3.6M cache_read tokens then spawned debugger as
-    # a fresh SDK child process. Two SDK instances + main brute-force
-    # output context squeezed past 8g cap right at the debugger spawn.
-    # 12g gives ~50% headroom while still containing pathological loops.
+    # History:
+    #   - 8g → 12g (job 011a6d486d53): legacy in-process subagent
+    #     path accumulated debugger context into main's Node.js
+    #     heap; OOMed at ~3.6M cache_read.
+    #   - 12g → 14g (job 5c5334381583): OOM at 3.1M cache_read
+    #     — single-process heap growth, NOT the fork-spike model
+    #     older comments suggested. Verified by reading the SDK's
+    #     subprocess_cli.py + query.py: each ClaudeSDKClient owns
+    #     ONE claude CLI Node.js subprocess; AgentDefinitions are
+    #     sub-conversations inside that process, not separate
+    #     OS-level forks.
+    #   - 14g RAM + 18g memswap (job c4f49803edfe): 4Gi of host
+    #     swap dedicated to worker absorbs heap growth during
+    #     long heap-pwn investigations. Host has 15Gi RAM + 4Gi
+    #     swap; leaves ~1Gi free for API/Redis/system.
     #
-    # Raised again 12g → 14g after job 5c5334381583: OOM at debugger
-    # spawn with main holding only 3.1M cache_read tokens — well below
-    # any compaction threshold. The token-based guards can't see the
-    # transient process-fork RAM spike (parent CLI + child CLI both
-    # resident for a few seconds). 14g RAM + 16g memswap absorbed
-    # most spikes but job c4f49803edfe (2026-05-12) still OOMed at
-    # 4.5M cache_read with the same 3rd-Agent-spawn pattern. Bumped
-    # memswap 16g → 18g so the entire host swap (4Gi) is available
-    # to the worker process tree during the fork moment. Host has
-    # 15Gi RAM + 4Gi swap; this caps the worker at 14g RAM + 4g swap
-    # which still leaves ~1Gi RAM free for API/Redis/system (swap is
-    # mostly idle on the host so dedicating it is safe).
+    # The MCP isolated-subagent path (USE_ISOLATED_SUBAGENTS=1,
+    # default ON) reduces the cumulative-heap pressure
+    # significantly because each subagent now runs in its own
+    # claude CLI subprocess and only its final-text reply lands
+    # in main's history. These limits are still load-bearing for
+    # the legacy fallback path and for runaway exploit loops.
     mem_limit: ${WORKER_MEM_LIMIT:-14g}
     memswap_limit: ${WORKER_MEMSWAP_LIMIT:-18g}
     env_file: .env
