@@ -1637,6 +1637,67 @@ when context is full.
 """
 
 
+SOFT_EJECT_USER_TURN = """\
+⏰ TOOL-CALL BUDGET ALERT — you have burned 80%+ of the
+INVESTIGATION_BUDGET (default 100 tool calls per analyzer run) WITHOUT
+an `./exploit.py` artifact on disk. Job d8decbd77ed9 hit this exact
+state at 80 calls and burned the remaining 20 on more recon delegations
+before BUDGET_ABORT shut it down with no artifact produced.
+
+What you MUST do BEFORE your next investigation step:
+
+  1. WRITE THE DRAFT. Even your second-best hypothesis is better than
+     `agent_error_kind=budget` with `exploit_present=false`. The auto-
+     retry loop will inject postjudge feedback so you can refine it —
+     that loop CANNOT start until exploit.py exists.
+  2. If your chain depends on a heap technique, START FROM A SCAFFOLD
+     instead of from scratch:
+         cp /opt/scaffold/heap_menu.py ./exploit.py     # menu chal
+     and import the helpers (`safe_link`, `build_full_chain`,
+     `aslr_retry`) so you DON'T re-derive the boilerplate.
+  3. Set `context.timeout = 10` and add `timeout=` on every recv-family
+     call. The judge will flag unbounded recvs as HIGH severity.
+  4. Write `./report.md` even if it's just "currently best guess: X
+     because Y; unconfirmed assumptions: Z".
+
+You can keep investigating AFTER the draft lands. The trip-wire is one-
+shot per job; it won't re-warn. The HARD abort fires at 100 calls.
+"""
+
+
+SCAFFOLD_MISSING_USER_TURN = """\
+🪜 SCAFFOLD NUDGE — this is a HEAP / FSOP / tcache / UAF challenge
+(detected from your description or recon's CANDIDATES) but you've
+made N tool calls without using any of the /opt/scaffold/ templates.
+The scaffolds encode invariants that judge has historically flagged
+as HIGH severity when written from scratch:
+
+  /opt/scaffold/heap_menu.py
+    — alloc / free / edit / show wrappers + libc_profile.json loader +
+      `safe_link(target, chunk)` + `assert_libc_base()`.
+      Just: `cp /opt/scaffold/heap_menu.py ./exploit.py` then fill
+      the prompt strings.
+
+  /opt/scaffold/fsop_wfile.py
+    — `_IO_FILE_plus` / `_IO_wide_data` / `_wide_vtable` builders
+      that ENFORCE the "vtable LAST" ordering (the documented #1
+      cause of FSOP SIGSEGVs). Use `build_full_chain(fake_file_addr=...,
+      doallocate_addr=...)` and flip vtable separately afterward.
+
+  /opt/scaffold/tcache_poison.py
+    — `safe_link()` auto-branches on libc_profile.json safe_linking.
+      `needs_key_bypass()` for glibc >= 2.35.
+
+  /opt/scaffold/aslr_retry.py
+    — `aslr_retry(exploit_one, max_attempts=64)` for nibble-race
+      chains; `expected_attempts_for(success_rate)` for sizing.
+
+If the chal is NOT menu-shaped (e.g. single-shot ROP, custom protocol),
+ignore this — but say so explicitly in report.md so the judge knows
+why you skipped them. This nudge fires once per job.
+"""
+
+
 _TOKEN_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -2510,11 +2571,12 @@ async def run_main_agent_session(
     last_sandbox: dict | None = None
 
     # Soft-eject machinery: at 80% of INVESTIGATION_BUDGET with no
-    # artifact yet, log a single warning so the operator (and the agent
-    # via the prompt's "you saw this warning" rule) knows the hard
-    # abort is nigh. Fires AT MOST ONCE per job to avoid spamming
-    # auto-retry cycles.
+    # artifact yet, queue a user-turn injection so the agent SEES the
+    # warning in its own context (a log_line alone doesn't reach the
+    # model). Fires AT MOST ONCE per job — the inject_after_turn flag
+    # is consumed by the main loop after the current agent turn ends.
     soft_eject_fired = {"value": False}
+    soft_eject_pending = {"value": False}
 
     def _maybe_soft_eject(tool_calls: int) -> None:
         if soft_eject_fired["value"]:
@@ -2531,11 +2593,54 @@ async def run_main_agent_session(
         if any((work_dir / n).is_file() for n in artifact_names):
             return
         soft_eject_fired["value"] = True
+        soft_eject_pending["value"] = True
         log_fn(
             f"SOFT_EJECT_WARN: {tool_calls}/{cap} tool calls without "
             f"{' / '.join(artifact_names)}. Hard abort fires at "
-            f"{cap}. Agent should draft the artifact NOW from its best "
-            f"hypothesis and refine after."
+            f"{cap}. Will inject finalize-now user-turn after current "
+            f"turn ends."
+        )
+
+    # Scaffold-missing nudge: heap chals where main is making tool calls
+    # but hasn't `cp`'d any /opt/scaffold/ template into the work dir by
+    # SCAFFOLD_NUDGE_THRESHOLD calls. One-shot per job. Gated by the
+    # heap_keywords_match flag the analyzer can pass through `summary`
+    # so non-heap modules don't see this nudge.
+    scaffold_nudge_fired = {"value": False}
+    scaffold_nudge_pending = {"value": False}
+
+    def _maybe_scaffold_nudge(tool_calls: int) -> None:
+        if scaffold_nudge_fired["value"]:
+            return
+        if not summary.get("heap_chal"):
+            return
+        try:
+            threshold = int(os.environ.get("SCAFFOLD_NUDGE_THRESHOLD", "30"))
+        except ValueError:
+            threshold = 30
+        if threshold <= 0 or tool_calls < threshold:
+            return
+        # Already cp'd a scaffold? Look for the canonical fingerprint
+        # (the heap_menu.py docstring's first line lives at the top).
+        ex = work_dir / "exploit.py"
+        scaffold_in_use = False
+        if ex.is_file():
+            try:
+                head = ex.read_text(errors="replace")[:512]
+                if "Heap-menu chal scaffold" in head or "scaffold.fsop_wfile" in head \
+                        or "scaffold.tcache_poison" in head or "scaffold.aslr_retry" in head:
+                    scaffold_in_use = True
+            except Exception:
+                pass
+        if scaffold_in_use:
+            scaffold_nudge_fired["value"] = True  # never nudge if already in use
+            return
+        scaffold_nudge_fired["value"] = True
+        scaffold_nudge_pending["value"] = True
+        log_fn(
+            f"SCAFFOLD_NUDGE: {tool_calls} tool calls into a heap chal "
+            f"without /opt/scaffold/ in exploit.py. Will inject nudge "
+            f"user-turn after current turn ends."
         )
 
     # State for the compaction guard. The SOFT warning is injected
@@ -2563,6 +2668,7 @@ async def run_main_agent_session(
                     elif isinstance(msg, UserMessage):
                         log_user_blocks(job_id, msg)
                     _maybe_soft_eject(summary.get("tool_calls", 0))
+                    _maybe_scaffold_nudge(summary.get("tool_calls", 0))
                     # Compaction state check — must come BEFORE
                     # budget_exceeded so an OOM-imminent run can fork
                     # rather than abort with "no artifact".
@@ -2639,9 +2745,27 @@ async def run_main_agent_session(
                 compaction_warn_pending["value"] = False
                 log_fn("[orchestrator] injecting compaction warning user-turn")
                 await client.query(COMPACTION_USER_TURN)
-                # Loop again — main's response to the warning is treated
-                # as a regular turn; the sandbox dispatch happens AFTER
-                # that turn ends.
+                continue
+
+            # ---- Soft-eject (budget 80%) user-turn injection ----
+            # Job d8decbd77ed9 hit SOFT_EJECT_WARN at 80/100 calls but
+            # the log_line alone didn't reach the model — it kept
+            # investigating until BUDGET_ABORT fired with no artifact.
+            # Inject the warning as a user-turn so main actually sees it.
+            if soft_eject_pending["value"]:
+                soft_eject_pending["value"] = False
+                log_fn("[orchestrator] injecting soft-eject user-turn")
+                await client.query(SOFT_EJECT_USER_TURN)
+                continue
+
+            # ---- Scaffold-missing nudge ----
+            # Heap chal + N tool calls + no /opt/scaffold/ template in
+            # exploit.py → nudge main to use the canonical templates
+            # instead of reinventing the wheel from scratch.
+            if scaffold_nudge_pending["value"]:
+                scaffold_nudge_pending["value"] = False
+                log_fn("[orchestrator] injecting scaffold-missing nudge")
+                await client.query(SCAFFOLD_MISSING_USER_TURN)
                 continue
 
             # ---- Decide whether to feed postjudge back to main ----

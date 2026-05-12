@@ -24,7 +24,7 @@ from modules._common import (
     write_meta,
 )
 from modules._runner import attempt_sandbox_run
-from modules.pwn.prompts import SYSTEM_PROMPT, build_user_prompt
+from modules.pwn.prompts import SYSTEM_PROMPT, build_user_prompt, looks_heap_advanced
 from modules.settings_io import apply_to_env, get_setting
 
 
@@ -215,7 +215,14 @@ async def _run_agent(
     log_line(job_id, f"Launching Claude agent (model={model})")
     if resume_sid:
         log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")
-    summary: dict = {"messages": 0, "tool_calls": 0, "model": model}
+    # Flag heap-shaped chals so the orchestrator's scaffold-missing
+    # trip-wire (SCAFFOLD_NUDGE in run_main_agent_session) can fire
+    # only when relevant. Detection is the same keyword heuristic
+    # the user-prompt builder uses, applied to {description + retry_hint}.
+    summary: dict = {
+        "messages": 0, "tool_calls": 0, "model": model,
+        "heap_chal": looks_heap_advanced(description or ""),
+    }
 
     soft_timeout = int(read_meta(job_id).get("job_timeout") or 0)
     watchdog = asyncio.create_task(soft_timeout_watchdog(job_id, soft_timeout))

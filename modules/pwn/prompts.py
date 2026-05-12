@@ -215,15 +215,37 @@ DON'T re-derive these facts on every chal):
     → ALWAYS-CURRENT PoC C source for every well-known technique on
       THIS glibc. Profile's how2heap.dir points at the right version
       dir; how2heap.techniques lists every .c file you can crib from.
-      Example:
-        # JSON says preferred FSOP is wfile_jumps overflow + version is 2.39
-        cat /opt/how2heap/glibc_2.39/house_of_apple2.c    # not present
-        cat /opt/how2heap/glibc_2.39/house_of_tangerine.c # if listed
-      Use these instead of reinventing chain math — they encode the
-      exact byte-level layout, offsets, and trigger order that work on
-      that glibc. If the technique you want is NOT in
-      profile.how2heap.techniques, your glibc DOESN'T support it
-      cleanly; pick a listed one.
+
+      RULE: TRUST THE PROFILE'S TECHNIQUES LIST.
+      Pick the .c file by name FROM THE techniques ARRAY, not from a
+      CTF blog post or your memory. how2heap renames + consolidates
+      techniques between versions, and CTF writeups often reference
+      OLD names. The corpus only has what's in the techniques array.
+
+      ALIAS TABLE — common CTF names → actual how2heap filename:
+        CTF blog says                        how2heap file (2.34+)
+        ────────────────────────────────────────────────────────────
+        house_of_apple, house_of_apple2  →  house_of_tangerine.c
+        IO_FILE / _IO_wfile_jumps chain  →  house_of_water.c
+        FSOP via _IO_2_1_stdout_         →  house_of_water.c
+        tcache poison (safe-linking)     →  tcache_poisoning.c +
+                                            decrypt_safe_linking.c
+        large-bin attack                 →  large_bin_attack.c
+        unsafe unlink                    →  unsafe_unlink.c
+        consolidate-into-unsorted        →  fastbin_dup_consolidate.c
+        UAF + double-free into tcache    →  house_of_botcake.c
+        einherjar (off-by-null heap ovf) →  house_of_einherjar.c
+
+      If you can't find an obvious match in techniques[], that means
+      the technique was REMOVED or RENAMED on this glibc — DO NOT
+      try to "find it elsewhere" or have recon search the web. Pick
+      a listed technique that achieves the same primitive and adapt.
+
+      Example flow:
+        cat ./.chal-libs/libc_profile.json | jq '.how2heap.techniques'
+        # ["decrypt_safe_linking", "fastbin_dup", ..., "house_of_tangerine"]
+        cat /opt/how2heap/glibc_2.39/house_of_tangerine.c
+        # ← THIS is the canonical FSOP chain for 2.34+ (not apple2).
   /opt/scaffold/heap_menu.py       (`cp` it to ./exploit.py — menu chals)
   /opt/scaffold/fsop_wfile.py      (import: `build_full_chain` + VTABLE_OFFSET)
   /opt/scaffold/tcache_poison.py   (import: `safe_link` + `needs_key_bypass`)
@@ -432,6 +454,14 @@ def _looks_heap_advanced(description: str | None) -> bool:
         return False
     low = description.lower()
     return any(k in low for k in _HEAP_HINT_KEYWORDS)
+
+
+def looks_heap_advanced(description: str | None) -> bool:
+    """Public alias of `_looks_heap_advanced` for analyzer.py — exposes
+    the same heap-detection heuristic so the orchestrator can flag the
+    job as heap-shaped and gate trip-wires (SCAFFOLD_NUDGE) on it.
+    """
+    return _looks_heap_advanced(description)
 
 
 def build_user_prompt(
