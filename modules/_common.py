@@ -315,6 +315,27 @@ MISSION (read first, follow strictly)
      trip-wire is specifically designed to prevent that pattern from
      repeating.
 
+3.5. CONTEXT COMPACTION GUARD (independent of #3, fires on memory not
+   tool-call count):
+   * SOFT — at 8 M accumulated `cache_read_input_tokens` (configurable
+     via `CONTEXT_COMPACTION_THRESHOLD`) the orchestrator injects a
+     `COMPACTION_USER_TURN` message into your conversation telling
+     you to STOP investigating, finalize the artifact, and end your
+     turn. DO NOT spawn debugger / recon after seeing it — the SDK
+     child process spawn is the documented OOM-trigger.
+   * HARD — at 14 M accumulated cache_read tokens (`COMPACTION_HARD_
+     CEILING`) the orchestrator ends your session cleanly with
+     `agent_error_kind=compaction_ceiling`. Whatever exploit.py +
+     report.md you've written are preserved; the auto-retry loop
+     then forks a fresh session whose first user-turn is the
+     postjudge feedback from the just-completed sandbox run — your
+     work continues with a small context.
+   This guard exists because jobs 011a6d486d53 (3.6 M tokens,
+   OOM at debugger spawn) and 7c4a6a4c7581 (13.5 M tokens, OOM
+   at debugger spawn) both wrote a working exploit and then died
+   trying to debug it. The compaction loop preserves your progress
+   instead.
+
 JUDGE GATE (mandatory before you finalize)
 ------------------------------------------
 Before you end your turn, you MUST send your final exploit/solver to
@@ -497,7 +518,8 @@ Pwn-specific:
                      extracted) libc + ld, staged at ./.chal-libs/.
                      ALSO emits ./.chal-libs/libc_profile.json with
                      {version, safe_linking, tcache_key, hooks_alive,
-                      preferred_fsop_chain, symbols, one_gadget}.
+                      preferred_fsop_chain, symbols, one_gadget,
+                      how2heap.{dir,techniques[]}}.
                      RUN THIS BEFORE pwn.ELF() / one_gadget / ROPgadget
                      against libc — worker libc is glibc 2.41 (wrong).
   - heap state     : `heap-probe ./prob --input <in> --break <bp>
@@ -509,12 +531,47 @@ Pwn-specific:
                      FSOP / tcache / nibble-race chains. Load
                      libc_profile.json automatically.
                        `cp /opt/scaffold/heap_menu.py ./exploit.py`
+  - how2heap PoCs  : /opt/how2heap/glibc_<VER>/*.c — shellphish corpus
+                     of every well-known heap technique, version-keyed
+                     against the chal's glibc. `cat` the .c file you
+                     plan to mimic INSTEAD of reinventing chain math.
+                     The applicable list is in libc_profile.json
+                     `how2heap.techniques`.
   - gadgets        : ROPgadget --binary ./bin/<name> --rop / --jop
   - decompiler     : `ghiant <binary> [outdir]` (Ghidra headless, ./decomp/)
+  - symbolic exec  : `angr` — when you can't see WHICH input leads to
+                     vuln(), or when one_gadget constraints need solver
+                     proof. Heavy (~800 MB resident); use sparingly,
+                     prefer recon delegation. Pattern:
+                       p = angr.Project('./prob', auto_load_libs=False)
+                       sm = p.factory.simulation_manager(
+                           p.factory.entry_state())
+                       sm.explore(find=<addr_of_win>, avoid=[<bad>])
   - libc id (remote-only): `pwn libcdb find <sym> <leak>` — queries
                      libc-database web API, returns matching versions.
-  - Python (import): pwn (pwntools — checksec / ELF / cyclic / asm / shellcraft),
-                     Crypto, gmpy2, sympy, z3
+  - Python (import): pwn (pwntools — checksec / ELF / cyclic / asm /
+                     shellcraft; pwn.fmtstr_payload; pwn.flat;
+                     pwn.libcdb.find_libc),
+                     libheap (parse malloc_chunk, walk arena / tcache
+                              from a raw heap dump without spawning gdb;
+                              import libheap; ...),
+                     Crypto, gmpy2, sympy, z3 (constraint solver — pair
+                     with angr or use solo when the heap-poison
+                     alignment math is just modular arithmetic)
+  - GDB Python API : every `gdb` call accepts `-x script.py` — full
+                     Python automation inside one gdb session:
+                       cat > /tmp/probe.py <<'PY'
+                       import gdb, json
+                       gdb.execute("file ./prob")
+                       gdb.execute("b *vuln+0x42"); gdb.execute("r < /tmp/in")
+                       rax = int(gdb.parse_and_eval("$rax")) & ((1<<64)-1)
+                       chunks = gdb.execute("heap chunks", to_string=True)
+                       print(json.dumps({{"rax": hex(rax),
+                                          "chunks_lines": chunks.count('\\n')}}))
+                       PY
+                       gdb -batch -x /tmp/probe.py
+                     The debugger subagent prefers this pattern over
+                     `-ex` chains for any non-trivial probe.
 """
 
 TOOLS_REV = _TOOLS_BASE + """\
@@ -1522,6 +1579,63 @@ _token_state: dict[str, dict[str, int]] = {}
 _token_seen_ids: dict[str, set[str]] = {}
 _token_turns: dict[str, int] = {}
 
+# Per-job compaction-warning state. Tracks whether we've already
+# emitted the SOFT context-compaction warning to main this run, so
+# the same advisory doesn't fire on every heartbeat once threshold
+# is crossed.
+_compaction_warned: dict[str, bool] = {}
+
+
+# Context-compaction thresholds (env-tunable).
+# Heuristic: pre-OOM jobs accumulated cache_read 3.6M (011a) → 13.5M
+# (7c4a). The first ones hit OOM at 8 GiB; 7c4a hit 12 GiB. A SOFT
+# warn at 8M leaves the agent ~3 turns to draft/save artifacts before
+# the HARD ceiling at 14M (where the heartbeat sets compaction_pending
+# and run_main_agent_session ejects the session for a fork-based
+# retry). Set CONTEXT_COMPACTION_THRESHOLD=0 to disable both.
+def _compaction_thresholds() -> tuple[int, int]:
+    try:
+        soft = int(os.environ.get("CONTEXT_COMPACTION_THRESHOLD", "8000000"))
+    except ValueError:
+        soft = 8_000_000
+    try:
+        hard = int(os.environ.get("CONTEXT_COMPACTION_HARD_CEILING", "14000000"))
+    except ValueError:
+        hard = 14_000_000
+    if soft <= 0:
+        return 0, 0
+    if hard < soft:
+        hard = int(soft * 1.75)
+    return soft, hard
+
+
+# Heuristic message the orchestrator can inject as a user-turn when
+# the soft threshold is crossed. Kept out of the heartbeat fn so the
+# main-session loop can include it in its own client.query() call
+# without coupling to the heartbeat's throttle.
+COMPACTION_USER_TURN = """\
+🧠 CONTEXT COMPACTION WARNING — accumulated cache_read tokens crossed
+the soft threshold. The SDK process inside the worker container is
+nearing its memory cap; spawning a subagent (debugger, recon) RIGHT
+NOW is the documented trigger that has OOM-killed every recent heap
+chal (jobs 011a6d486d53, 7c4a6a4c7581). What to do — in order:
+
+  1. STOP investigating. Do NOT delegate to debugger or recon.
+  2. If `./exploit.py` exists, verify the JUDGE GATE was run on its
+     CURRENT state and update `./report.md` with the failure
+     hypothesis from your most recent run.
+  3. If `./exploit.py` is incomplete, finalize it from your best
+     hypothesis right now — even a one-shot attempt is more useful
+     than a debugger spawn that OOM's the run before it finishes.
+  4. End your turn cleanly. The orchestrator's auto-retry loop will
+     pick up the postjudge feedback and the next attempt starts
+     with a fresh, smaller context.
+
+If you ignore this and spawn a subagent anyway, the next AGENT_ERROR
+in run.log will reference this very warning. Drafting > debugging
+when context is full.
+"""
+
 
 _TOKEN_KEYS = (
     "input_tokens",
@@ -1598,6 +1712,25 @@ def agent_heartbeat(job_id: str, msg) -> None:
         if isinstance(model_usage, dict):
             updates["model_usage"] = model_usage
 
+    # Compaction threshold check. Reads CACHE_READ accumulation and
+    # mirrors a `compaction_state` field into meta.json so:
+    #   "ok"       — under SOFT, nothing to do
+    #   "warn"     — between SOFT and HARD; main session should
+    #                soft-eject (drafted by run_main_agent_session).
+    #   "ceiling"  — at/above HARD; main session must terminate
+    #                cleanly so the retry loop can fork a fresh
+    #                session with a smaller starting context.
+    soft, hard = _compaction_thresholds()
+    state = "ok"
+    if soft > 0:
+        cr = int((tokens or {}).get("cache_read_input_tokens") or 0)
+        if cr >= hard:
+            state = "ceiling"
+        elif cr >= soft:
+            state = "warn"
+    if state != "ok":
+        updates["compaction_state"] = state
+
     now = _time.monotonic()
     last = _heartbeat_state.get(job_id, 0.0)
     throttled = (not is_result) and (now - last < _HEARTBEAT_MIN_INTERVAL_S)
@@ -1613,6 +1746,35 @@ def agent_heartbeat(job_id: str, msg) -> None:
         agent_turns=turns or None,
         **updates,
     )
+
+
+def get_compaction_state(job_id: str) -> str:
+    """Returns 'ok'|'warn'|'ceiling' based on accumulated cache_read.
+    Used by run_main_agent_session to decide soft-eject vs. hard-abort.
+    Reads the same in-memory accumulator agent_heartbeat updates, so
+    callers don't need to round-trip through meta.json.
+    """
+    soft, hard = _compaction_thresholds()
+    if soft <= 0:
+        return "ok"
+    tok = _token_state.get(job_id) or {}
+    cr = int(tok.get("cache_read_input_tokens") or 0)
+    if cr >= hard:
+        return "ceiling"
+    if cr >= soft:
+        return "warn"
+    return "ok"
+
+
+def mark_compaction_warned(job_id: str) -> bool:
+    """First call returns True (caller should fire the warning); later
+    calls return False (warning already fired this job). One-shot guard
+    so we don't re-warn every turn after the threshold is crossed.
+    """
+    if _compaction_warned.get(job_id):
+        return False
+    _compaction_warned[job_id] = True
+    return True
 
 
 # Per-job map { tool_use_id: subagent_type } — populated when the main
@@ -2376,6 +2538,13 @@ async def run_main_agent_session(
             f"hypothesis and refine after."
         )
 
+    # State for the compaction guard. The SOFT warning is injected
+    # as a user-turn AT MOST ONCE per session. The HARD ceiling
+    # triggers a clean abort + retry-loop fork so the next attempt
+    # starts with a small context.
+    compaction_warn_pending = {"value": False}
+    compaction_ceiling_hit = {"value": False}
+
     async with ClaudeSDKClient(options=options) as client:
         await client.query(initial_prompt)
 
@@ -2394,6 +2563,36 @@ async def run_main_agent_session(
                     elif isinstance(msg, UserMessage):
                         log_user_blocks(job_id, msg)
                     _maybe_soft_eject(summary.get("tool_calls", 0))
+                    # Compaction state check — must come BEFORE
+                    # budget_exceeded so an OOM-imminent run can fork
+                    # rather than abort with "no artifact".
+                    cstate = get_compaction_state(job_id)
+                    if cstate == "ceiling" and not compaction_ceiling_hit["value"]:
+                        compaction_ceiling_hit["value"] = True
+                        cr = int((_token_state.get(job_id) or {}).get(
+                            "cache_read_input_tokens") or 0)
+                        log_fn(
+                            f"COMPACTION_CEILING: cache_read={cr:,} crossed "
+                            f"hard ceiling. Ending main session so the "
+                            f"retry loop can fork a fresh session before "
+                            f"OOM kills the SDK."
+                        )
+                        summary["agent_error"] = (
+                            f"context compaction ceiling reached "
+                            f"(cache_read={cr})"
+                        )
+                        summary["agent_error_kind"] = "compaction_ceiling"
+                        _snapshot_cost(summary, "COMPACTION_CEILING")
+                        return last_sandbox
+                    elif cstate == "warn" and mark_compaction_warned(job_id):
+                        compaction_warn_pending["value"] = True
+                        cr = int((_token_state.get(job_id) or {}).get(
+                            "cache_read_input_tokens") or 0)
+                        log_fn(
+                            f"COMPACTION_WARN: cache_read={cr:,} crossed "
+                            f"soft threshold. Will inject finalize-now "
+                            f"user-turn after main's current turn ends."
+                        )
                     if budget_exceeded(
                         summary.get("tool_calls", 0),
                         work_dir, artifact_names,
@@ -2430,6 +2629,20 @@ async def run_main_agent_session(
                 log_fn(f"AGENT_ERROR ({summary['agent_error_kind']}): {msg_text[:400]}")
                 _snapshot_cost(summary, "AGENT_ERROR")
                 return last_sandbox
+
+            # ---- Compaction soft warning injection ----
+            # If we crossed the SOFT threshold inside the just-ended
+            # turn, inject the COMPACTION_USER_TURN now and let main
+            # respond (finalize the artifact, no subagent spawns). The
+            # ceiling case was already handled inline above (clean abort).
+            if compaction_warn_pending["value"]:
+                compaction_warn_pending["value"] = False
+                log_fn("[orchestrator] injecting compaction warning user-turn")
+                await client.query(COMPACTION_USER_TURN)
+                # Loop again — main's response to the warning is treated
+                # as a regular turn; the sandbox dispatch happens AFTER
+                # that turn ends.
+                continue
 
             # ---- Decide whether to feed postjudge back to main ----
             if not auto_run or sandbox_runner is None:

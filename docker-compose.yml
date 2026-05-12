@@ -91,6 +91,16 @@ services:
       #     soft/hard timeout
       # Default: -1 (unlimited). Override via .env if you want a cap.
       AUTO_RETRY_MAX: ${AUTO_RETRY_MAX:--1}
+      # Context-compaction guard. When the accumulated
+      # `cache_read_input_tokens` for the main session crosses
+      # CONTEXT_COMPACTION_THRESHOLD (SOFT), the orchestrator injects a
+      # "finalize now, no subagent spawns" user-turn. When it crosses
+      # CONTEXT_COMPACTION_HARD_CEILING, the main session is aborted
+      # cleanly so the auto-retry loop forks a fresh session before the
+      # SDK CLI gets OOM-killed (the documented failure mode of jobs
+      # 011a6d486d53 / 7c4a6a4c7581). Set SOFT=0 to disable both.
+      CONTEXT_COMPACTION_THRESHOLD: ${CONTEXT_COMPACTION_THRESHOLD:-8000000}
+      CONTEXT_COMPACTION_HARD_CEILING: ${CONTEXT_COMPACTION_HARD_CEILING:-14000000}
     volumes:
       - ./data:/data
       - ./modules:/app/modules:ro
