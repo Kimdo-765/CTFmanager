@@ -1761,6 +1761,37 @@ why you skipped them. This nudge fires once per job.
 """
 
 
+SUBAGENT_CAP_USER_TURN = """\
+🛑 SUBAGENT SPAWN CAP REACHED — you've already spawned the maximum
+number of subagents for this run. DO NOT call the `Agent` tool again
+this session. Each Agent(subagent_type=...) call forks a fresh
+`claude` CLI subprocess inside the worker container. With your
+accumulated cache_read context, a third concurrent CLI is the
+documented cause of the OOM that killed jobs 011a6d486d53 /
+7c4a6a4c7581 / ff8240803dc2 / 5c5334381583 — even when the token
+count looked safe (3.1 M cache_read in 5c5334).
+
+What to do INSTEAD:
+
+1. Any debugger work you'd have delegated → run inline with
+   `bash -lc 'gdb -batch -nx -x /tmp/probe.gdb ./prob'`. The
+   `chal-libc-fix` patchelf has already aligned the binary to the
+   chal's libc, so an inline gdb session is functionally identical
+   to a debugger subagent — minus the second SDK process.
+
+2. Any recon question → grep / Read on the existing decomp/*.c
+   files directly. The decompiler already ran during autoboot and
+   the recon results from your earlier spawns are still in scope.
+
+3. Finalize ./exploit.py + ./report.md NOW from your best hypothesis.
+   The fallback safety net is still active — but landing a real
+   exploit before any further analysis is the cheaper path.
+
+This warning fires ONCE per job. Ignoring it raises the OOM risk
+back to its pre-cap level.
+"""
+
+
 _TOKEN_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -2247,6 +2278,16 @@ def log_assistant_blocks(job_id: str, msg, summary: dict) -> None:
             summary["tool_calls"] = summary.get("tool_calls", 0) + 1
             name = getattr(block, "name", "?")
             inp = getattr(block, "input", None) or {}
+            # Tally subagent spawns so the orchestrator's spawn-cap
+            # guard can fire a "no more Agent calls" user-turn before
+            # the next concurrent SDK CLI fork triggers an OOM.
+            # Only main's Agent calls count (subagents shouldn't be
+            # spawning their own Agents anyway, but the is_main gate
+            # makes that intent explicit).
+            if is_main and name == "Agent":
+                summary["subagent_spawns"] = (
+                    int(summary.get("subagent_spawns", 0)) + 1
+                )
             if is_main:
                 try:
                     pretty = json.dumps(inp, indent=2, ensure_ascii=False)
@@ -2951,6 +2992,37 @@ async def run_main_agent_session(
             f"user-turn after current turn ends."
         )
 
+    # Subagent-spawn hard cap. Each Agent(subagent_type=...) call
+    # forks a fresh `claude` CLI subprocess. Two concurrent SDK CLIs
+    # routinely peak past the worker cgroup limit at fork time, even
+    # when each one's cache_read is below the compaction thresholds
+    # (job 5c5334381583: 3.1 M tokens, OOMed at debugger spawn). We
+    # tally completed Agent calls and, once we've reached the cap,
+    # inject SUBAGENT_CAP_USER_TURN as the next user turn — main is
+    # told to do remaining analysis inline.
+    subagent_cap_fired = {"value": False}
+    subagent_cap_pending = {"value": False}
+
+    def _maybe_subagent_cap() -> None:
+        if subagent_cap_fired["value"]:
+            return
+        try:
+            cap = int(os.environ.get("SUBAGENT_SPAWN_CAP", "2"))
+        except ValueError:
+            cap = 2
+        if cap <= 0:
+            return
+        count = int(summary.get("subagent_spawns", 0))
+        if count < cap:
+            return
+        subagent_cap_fired["value"] = True
+        subagent_cap_pending["value"] = True
+        log_fn(
+            f"SUBAGENT_CAP_REACHED: {count}/{cap} Agent spawns. "
+            f"Will inject 'no more spawns' user-turn after current "
+            f"turn ends."
+        )
+
     # State for the compaction guard. The SOFT warning is injected
     # as a user-turn AT MOST ONCE per session. The HARD ceiling
     # triggers a clean abort + retry-loop fork so the next attempt
@@ -2985,6 +3057,7 @@ async def run_main_agent_session(
                         log_user_blocks(job_id, msg)
                     _maybe_soft_eject(summary.get("tool_calls", 0))
                     _maybe_scaffold_nudge(summary.get("tool_calls", 0))
+                    _maybe_subagent_cap()
                     # Compaction state check — must come BEFORE
                     # budget_exceeded so an OOM-imminent run can fork
                     # rather than abort with "no artifact".
@@ -3024,6 +3097,7 @@ async def run_main_agent_session(
                         compaction_warn_pending["value"] = False
                         soft_eject_pending["value"] = False
                         scaffold_nudge_pending["value"] = False
+                        subagent_cap_pending["value"] = False
                         # Break so sandbox + postjudge still runs with
                         # the fallback artifact; the job ends as
                         # no_flag/partial instead of failed.
@@ -3159,6 +3233,7 @@ async def run_main_agent_session(
                     compaction_warn_pending["value"] = False
                     soft_eject_pending["value"] = False
                     scaffold_nudge_pending["value"] = False
+                    subagent_cap_pending["value"] = False
                 else:
                     return last_sandbox
 
@@ -3170,6 +3245,18 @@ async def run_main_agent_session(
                 final_draft_pending["value"] = False
                 log_fn("[orchestrator] injecting FINAL_DRAFT last-chance user-turn")
                 await client.query(FINAL_DRAFT_USER_TURN)
+                continue
+
+            # ---- Subagent-spawn cap injection ----
+            # Fires when summary["subagent_spawns"] crosses
+            # SUBAGENT_SPAWN_CAP. Higher priority than the other
+            # injections because the next concurrent SDK CLI fork is
+            # the documented OOM trigger (5c5334381583: 3.1M cache_read
+            # + 3rd Agent spawn → SIGKILL).
+            if subagent_cap_pending["value"]:
+                subagent_cap_pending["value"] = False
+                log_fn("[orchestrator] injecting subagent-cap user-turn")
+                await client.query(SUBAGENT_CAP_USER_TURN)
                 continue
 
             # ---- Compaction soft warning injection ----

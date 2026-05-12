@@ -56,8 +56,18 @@ services:
     # a fresh SDK child process. Two SDK instances + main brute-force
     # output context squeezed past 8g cap right at the debugger spawn.
     # 12g gives ~50% headroom while still containing pathological loops.
-    mem_limit: ${WORKER_MEM_LIMIT:-12g}
-    memswap_limit: ${WORKER_MEM_LIMIT:-12g}
+    #
+    # Raised again 12g → 14g after job 5c5334381583: OOM at debugger
+    # spawn with main holding only 3.1M cache_read tokens — well below
+    # any compaction threshold. The token-based guards can't see the
+    # transient process-fork RAM spike (parent CLI + child CLI both
+    # resident for a few seconds). 14g RAM + 16g memswap (= 2g of
+    # swap usage allowed) absorbs the fork moment without invoking
+    # the host kernel OOM-killer. Host has 15Gi total + 4Gi swap, so
+    # this keeps ~1Gi RAM + 2Gi swap free for API/Redis/system. If
+    # your host has less, drop these in .env.
+    mem_limit: ${WORKER_MEM_LIMIT:-14g}
+    memswap_limit: ${WORKER_MEMSWAP_LIMIT:-16g}
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
