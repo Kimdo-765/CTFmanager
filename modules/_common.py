@@ -2996,16 +2996,29 @@ async def run_main_agent_session(
     # forks a fresh `claude` CLI subprocess. Two concurrent SDK CLIs
     # routinely peak past the worker cgroup limit at fork time, even
     # when each one's cache_read is below the compaction thresholds
-    # (job 5c5334381583: 3.1 M tokens, OOMed at debugger spawn). We
-    # tally completed Agent calls and, once we've reached the cap,
-    # inject SUBAGENT_CAP_USER_TURN as the next user turn — main is
-    # told to do remaining analysis inline.
+    # (job 5c5334381583: 3.1 M tokens, OOMed at debugger spawn).
+    #
+    # Two-stage enforcement:
+    #
+    #  (a) WARN at cap — fires when summary["subagent_spawns"] == cap.
+    #      Sets `subagent_cap_pending` for post-turn injection of
+    #      SUBAGENT_CAP_USER_TURN. Works only if main yields its
+    #      turn before the next spawn (often it does NOT — see
+    #      job c4f49803edfe: 8 minutes of continuous tool calls
+    #      with no turn boundary).
+    #
+    #  (b) BREAK at cap+1 — when main emits another Agent spawn
+    #      AFTER the cap, we set `subagent_cap_break` and break the
+    #      receive loop on the next yield. Same recovery path as
+    #      compaction_ceiling: idempotent fallback artifact write,
+    #      pending flags cleared, fall through to sandbox dispatch.
+    #      Best-effort against the SDK's fork race; the fallback +
+    #      higher memswap_limit are the layered safety net.
     subagent_cap_fired = {"value": False}
     subagent_cap_pending = {"value": False}
+    subagent_cap_break = {"value": False}
 
     def _maybe_subagent_cap() -> None:
-        if subagent_cap_fired["value"]:
-            return
         try:
             cap = int(os.environ.get("SUBAGENT_SPAWN_CAP", "2"))
         except ValueError:
@@ -3013,15 +3026,21 @@ async def run_main_agent_session(
         if cap <= 0:
             return
         count = int(summary.get("subagent_spawns", 0))
-        if count < cap:
-            return
-        subagent_cap_fired["value"] = True
-        subagent_cap_pending["value"] = True
-        log_fn(
-            f"SUBAGENT_CAP_REACHED: {count}/{cap} Agent spawns. "
-            f"Will inject 'no more spawns' user-turn after current "
-            f"turn ends."
-        )
+        if count >= cap and not subagent_cap_fired["value"]:
+            subagent_cap_fired["value"] = True
+            subagent_cap_pending["value"] = True
+            log_fn(
+                f"SUBAGENT_CAP_REACHED: {count}/{cap} Agent spawns. "
+                f"Will inject 'no more spawns' user-turn after current "
+                f"turn ends."
+            )
+        if count > cap and not subagent_cap_break["value"]:
+            subagent_cap_break["value"] = True
+            log_fn(
+                f"SUBAGENT_CAP_EXCEEDED: {count}/{cap} Agent spawns "
+                f"— breaking receive loop NOW so the in-flight fork "
+                f"is killed before it OOMs the worker."
+            )
 
     # State for the compaction guard. The SOFT warning is injected
     # as a user-turn AT MOST ONCE per session. The HARD ceiling
@@ -3058,6 +3077,36 @@ async def run_main_agent_session(
                     _maybe_soft_eject(summary.get("tool_calls", 0))
                     _maybe_scaffold_nudge(summary.get("tool_calls", 0))
                     _maybe_subagent_cap()
+                    # If main went past the cap (emitted Agent #cap+1
+                    # without yielding its turn), break the receive
+                    # loop NOW so the SDK kills the in-flight fork
+                    # before it OOMs the worker. Treat the same as
+                    # compaction_ceiling: write fallback + clear
+                    # pending flags + fall through to sandbox dispatch.
+                    if subagent_cap_break["value"]:
+                        count = int(summary.get("subagent_spawns", 0))
+                        try:
+                            cap = int(os.environ.get(
+                                "SUBAGENT_SPAWN_CAP", "2"))
+                        except ValueError:
+                            cap = 2
+                        exploit_missing = not (work_dir / "exploit.py").is_file()
+                        report_missing = not (work_dir / "report.md").is_file()
+                        write_fallback_artifacts(work_dir, log_fn)
+                        if exploit_missing or report_missing:
+                            summary["fallback_artifact_used"] = True
+                        summary["agent_error"] = (
+                            f"subagent spawn cap exceeded "
+                            f"({count}/{cap})"
+                        )
+                        summary["agent_error_kind"] = "subagent_cap"
+                        _snapshot_cost(summary, "SUBAGENT_CAP_EXCEEDED")
+                        final_draft_pending["value"] = False
+                        compaction_warn_pending["value"] = False
+                        soft_eject_pending["value"] = False
+                        scaffold_nudge_pending["value"] = False
+                        subagent_cap_pending["value"] = False
+                        break
                     # Compaction state check — must come BEFORE
                     # budget_exceeded so an OOM-imminent run can fork
                     # rather than abort with "no artifact".
@@ -3204,6 +3253,7 @@ async def run_main_agent_session(
                 # gets a companion report drafted.
                 if summary["agent_error_kind"] in (
                     "oom_or_killed", "compaction_ceiling", "timeout",
+                    "subagent_cap",
                 ):
                     exploit_missing = not (work_dir / "exploit.py").is_file()
                     report_missing = not (work_dir / "report.md").is_file()
@@ -3345,6 +3395,7 @@ async def run_main_agent_session(
             # postjudge back into a broken session.
             if summary["agent_error_kind"] in (
                 "oom_or_killed", "compaction_ceiling", "timeout",
+                "subagent_cap",
             ):
                 log_fn(
                     f"[orchestrator] client died this attempt "

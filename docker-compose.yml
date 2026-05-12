@@ -61,13 +61,16 @@ services:
     # spawn with main holding only 3.1M cache_read tokens — well below
     # any compaction threshold. The token-based guards can't see the
     # transient process-fork RAM spike (parent CLI + child CLI both
-    # resident for a few seconds). 14g RAM + 16g memswap (= 2g of
-    # swap usage allowed) absorbs the fork moment without invoking
-    # the host kernel OOM-killer. Host has 15Gi total + 4Gi swap, so
-    # this keeps ~1Gi RAM + 2Gi swap free for API/Redis/system. If
-    # your host has less, drop these in .env.
+    # resident for a few seconds). 14g RAM + 16g memswap absorbed
+    # most spikes but job c4f49803edfe (2026-05-12) still OOMed at
+    # 4.5M cache_read with the same 3rd-Agent-spawn pattern. Bumped
+    # memswap 16g → 18g so the entire host swap (4Gi) is available
+    # to the worker process tree during the fork moment. Host has
+    # 15Gi RAM + 4Gi swap; this caps the worker at 14g RAM + 4g swap
+    # which still leaves ~1Gi RAM free for API/Redis/system (swap is
+    # mostly idle on the host so dedicating it is safe).
     mem_limit: ${WORKER_MEM_LIMIT:-14g}
-    memswap_limit: ${WORKER_MEMSWAP_LIMIT:-16g}
+    memswap_limit: ${WORKER_MEMSWAP_LIMIT:-18g}
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
