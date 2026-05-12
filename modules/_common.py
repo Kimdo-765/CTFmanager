@@ -1877,7 +1877,26 @@ def make_spawn_subagent_mcp(
                                     f"[{tag}] TOOL {nm}: {preview}",
                                 )
                     elif isinstance(msg, UserMessage):
-                        log_user_blocks(job_id, msg)
+                        # CANNOT use log_user_blocks here — it calls
+                        # agent_tag() which looks up parent_tool_use_id
+                        # in the per-job subagent registry. Isolated
+                        # subagents run in a SEPARATE ClaudeSDKClient,
+                        # so their UserMessage (= tool_result) blocks
+                        # don't carry a parent_tool_use_id that maps to
+                        # any registered Agent call in main's session.
+                        # The lookup falls back to "main" and we get
+                        # `[main] TOOL_RESULT: ...` lines attributed to
+                        # the wrong agent. Log directly with our tag.
+                        content = getattr(msg, "content", None)
+                        if isinstance(content, list):
+                            for blk in content:
+                                if type(blk).__name__ != "ToolResultBlock":
+                                    continue
+                                is_err = bool(getattr(blk, "is_error", False))
+                                body_raw = getattr(blk, "content", None)
+                                preview = format_tool_result(body_raw, is_err)
+                                log_line(job_id, f"[{tag}] " + preview)
+                                _check_runaway(job_id, tag, preview)
                     elif isinstance(msg, ResultMessage):
                         # Bill the subagent's cost to the main job.
                         cost = (
