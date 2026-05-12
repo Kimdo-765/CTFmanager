@@ -243,8 +243,13 @@ MISSION (read first, follow strictly)
 1. WRITE: produce {deliverables} in your CURRENT WORKING DIRECTORY
    using RELATIVE paths. The orchestrator collects only files at cwd.
 2. DELEGATE STATIC investigation to the read-only `recon` subagent
-   via the isolated MCP tool (preferred — runs in its own subprocess
-   so its context never accumulates into yours):
+   via the isolated MCP tool. There is exactly ONE delegation tool
+   in this run — `mcp__team__spawn_subagent`. The SDK's built-in
+   `Agent` / `Task` tools are EXPLICITLY DISALLOWED for this session
+   (they dispatch to a built-in "general-purpose" subagent that
+   shares your Node.js process heap — exactly what the MCP tool
+   exists to avoid). If you try to call `Agent(subagent_type=...)`
+   the orchestrator will reject the tool call. Always use:
        mcp__team__spawn_subagent(
          subagent_type="recon",
          prompt="<one specific question with the path(s) to look at>"
@@ -1701,11 +1706,22 @@ def make_main_session_options(
             summary=summary,
         )
         env["USE_ISOLATED_SUBAGENTS"] = "1"
+        # Disallowed-tools list. permission_mode=bypassPermissions
+        # lets the model call ANY built-in tool regardless of
+        # allowed_tools — including the SDK's Task/Agent tool which
+        # dispatches to a built-in "general-purpose" subagent that
+        # runs in main's same Node.js process (= exactly the
+        # cumulative-heap pattern the MCP path exists to escape).
+        # Block both names defensively; main must use our MCP tool.
+        # Verified in job 6ac97fb2fb4e (2026-05-12): main bypassed
+        # allowed_tools and spawned a general-purpose Agent that
+        # accumulated context into main's heap.
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
             model=model,
             cwd=str(work_dir),
             allowed_tools=[*base_tools, spawn_tool],
+            disallowed_tools=["Agent", "Task"],
             permission_mode="bypassPermissions",
             add_dirs=add_dirs or [],
             env=env,
@@ -1715,7 +1731,7 @@ def make_main_session_options(
         )
         log_fn_local(
             "[orchestrator] subagent isolation: ON "
-            f"(tool={spawn_tool})"
+            f"(tool={spawn_tool}; Agent/Task blocked)"
         )
     else:
         env["USE_ISOLATED_SUBAGENTS"] = "0"
