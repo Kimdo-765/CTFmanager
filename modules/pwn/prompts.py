@@ -41,6 +41,49 @@ PWN-SPECIFIC TOOLS (full catalogue is in the BASH CLIs block above):
 
 WORKFLOW
 --------
+0. THREAT MODEL BOOTSTRAP (write this BEFORE any deep analysis — it
+   takes 1 turn and saves 10 by forcing you to declare assumptions
+   instead of carrying them as silent context):
+   Write `./THREAT_MODEL.md` in this exact shape (≤2 KB; pure facts
+   from the chal description + autoboot output, no speculation yet):
+
+       # Threat Model: <chal name from description or filename>
+
+       ## 1. Target
+       - binary: ./prob (patchelf'd against ./.chal-libs/libc.so.6)
+       - libc: glibc <X.YY> (from libc_profile.json; arch x86_64/aarch64)
+       - mitigations: <checksec output line>
+       - service shape: <local | host:port | menu-driven | one-shot>
+
+       ## 2. Attack surface
+       - input vector(s): <stdin | argv | recv() | …>
+       - controllable size: <yes/no, max bytes>
+       - notable strings / menu options visible in `strings | head -200`
+
+       ## 3. What I KNOW (cite source)
+       - <fact> — from <file:line or autoboot/recon output>
+
+       ## 4. What I'm ASSUMING (call out each one)
+       - integer signedness of menu idx: <signed | unsigned | UNKNOWN>
+       - sentinel value for "no operation": <-1 | 0xff…ff | UNKNOWN>
+       - chunk header offset / scale used by indexing math: <UNKNOWN>
+       - whether ./prob spawns same architecture as autoboot detected
+       - whether remote target shares the bundled libc
+
+       ## 5. Open questions (resolved by recon / verify: disasm BEFORE writing exploit)
+       - <question> → plan: <objdump -d / ghiant xrefs / recon delegate>
+
+       ## 6. Candidate primitives (rank by quality tier — see HEAP/FSOP
+       cheat-sheet's QUALITY TIERS section)
+       - <name> [HIGH|MED|LOW]: <one-line reason>
+
+   The THREAT_MODEL.md sections #4 and #5 are the most valuable —
+   every documented failure mode (1d00be30d4e9 signed/unsigned
+   sentinel, a914 vtable order, 9d58 strace flood, 011a debugger
+   spawn fanout) traces back to an unstated assumption. Writing
+   them down makes wrong ones easy to spot. Keep it updated as
+   you learn more; rewrite #4 facts as #3 facts once verified.
+
 1. Triage: `file`, `pwn checksec`, `strings | head -200`. If Go,
    `redress info`/`packages` first.
 2. Small binary? `objdump -d` is faster than ghiant. Read main + obvious
@@ -126,6 +169,48 @@ WORKFLOW
 8. Write `./report.md`: mitigations / vuln (bug class + file:line) /
    strategy (offsets, gadgets) / glibc version used for offsets /
    one-line run command.
+   ALSO write `./findings.json` (strict schema — judge will validate)
+   so downstream tooling (UI, retry reviewer, dashboard) has structured
+   data, not just prose. JSON shape (every field REQUIRED — use null
+   for not-applicable, never omit a key):
+   ```
+   {
+     "schema_version": 1,
+     "chal_name": "<from description or filename>",
+     "glibc_version": "<2.39 | null>",
+     "arch": "x86_64 | aarch64 | arm | i386",
+     "mitigations": {
+       "canary": true|false,
+       "nx": true|false,
+       "pie": true|false,
+       "relro": "full | partial | none | null"
+     },
+     "vulns": [
+       {
+         "id": "V-01",
+         "bug_class": "heap-overflow | uaf | double-free | fmt-string | bof | int-overflow | oob-read | oob-write | logic | …",
+         "file": "<decomp filename or binary symbol>",
+         "line": <int or null>,
+         "trigger": "<one paragraph: how attacker reaches it>",
+         "primitive_class": "AAW | RCE | UAF | AAR | partial-write | info-leak | dos",
+         "primitive_quality": "HIGH | MED | LOW"
+       }
+     ],
+     "chain": {
+       "technique_name": "tcache_poison | house_of_tangerine | house_of_water | ret2libc | rop | fsop_wfile | …",
+       "how2heap_file": "/opt/how2heap/glibc_<VER>/<name>.c | null",
+       "steps": [
+         "<ordered one-line steps — e.g. 'leak libc via unsorted bin'>"
+       ],
+       "one_gadget_offset": "0x… | null",
+       "expected_observable": "<what you expect on stdout if it works — e.g. /bin/sh prompt, cat /flag output>"
+     },
+     "exploit_status": "drafted | tested-failed | tested-partial | flag-captured | aborted",
+     "caveats": ["<remote-untested | aslr-unstable | requires-N-attempts | …>"]
+   }
+   ```
+   If you don't know a field's value yet, write `null` and add it
+   to `caveats`. Never invent a value to make the schema validate.
 9. Pre-finalize: invoke the JUDGE GATE (see mission_block above).
 
 DELEGATE TO DEBUGGER (dynamic facts you cannot derive from disasm)
@@ -203,6 +288,49 @@ The single biggest failure mode on heap & FSOP chals is wasting all
 your turns rediscovering glibc-version-specific facts the rest of
 the world has already documented. Anchor your strategy to the
 glibc version FIRST, then pick a chain that's KNOWN to work on it.
+
+QUALITY TIERS for candidate primitives — same Bayesian filter the
+shellphish vulnerability-detection agent uses, adapted for heap pwn.
+Use these when filling THREAT_MODEL.md section #6 and when judge asks
+"what primitive does this chain produce?" in the report:
+
+HIGH VALUE (commit to these; build the exploit around the strongest one)
+  - Arbitrary Write (AAW) — controllable {target_addr, value}.
+    Examples: tcache poison, __free_hook overwrite (≤2.33),
+    _IO_list_all overwrite for FSOP, house_of_tangerine, large-bin
+    attack with shaped tcache.
+  - Arbitrary Code Execution (RCE) — direct vtable hijack, ROP
+    chain anchored on a leak, FSOP _IO_wfile_jumps with valid
+    one_gadget constraint.
+  - Use-After-Free with size control — re-allocate the freed slot
+    with a controlled chunk; lets you forge ANY object the program
+    will later dereference (function pointers, FILE*, etc.).
+
+MED VALUE (record them as STEPPING-STONES; never the final chain)
+  - Arbitrary Read (AAR) — leak primitive only. Useful to bootstrap
+    libc base, heap base, stack canary, but the report must show
+    how the leak FEEDS a HIGH primitive, otherwise the chain is
+    incomplete.
+  - Constrained partial overwrite — overwrite N bytes at fixed
+    offset. Often enough for ROP-anchor / GOT-overwrite but NOT
+    for poison-style heap primitives.
+  - Off-by-one / null-byte heap consolidation — needs additional
+    primitive to escalate.
+
+LOW VALUE (note but do NOT build the exploit around)
+  - Information disclosure with no controllable target — leaks an
+    address but you can't redirect to it.
+  - Pure DoS (assert, NULL deref, stack exhaustion). Glibc abort
+    isn't memory corruption.
+  - Format-string with `%n` blocked or no `$` indexing — read-only
+    leaks unless you also have a write primitive.
+
+When you pick a chain, the report MUST state {primitive_class:
+"AAW"|"RCE"|"UAF"|"AAR"|"partial-write"|"info-leak"|"dos"} and
+the chain steps must traverse HIGH-tier primitives only — MED-tier
+nodes are allowed as intermediate leaks but every leaf must
+terminate in a HIGH-tier primitive. A chain that's all MED tier
+will be flagged by judge as "incomplete" and won't capture flag.
 
 Tooling that handles the boilerplate (use them — they exist so you
 DON'T re-derive these facts on every chal):

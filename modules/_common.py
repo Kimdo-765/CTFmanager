@@ -1049,6 +1049,23 @@ Antipatterns to flag in scripts (high-signal, encountered most often):
 * `Crypto.Util.number.bytes_to_long` on something that isn't bytes,
   or other type confusion that crashes at first call.
 
+findings.json (NEW — when main writes one, validate it):
+* Required keys missing or extra keys present → MED finding. The
+  schema is documented in pwn/prompts.py step 8. Check the script
+  isn't lying about `glibc_version` (compare against
+  ./.chal-libs/libc_profile.json) or `arch` (compare against
+  `file ./prob`).
+* `chain.technique_name` set but `chain.how2heap_file` is null and
+  the technique IS available in libc_profile.json's
+  how2heap.techniques list → MED severity (agent skipped the
+  canonical PoC source).
+* `vulns[].primitive_quality` all LOW or only MED with no HIGH-tier
+  in any vuln → HIGH severity. A chain made of MED stepping stones
+  alone won't capture flag; flag as "incomplete-chain".
+* `exploit_status: "drafted"` but the script-level review still finds
+  HIGH antipatterns → severity remains high; the agent self-rating
+  doesn't override the static check.
+
 Heap / FSOP class antipatterns (silent crashes the regular checks
 don't catch — flag these aggressively when the script touches
 `_IO_FILE`, tcache, fastbin, unsorted, large bin, vtable):
@@ -2417,12 +2434,17 @@ def _format_postjudge_user_turn(
     max_attempts: int,
     script_filename: str,
     sandbox_result: dict,
+    findings_issues: list[str] | None = None,
 ) -> str:
     """Compose the user-turn body that gets injected back into main's
     SDK session after a failed sandbox run. Tells main what verdict
     came back, gives it the postjudge retry_hint verbatim, and asks
     for a corrected script. Tail of stdout/stderr is included so main
     can cross-check rather than trusting judge's summary blindly.
+    `findings_issues` is the validator output from validate_findings()
+    on the just-finished attempt's findings.json — included verbatim
+    so main fixes schema drift on the retry instead of letting it
+    accumulate.
     """
     judge = (sandbox_result or {}).get("judge") or {}
     verdict = judge.get("verdict") or "unknown"
@@ -2452,6 +2474,13 @@ def _format_postjudge_user_turn(
             f"\n=== prescriptive fix (failure_code={failure_code}) ===\n"
             f"{HEAP_FIX_HINTS[failure_code]}\n"
         )
+    findings_block = ""
+    if findings_issues:
+        findings_block = (
+            "\n=== findings.json schema issues (fix these on this retry) ===\n"
+            + "\n".join(f"  - {x}" for x in findings_issues[:8])
+            + "\n"
+        )
 
     return (
         f"🔁 AUTO-RETRY {attempt_idx}/{cap_str} — postjudge feedback\n"
@@ -2464,6 +2493,7 @@ def _format_postjudge_user_turn(
         + (f"  · failure_code: {failure_code}\n" if failure_code else "")
         + f"{timeout_marker}"
         f"{fix_preamble}"
+        f"{findings_block}"
         f"\n"
         f"=== retry hint (from postjudge — apply this) ===\n"
         f"{retry_hint or '(judge produced no actionable hint; debug from the tails below)'}\n"
@@ -2497,6 +2527,125 @@ def _pick_present_artifact(
         if (work_dir / n).is_file():
             return n
     return None
+
+
+# Schema for findings.json — checked AFTER main writes it; missing/wrong
+# fields produce a "findings.json invalid: ..." warning that gets folded
+# into the next auto-retry user-turn so main fixes it on the retry.
+# Keep tight enough to catch the obvious mistakes (wrong types, missing
+# required keys) without becoming a full JSON-schema implementation —
+# we don't ship a validator dep here.
+_FINDINGS_REQUIRED_TOP_KEYS = {
+    "schema_version", "chal_name", "glibc_version", "arch",
+    "mitigations", "vulns", "chain", "exploit_status", "caveats",
+}
+_FINDINGS_REQUIRED_VULN_KEYS = {
+    "id", "bug_class", "file", "line", "trigger",
+    "primitive_class", "primitive_quality",
+}
+_FINDINGS_REQUIRED_CHAIN_KEYS = {
+    "technique_name", "how2heap_file", "steps",
+    "one_gadget_offset", "expected_observable",
+}
+_FINDINGS_PRIM_QUALITY = {"HIGH", "MED", "LOW"}
+_FINDINGS_PRIM_CLASS = {
+    "AAW", "RCE", "UAF", "AAR",
+    "partial-write", "info-leak", "dos",
+}
+_FINDINGS_EXPLOIT_STATUS = {
+    "drafted", "tested-failed", "tested-partial",
+    "flag-captured", "aborted",
+}
+
+
+def validate_findings(work_dir: Path) -> list[str]:
+    """Return list of human-readable findings.json schema issues.
+    Empty list = either valid OR file missing (callers decide which).
+    Used by the auto-retry loop to surface schema drift back to main
+    on the next turn.
+    """
+    p = work_dir / "findings.json"
+    if not p.is_file():
+        return []
+    issues: list[str] = []
+    try:
+        data = json.loads(p.read_text())
+    except json.JSONDecodeError as e:
+        return [f"findings.json is not valid JSON: {e}"]
+    if not isinstance(data, dict):
+        return ["findings.json top-level is not an object"]
+    missing_top = _FINDINGS_REQUIRED_TOP_KEYS - set(data.keys())
+    if missing_top:
+        issues.append(f"findings.json missing top-level keys: {sorted(missing_top)}")
+    vulns = data.get("vulns")
+    if not isinstance(vulns, list) or not vulns:
+        issues.append("findings.json `vulns` must be a non-empty array")
+    else:
+        any_high = False
+        for i, v in enumerate(vulns):
+            if not isinstance(v, dict):
+                issues.append(f"findings.json vulns[{i}] is not an object")
+                continue
+            m = _FINDINGS_REQUIRED_VULN_KEYS - set(v.keys())
+            if m:
+                issues.append(f"findings.json vulns[{i}] missing keys: {sorted(m)}")
+            pc = v.get("primitive_class")
+            if pc is not None and pc not in _FINDINGS_PRIM_CLASS:
+                issues.append(
+                    f"findings.json vulns[{i}].primitive_class={pc!r} "
+                    f"not in {sorted(_FINDINGS_PRIM_CLASS)}"
+                )
+            pq = v.get("primitive_quality")
+            if pq is not None and pq not in _FINDINGS_PRIM_QUALITY:
+                issues.append(
+                    f"findings.json vulns[{i}].primitive_quality={pq!r} "
+                    f"not in {sorted(_FINDINGS_PRIM_QUALITY)}"
+                )
+            if pq == "HIGH":
+                any_high = True
+        if vulns and not any_high:
+            issues.append(
+                "findings.json has no HIGH-tier primitive — chain made "
+                "of MED/LOW stepping stones alone won't capture a flag. "
+                "See QUALITY TIERS in the heap cheat-sheet."
+            )
+    chain = data.get("chain")
+    if not isinstance(chain, dict):
+        issues.append("findings.json `chain` must be an object")
+    else:
+        m = _FINDINGS_REQUIRED_CHAIN_KEYS - set(chain.keys())
+        if m:
+            issues.append(f"findings.json chain missing keys: {sorted(m)}")
+        if (chain.get("technique_name")
+                and chain.get("how2heap_file") is None):
+            issues.append(
+                f"findings.json chain.technique_name="
+                f"{chain.get('technique_name')!r} set but how2heap_file "
+                "is null — point at /opt/how2heap/glibc_<VER>/<name>.c "
+                "if it exists in the corpus, else explain in caveats."
+            )
+    status = data.get("exploit_status")
+    if status is not None and status not in _FINDINGS_EXPLOIT_STATUS:
+        issues.append(
+            f"findings.json exploit_status={status!r} not in "
+            f"{sorted(_FINDINGS_EXPLOIT_STATUS)}"
+        )
+    glibc_in_profile = None
+    try:
+        profile_path = work_dir / ".chal-libs" / "libc_profile.json"
+        if profile_path.is_file():
+            pdata = json.loads(profile_path.read_text())
+            glibc_in_profile = pdata.get("version")
+    except Exception:
+        pass
+    if (glibc_in_profile and data.get("glibc_version")
+            and data["glibc_version"] != glibc_in_profile):
+        issues.append(
+            f"findings.json glibc_version={data['glibc_version']!r} "
+            f"disagrees with libc_profile.json ({glibc_in_profile!r}). "
+            "Trust the profile — it was extracted from the actual libc."
+        )
+    return issues
 
 
 async def run_main_agent_session(
@@ -2784,7 +2933,7 @@ async def run_main_agent_session(
             # "exploit.py missing, cannot auto-run" on every cycle and the
             # auto-retry loop short-circuits with verdict=None.
             jd = job_dir(job_id)
-            for nm in (picked, "report.md"):
+            for nm in (picked, "report.md", "findings.json", "THREAT_MODEL.md"):
                 src = work_dir / nm
                 if not src.is_file():
                     continue
@@ -2841,11 +2990,18 @@ async def run_main_agent_session(
             # Inject postjudge feedback as next user turn and loop.
             attempt += 1
             write_meta(job_id, stage=f"auto-retry-{attempt}")
+            findings_issues = validate_findings(work_dir)
+            if findings_issues:
+                log_fn(
+                    "[orchestrator] findings.json schema issues: "
+                    f"{len(findings_issues)} — folding into retry feedback"
+                )
             feedback = _format_postjudge_user_turn(
                 attempt_idx=attempt,
                 max_attempts=max_retries,
                 script_filename=picked,
                 sandbox_result=last_sandbox or {},
+                findings_issues=findings_issues,
             )
             log_fn(
                 f"[orchestrator] injecting postjudge feedback as new user "

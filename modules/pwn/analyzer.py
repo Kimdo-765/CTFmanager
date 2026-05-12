@@ -253,13 +253,16 @@ async def _run_agent(
             write_meta(job_id, awaiting_decision=False)
         # Carry artifacts up to the job dir. Runs in `finally` so any
         # abrupt exit (RQ stop / Stop&Resume / SIGTERM-with-grace) still
-        # flushes the agent's exploit.py / report.md into <jobdir>/, where
+        # flushes the agent's exploit.py / report.md / findings.json /
+        # THREAT_MODEL.md into <jobdir>/, where
         # the API's file links look. Wrapped in its own try/except so a
         # copy failure can't mask the real agent error in summary.
         try:
             fallback_dirs = prior_work_dirs(job_id)
             found = collect_outputs(
-                work_dir, ["exploit.py", "report.md"], fallback_dirs=fallback_dirs,
+                work_dir,
+                ["exploit.py", "report.md", "findings.json", "THREAT_MODEL.md"],
+                fallback_dirs=fallback_dirs,
             )
             summary["exploit_present"] = "exploit.py" in found
             summary["report_present"] = "report.md" in found
