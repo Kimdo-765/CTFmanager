@@ -86,13 +86,24 @@ WORKFLOW
 
 1. Triage: `file`, `pwn checksec`, `strings | head -200`. If Go,
    `redress info`/`packages` first.
-2. Small binary? `objdump -d` is faster than ghiant. Read main + obvious
-   helpers directly. (For Go: filter `objdump -d -j .text | grep '<main\\.'`.)
-3. Non-trivial binary (custom VMs, large funcs, heavy crypto)?
-   `ghiant ./bin/<n>` to populate `./decomp/`, then DELEGATE TO RECON
-   for the decomp triage protocol — recon returns the FUNCTIONS
-   inventory + CANDIDATES (HIGH/MED/LOW + bug class + file:line). Read
-   only the .c files recon flags. NEVER walk the whole tree yourself.
+2. ALWAYS DECOMPILE FIRST: `ghiant ./bin/<n>` populates `./decomp/` and
+   the cached Ghidra project; per-function reads run ~5-10s warm.
+   **NEVER `objdump -d ./bin/<n>` without a function filter** — a full
+   `.text` dump on a 10K-function binary blows 100s of KB into your
+   cache_read budget for content recon already has. ACCEPTABLE objdump
+   patterns:
+       objdump -d -j .text ./bin/<n> | sed -n '/<func>:/,/^$/p' | head -80
+       objdump -d -j .text ./bin/<n> | grep '<main\\.'   # Go filter
+   Anything broader → use `ghiant ./decomp/<func>.c` instead.
+3. Non-trivial binary (custom VMs, large funcs, heavy crypto)? After
+   `ghiant`, **DELEGATE TO RECON** before diving in yourself —
+   `mcp__team__spawn_subagent(subagent_type="recon", prompt=…)`. Recon
+   reads decomp in its own isolated context and returns ONE short
+   message (FUNCTIONS inventory + CANDIDATES, HIGH/MED/LOW + bug
+   class + file:line). Read only the .c files recon flags. NEVER walk
+   the whole tree yourself — that fills MAIN's cache_read with bytes
+   that recon can summarize in 2 KB. For heap chals: recon FIRST is
+   not optional — main's cache budget is the dominant cost in the run.
 3.5. PRIMITIVE VALIDATION (MANDATORY for heap chals; recommended for
    any int-overflow / OOB / signedness bug). The decompile tells you
    WHERE to look; assembly tells you WHAT THE CPU ACTUALLY DOES.
@@ -606,6 +617,8 @@ def build_user_prompt(
     target: str | None,
     description: str | None,
     auto_run: bool,
+    *,
+    chal_unpacked: bool = False,
 ) -> str:
     parts: list[str] = []
     base_desc, retry_hint = split_retry_hint(description)
@@ -629,6 +642,16 @@ def build_user_prompt(
             "pwntools `remote()` to fingerprint the protocol, look for "
             "format-string leaks / command-injection / observable behavior, "
             "craft the exploit blindly from response patterns."
+        )
+    if chal_unpacked:
+        parts.append(
+            "Upload bundle has ALREADY been unpacked by the orchestrator:\n"
+            "  - Challenge binaries are flattened into `./bin/` directly\n"
+            "  - Bundled libc / ld-* / lib*.so files are pre-staged into\n"
+            "    `./.chal-libs/` (chal-libc-fix already ran against them)\n"
+            "  - Raw bundle tree is at `./chal/` (read-only; helpful for\n"
+            "    reading Dockerfile / pwn.xinetd / etc. for deploy context)\n"
+            "DO NOT re-unzip into `./bin/extracted/` — the work is done."
         )
     if target:
         parts.append(f"Remote target: {target}")
@@ -701,10 +724,28 @@ def build_user_prompt(
         )
     if not retry_hint:
         if binary_name:
-            parts.append(
-                "Begin with file/checksec/strings on the binary. Decompile with "
-                f"`ghiant ./bin/{binary_name}` ONLY if disasm is too dense."
-            )
+            if heap_advanced:
+                parts.append(
+                    f"START: `file ./bin/{binary_name}` + `pwn checksec` "
+                    f"+ `strings | head -50` for the 30-sec triage. THEN\n"
+                    f"  1. `ghiant ./bin/{binary_name}`  (populates ./decomp/)\n"
+                    f"  2. `mcp__team__spawn_subagent(subagent_type=\"recon\","
+                    f" prompt=\"Heap chal — triage ./decomp/. Return "
+                    f"CANDIDATES (HIGH/MED/LOW + bug class + file:line) "
+                    f"and the alloc/free signature.\")`\n"
+                    "Heap chals are recon-first per WORKFLOW step 3 — main's "
+                    "cache budget is the run's dominant cost; do not walk "
+                    "./decomp/ in this context. Wait for recon's reply, then "
+                    "open ONLY the .c files it flags."
+                )
+            else:
+                parts.append(
+                    f"Begin with `file`/`pwn checksec`/`strings | head -50` "
+                    f"then `ghiant ./bin/{binary_name}`. For non-trivial "
+                    f"binaries (custom VM, many funcs) delegate the decomp "
+                    f"triage to recon (WORKFLOW step 3). For small / linear "
+                    f"binaries you can read ./decomp/main.c yourself."
+                )
         else:
             parts.append(
                 "Begin by connecting to the target; probe with long strings, "

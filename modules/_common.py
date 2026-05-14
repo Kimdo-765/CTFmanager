@@ -1756,6 +1756,21 @@ def make_standalone_options(
         else (model or LATEST_JUDGE_MODEL)
     )
     env = {"JOB_ID": job_id, "AGENT_ROLE": agent_type}
+    # Same per-job TMPDIR + terminfo silencing as main session — keeps
+    # subagent Bash output clean and prevents /tmp collision when
+    # concurrent jobs spawn subagents in the same container.
+    sub_tmp = Path(work_dir) / "tmp"
+    try:
+        sub_tmp.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    _sub_tmp_str = str(sub_tmp)
+    env["TMPDIR"] = _sub_tmp_str
+    env["TMP"]    = _sub_tmp_str
+    env["TEMP"]   = _sub_tmp_str
+    env.setdefault("TERM", "xterm")
+    env.setdefault("PWNLIB_NOTERM", "1")
+    env.setdefault("PWNLIB_SILENT", "1")
     if extra_env:
         env.update({k: str(v) for k, v in extra_env.items()})
     return ClaudeAgentOptions(
@@ -1815,6 +1830,21 @@ def make_main_session_options(
     env["TMPDIR"] = _tmp_str
     env["TMP"]    = _tmp_str
     env["TEMP"]   = _tmp_str
+
+    # Terminal-mode quietness:
+    #   TERM=xterm — silences `_curses.error: setupterm: could not find
+    #     terminfo database` that pwntools / pwn checksec prints on every
+    #     invocation inside the worker container (no /etc/terminfo). ~3
+    #     lines of pure noise per checksec call.
+    #   PWNLIB_NOTERM=1 — disables pwntools' terminal-mode rewrites
+    #     (cursor positioning, color escapes, progress bars) so Bash
+    #     tool_result captures stay clean. The agent doesn't see ANSI
+    #     anyway; this just drops the carriage-return chatter.
+    #   PWNLIB_SILENT=1 — suppresses pwntools' "[*] '...'" / "[!] ..."
+    #     status lines so checksec output is just the structured table.
+    env.setdefault("TERM", "xterm")
+    env.setdefault("PWNLIB_NOTERM", "1")
+    env.setdefault("PWNLIB_SILENT", "1")
 
     if use_isolated:
         mcp_server, spawn_tool = make_spawn_subagent_mcp(

@@ -27,15 +27,34 @@ from modules.pwn.prompts import SYSTEM_PROMPT, build_user_prompt, looks_heap_adv
 from modules.settings_io import apply_to_env, get_setting
 
 
+def _is_shared_lib(p: Path) -> bool:
+    n = p.name.lower()
+    return (
+        n.startswith("libc")
+        or n.startswith("ld-")
+        or n.startswith("ld.")
+        or ".so" in n
+    )
+
+
 def _find_elf_or_unzip(staged_bin: Path, work_dir: Path, log_fn) -> list[Path]:
     """Find ELF binaries in `staged_bin`. If only zip/tar bundles are
     present (the standard Dreamhack / HackTheBox shape), unzip the first
-    bundle into <work_dir>/chal/ and rescan there. Returns whatever ELFs
-    were found across both passes.
+    bundle into <work_dir>/chal/ and rescan there. After a successful
+    unpack the originating bundle is removed from ``staged_bin`` and the
+    discovered ELFs are flattened into ``staged_bin`` (so the agent's
+    ``./bin/<name>`` references resolve directly) and any glibc / ld /
+    chal-supplied ``lib*.so*`` files are pre-staged into
+    ``<work_dir>/.chal-libs/`` so the subsequent ``chal-libc-fix`` takes
+    the "physical libs bundled" fast path instead of falling back to
+    a docker-pull base image fetch.
+
+    Returns the list of ELFs found at their final ``staged_bin`` paths.
     """
     elfs: list[Path] = []
 
-    def _scan(d: Path) -> None:
+    def _scan(d: Path) -> list[Path]:
+        out: list[Path] = []
         try:
             for f in d.rglob("*"):
                 if not f.is_file():
@@ -45,12 +64,14 @@ def _find_elf_or_unzip(staged_bin: Path, work_dir: Path, log_fn) -> list[Path]:
                 except Exception:
                     continue
                 if head == b"\x7fELF":
-                    elfs.append(f)
+                    out.append(f)
         except Exception as e:
             log_fn(f"[autoboot] scan {d} failed: {e}")
+        return out
 
-    _scan(staged_bin)
-    if elfs:
+    found = _scan(staged_bin)
+    if found:
+        elfs.extend(found)
         return elfs
 
     # No raw ELF — look for archives and unpack one.
@@ -85,18 +106,88 @@ def _find_elf_or_unzip(staged_bin: Path, work_dir: Path, log_fn) -> list[Path]:
     except Exception as e:
         log_fn(f"[autoboot] bundle unpack failed: {e}")
         return []
-    _scan(out_dir)
-    if not elfs:
+    # Bundle unpacked successfully → drop the archive so ``./bin/`` only
+    # holds binaries the agent should look at. Otherwise the agent sees
+    # the .zip on its first ``ls ./bin/`` and wastes 3-4 turns
+    # re-extracting (observed live on 5963af004fdc).
+    try:
+        bundle.unlink()
+        log_fn(f"[autoboot] removed bundle {bundle.name} from ./bin/")
+    except OSError as e:
+        log_fn(f"[autoboot] could not remove bundle: {e}")
+
+    extracted_elfs = _scan(out_dir)
+    if not extracted_elfs:
         log_fn(f"[autoboot] bundle {bundle.name} contained no ELF")
+        return []
+
+    # Split into challenge binaries (non-.so) and shared libs. Flatten
+    # the binaries into staged_bin so the prompt's ./bin/<name> path
+    # resolves; copy the .so / ld-* libs into .chal-libs so chal-libc-fix
+    # can take the bundled-libs fast path without needing JOB_ID +
+    # HOST_DATA_DIR for a docker-pull fallback.
+    chal_libs_dir = work_dir / ".chal-libs"
+    flattened: list[Path] = []
+    for src in extracted_elfs:
+        try:
+            if _is_shared_lib(src):
+                chal_libs_dir.mkdir(parents=True, exist_ok=True)
+                # libc-2.23.so → keep as libc.so.6 alias the linker expects
+                target_name = src.name
+                if target_name.startswith("libc-") and target_name.endswith(".so"):
+                    alias = chal_libs_dir / "libc.so.6"
+                    if not alias.exists():
+                        shutil.copy2(src, alias)
+                        alias.chmod(0o755)
+                dst = chal_libs_dir / target_name
+                if not dst.exists():
+                    shutil.copy2(src, dst)
+                    dst.chmod(0o755)
+            else:
+                dst = staged_bin / src.name
+                if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+                    shutil.copy2(src, dst)
+                    dst.chmod(0o755)
+                flattened.append(dst)
+        except Exception as e:
+            log_fn(f"[autoboot] flatten {src.name} failed: {e}")
+
+    if flattened:
+        log_fn(
+            f"[autoboot] flattened {len(flattened)} binary/binaries into "
+            f"./bin/: {', '.join(p.name for p in flattened)}"
+        )
+    if chal_libs_dir.is_dir():
+        libs = sorted(p.name for p in chal_libs_dir.iterdir() if p.is_file())
+        if libs:
+            log_fn(
+                f"[autoboot] pre-staged libs into ./.chal-libs/: "
+                f"{', '.join(libs)}"
+            )
+
+    elfs.extend(flattened or extracted_elfs)
     return elfs
 
 
 def _autobootstrap_libc(
-    staged_bin: Path, work_dir: Path, log_fn, *, timeout_s: int = 180,
-) -> Path | None:
+    staged_bin: Path,
+    work_dir: Path,
+    log_fn,
+    *,
+    job_id: str,
+    timeout_s: int = 180,
+) -> tuple[Path | None, str | None]:
     """Run `chal-libc-fix` against the first ELF in <staged_bin> BEFORE the
     agent starts, so ./.chal-libs/libc_profile.json is always on disk when
     the agent enters its first turn.
+
+    Returns ``(profile_path, elf_basename)``:
+      - ``profile_path`` — path to libc_profile.json on success, else None.
+      - ``elf_basename`` — basename of the canonical chal ELF inside
+        ``./bin/`` (e.g. ``chall``) so the caller can use it as
+        ``binary_name`` in the agent prompt. Mismatched / missing means
+        autoboot couldn't pick a canonical binary; caller falls back to
+        the upload filename.
 
     Why: jobs 9d58fe152fba / 011a6d486d53 (and the earlier OOM pair)
     skipped chal-libc-fix entirely because the model dove into decompile
@@ -107,10 +198,9 @@ def _autobootstrap_libc(
     deterministic.
 
     .zip / .tar bundles (Dreamhack standard) are auto-unpacked into
-    <work_dir>/chal/ first; the first ELF found anywhere under there
-    becomes the chal target. Job 011a6d486d53 hit this case (zip in
-    ./bin/) — autoboot stopped at the ELF magic check and main ended
-    up doing the unpack + chal-libc-fix manually 48 s into the run.
+    <work_dir>/chal/ first; the discovered ELFs are flattened into
+    ``./bin/`` and any chal-supplied libc/ld/.so files are pre-staged
+    into ``./.chal-libs/`` (see ``_find_elf_or_unzip``).
 
     Best-effort: any failure is logged and swallowed; the agent can still
     try chal-libc-fix manually from its prompt.
@@ -118,11 +208,19 @@ def _autobootstrap_libc(
     elf_candidates = _find_elf_or_unzip(staged_bin, work_dir, log_fn)
     if not elf_candidates:
         log_fn("[autoboot] no ELF found in ./bin/ — skipping chal-libc-fix")
-        return None
-    # Patch the first ELF as the canonical chal target. The agent can
-    # patch additional ones if needed. We copy it to ./prob first so the
-    # original bin/ remains pristine for fall-back inspection.
-    elf = elf_candidates[0]
+        return (None, None)
+    # Pick the largest ELF inside ./bin/ as the canonical chal — small
+    # auxiliary binaries (helpers, libsalloc-style wrappers) sort below
+    # the real challenge by size.
+    bin_elfs = [
+        e for e in elf_candidates if e.parent.resolve() == staged_bin.resolve()
+    ]
+    if not bin_elfs:
+        bin_elfs = elf_candidates
+    bin_elfs.sort(key=lambda p: p.stat().st_size, reverse=True)
+    elf = bin_elfs[0]
+    elf_basename = elf.name if elf.parent.resolve() == staged_bin.resolve() else None
+
     prob = work_dir / "prob"
     try:
         if not prob.exists() or prob.stat().st_size != elf.stat().st_size:
@@ -130,10 +228,20 @@ def _autobootstrap_libc(
             prob.chmod(0o755)
     except Exception as e:
         log_fn(f"[autoboot] could not stage ./prob: {e}")
-        return None
+        return (None, elf_basename)
     cmd = ["chal-libc-fix", str(prob)]
     log_fn(f"[autoboot] running: {' '.join(cmd)}")
+    # Inherit worker env + force-set JOB_ID / HOST_DATA_DIR. chal-libc-fix
+    # uses these to bind-mount the job dir into a sibling docker for
+    # base-image extraction; without them it aborts before pulling and
+    # the binary runs against the wrong libc. JOB_ID isn't in the worker
+    # env at autoboot time because it's per-job, and HOST_DATA_DIR may
+    # be absent if compose env_file is misconfigured — set both.
     env = os.environ.copy()
+    env["JOB_ID"] = job_id
+    host_data_dir = os.environ.get("HOST_DATA_DIR") or ""
+    if host_data_dir:
+        env["HOST_DATA_DIR"] = host_data_dir
     try:
         res = subprocess.run(
             cmd, cwd=str(work_dir), env=env,
@@ -141,13 +249,13 @@ def _autobootstrap_libc(
         )
     except subprocess.TimeoutExpired:
         log_fn(f"[autoboot] chal-libc-fix timed out after {timeout_s}s")
-        return None
+        return (None, elf_basename)
     except FileNotFoundError:
         log_fn("[autoboot] chal-libc-fix not on PATH (build is older than the patch)")
-        return None
+        return (None, elf_basename)
     except Exception as e:
         log_fn(f"[autoboot] chal-libc-fix spawn failed: {e}")
-        return None
+        return (None, elf_basename)
     for line in (res.stdout or "").splitlines()[-12:]:
         log_fn(f"[autoboot] {line}")
     for line in (res.stderr or "").splitlines()[-6:]:
@@ -155,13 +263,13 @@ def _autobootstrap_libc(
     profile = work_dir / ".chal-libs" / "libc_profile.json"
     if profile.is_file():
         log_fn(f"[autoboot] libc_profile.json ready ({profile.stat().st_size} B)")
-        return profile
+        return (profile, elf_basename)
     log_fn(
         f"[autoboot] chal-libc-fix exited {res.returncode} but no "
         f"libc_profile.json — likely musl/distroless. Agent falls back to "
         f"worker libc."
     )
-    return None
+    return (None, elf_basename)
 
 
 async def _run_agent(
@@ -192,9 +300,18 @@ async def _run_agent(
     # all skipped this step model-side and the rest of the heap pipeline
     # became dead code as a result. Doing it here makes the profile
     # data deterministic; the agent only has to READ it.
-    _autobootstrap_libc(
+    _profile, autoboot_elf_name = _autobootstrap_libc(
         staged_bin, work_dir, lambda s: log_line(job_id, s),
+        job_id=job_id,
     )
+
+    # If autoboot flattened a zip + discovered the real ELF, prefer that
+    # name in the user prompt over the .zip filename the user uploaded.
+    # ``./bin/<binary_name>`` references in the prompt then resolve to
+    # the actual challenge instead of confusing the agent with a zip
+    # path (observed live on 5963af004fdc).
+    effective_binary_name = autoboot_elf_name or binary_name
+    chal_unpacked = (work_dir / "chal").is_dir()
 
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     resume_sid = read_meta(job_id).get("resume_session_id")
@@ -216,7 +333,10 @@ async def _run_agent(
         summary=summary,
         resume_sid=resume_sid,
     )
-    user_prompt = build_user_prompt(binary_name, target, description, auto_run)
+    user_prompt = build_user_prompt(
+        effective_binary_name, target, description, auto_run,
+        chal_unpacked=chal_unpacked,
+    )
 
     log_line(job_id, f"Launching Claude agent (model={model})")
     if resume_sid:
