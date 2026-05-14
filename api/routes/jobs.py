@@ -1,15 +1,37 @@
+import asyncio
 import json
+import os
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from api.queue import get_queue, get_redis
 from api.storage import JOBS_DIR, read_job_meta, write_job_meta
 
+REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
+
 router = APIRouter()
+
+# Job IDs are always 12 hex chars (api.storage.new_job_id =
+# uuid.uuid4().hex[:12]). Anything else — empty string, ".",
+# "..", "%2E", path traversals — must be rejected BEFORE the
+# Path(...).name + JOBS_DIR / safe construction, because
+# Path(".").name returns "" → JOBS_DIR / "" == JOBS_DIR itself,
+# and a subsequent rmtree wipes every job. Verified the hard
+# way during a security audit on 2026-05-14.
+_JOB_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+
+
+def _validate_job_id(job_id: str) -> str:
+    """Reject anything that isn't a canonical 12-hex job id.
+    Returns the validated id unchanged."""
+    if not _JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=400, detail="invalid job id")
+    return job_id
 
 
 def _hard_stop_job(job_id: str) -> dict:
@@ -245,8 +267,18 @@ def bulk_delete_jobs(
 
 @router.delete("/{job_id}")
 def delete_job(job_id: str):
-    safe = Path(job_id).name
+    safe = _validate_job_id(job_id)
     d = JOBS_DIR / safe
+    # Defense in depth: ensure the resolved path is a direct
+    # child of JOBS_DIR. Catches the case where JOBS_DIR is
+    # itself a symlink that resolves outside the expected root.
+    jobs_root = JOBS_DIR.resolve()
+    try:
+        d_resolved = d.resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid job id")
+    if d_resolved.parent != jobs_root:
+        raise HTTPException(status_code=400, detail="invalid job id")
     if not d.exists():
         raise HTTPException(status_code=404, detail="job not found")
     meta = read_job_meta(safe)
@@ -284,6 +316,169 @@ def get_job_log(job_id: str, tail: int | None = None):
             )
             return PlainTextResponse(header + text)
     return PlainTextResponse(log.read_text(errors="replace"))
+
+
+_TERMINAL_META_STATUSES = {"finished", "failed", "no_flag", "stopped"}
+
+
+@router.get("/{job_id}/stream")
+async def stream_job(job_id: str, request: Request):
+    """Server-Sent Events live feed of a job's run.log + meta updates.
+
+    Multiplexes three Redis pubsub channels into one HTTP stream:
+      - `job:<id>:log`  → SSE event `log`   {ts, line}
+      - `job:<id>:meta` → SSE event `meta`  {...}
+      - `job:<id>:sdk`  → SSE event `sdk`   {...}  (Phase 4)
+
+    On connect we replay the current run.log + meta.json so the client
+    can render the full state without a separate fetch. After backfill,
+    it streams new events as they're published. The connection holds
+    open until the client disconnects OR the job reaches a terminal
+    status (then we emit one final `done` event and close).
+
+    Heartbeat: a comment line (`: ping`) every 15s keeps any proxy
+    between client and api from culling the long-lived connection.
+    """
+    safe = _validate_job_id(job_id)
+    jd = JOBS_DIR / safe
+    if not jd.exists():
+        raise HTTPException(status_code=404, detail="job not found")
+
+    log_path = jd / "run.log"
+    meta_path = jd / "meta.json"
+
+    def sse(name: str, data) -> bytes:
+        return f"event: {name}\ndata: {json.dumps(data)}\n\n".encode()
+
+    async def event_gen():
+        from redis import asyncio as aioredis
+        r = aioredis.from_url(REDIS_URL)
+        pubsub = r.pubsub()
+        try:
+            # Subscribe BEFORE backfill so any event published between
+            # backfill-read and subscribe is buffered (Redis pubsub is
+            # ephemeral but the gap here is microseconds).
+            await pubsub.subscribe(
+                f"job:{safe}:log",
+                f"job:{safe}:meta",
+                f"job:{safe}:sdk",
+            )
+
+            # --- Backfill --------------------------------------------
+            # Send current meta.json so the UI has tokens/status from
+            # the moment of connect.
+            try:
+                if meta_path.exists():
+                    meta = json.loads(meta_path.read_text())
+                    yield sse("meta", {"backfill": True, "meta": meta})
+            except Exception:
+                pass
+
+            # Send the existing run.log line-by-line. Each line keeps
+            # its on-disk timestamp prefix so the frontend can parse
+            # it the same way it parses live events.
+            try:
+                if log_path.exists():
+                    # Cap backfill at last 256 KB so a 100MB log doesn't
+                    # block the stream open.
+                    size = log_path.stat().st_size
+                    cap = 256 * 1024
+                    with log_path.open("rb") as fp:
+                        if size > cap:
+                            fp.seek(size - cap)
+                            fp.readline()  # skip partial
+                        data = fp.read().decode("utf-8", errors="replace")
+                    if size > cap:
+                        yield sse("log", {
+                            "backfill": True,
+                            "line": f"…(showing last ~{cap // 1024}KB of {size} bytes — full log via /api/jobs/{safe}/file/run.log)…",
+                            "ts": "",
+                        })
+                    for line in data.splitlines():
+                        # Each on-disk line looks like "[HH:MM:SS] <body>".
+                        m = re.match(r"^\[(\d\d:\d\d:\d\d)\] (.*)$", line)
+                        if m:
+                            ts, body = m.group(1), m.group(2)
+                        else:
+                            ts, body = "", line
+                        yield sse("log", {
+                            "backfill": True,
+                            "ts": ts,
+                            "line": body,
+                        })
+            except Exception:
+                pass
+
+            yield sse("backfill_done", {})
+
+            # If the job is already terminal at backfill time, close
+            # immediately — no live updates will come.
+            try:
+                if meta_path.exists():
+                    status = json.loads(meta_path.read_text()).get("status")
+                    if status in _TERMINAL_META_STATUSES:
+                        yield sse("done", {"status": status})
+                        return
+            except Exception:
+                pass
+
+            # --- Live loop -------------------------------------------
+            last_ping = asyncio.get_event_loop().time()
+            HEARTBEAT_S = 15.0
+            while True:
+                if await request.is_disconnected():
+                    return
+                # Wait up to 5s for the next pubsub message.
+                msg = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=5.0,
+                )
+                now = asyncio.get_event_loop().time()
+                if msg is None:
+                    # Heartbeat to keep proxies/clients from cutting us.
+                    if now - last_ping >= HEARTBEAT_S:
+                        yield b": ping\n\n"
+                        last_ping = now
+                    continue
+
+                channel = msg["channel"].decode("utf-8", "replace")
+                # channel = "job:<id>:<suffix>"
+                suffix = channel.rsplit(":", 1)[-1]
+                try:
+                    payload = json.loads(msg["data"])
+                except Exception:
+                    payload = {"raw": msg["data"].decode("utf-8", "replace")}
+
+                yield sse(suffix, payload)
+                last_ping = now
+
+                # If we just saw a terminal status, close cleanly.
+                if suffix == "meta":
+                    su = payload.get("status_update") or {}
+                    new_status = su.get("status")
+                    if new_status in _TERMINAL_META_STATUSES:
+                        yield sse("done", {"status": new_status})
+                        return
+        finally:
+            try:
+                await pubsub.unsubscribe()
+                await pubsub.close()
+            except Exception:
+                pass
+            try:
+                await r.close()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.get("/{job_id}/file/{name}")

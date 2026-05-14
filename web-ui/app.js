@@ -44,6 +44,228 @@ function fillModelSelects() {
 let selectedJob = null;
 let pollTimer = null;
 
+// Per-job token snapshots used to render Δ in the tokens pill so the
+// run-log footer shows live "↓X k tokens" deltas the way Claude
+// Code's status line does. Keyed by job id; reset whenever the job
+// changes or its turn count regresses (= retry/resume forked it).
+const _prevTokens = {};
+
+// Live SSE stream state. We keep the 2-second poller as a fallback so
+// the panel still works when the server-side stream is unavailable
+// (older worker image, redis hiccup, browser without EventSource).
+// When a live stream connects, the poller's interval is widened so the
+// stream is the primary signal and the poller is only there to refresh
+// derived fields the stream doesn't carry (file links, full result_data).
+let liveStream = null;
+let liveStreamJobId = null;
+let liveStreamConnected = false;
+let _metaRefreshTimer = null;
+
+function _scheduleMetaRefresh(id) {
+  if (_metaRefreshTimer) return;
+  _metaRefreshTimer = setTimeout(() => {
+    _metaRefreshTimer = null;
+    if (selectedJob === id) renderJob(id);
+  }, 350);
+}
+
+// User preference: hide/show the live SDK panel. Persisted so the
+// choice survives page reloads. Defaults to "show".
+let _sdkLiveHidden = (() => {
+  try { return localStorage.getItem("sdk_live_hidden") === "1"; }
+  catch (_) { return false; }
+})();
+
+// Log-tail style live feed: one row per SDK event, single fixed-height
+// pane, no card chrome, no animations. The earlier card-based design
+// caused reflow + typing animation that read as visual chaos.
+const _SDK_MAX_LINES = 60;
+const _SDK_BODY_PREVIEW_CHARS = 240;
+
+function _renderSdkEvent(id, payload) {
+  const panel = document.querySelector(
+    `.sdk-live[data-job-id="${(window.CSS && CSS.escape) ? CSS.escape(id) : id}"]`,
+  );
+  if (!panel) return;
+  panel.hidden = false;
+  if (_sdkLiveHidden) panel.classList.add("collapsed");
+  const feed = panel.querySelector(".sdk-live-feed");
+  if (!feed) return;
+
+  const kind = payload.kind || "";
+  const tag = payload.tag || "main";
+
+  let label, body, kindClass;
+  if (kind === "text") {
+    label = "AGENT"; kindClass = "sdk-text"; body = payload.text || "";
+  } else if (kind === "thinking") {
+    label = "THINK"; kindClass = "sdk-think"; body = payload.thinking || "";
+  } else if (kind === "tool_use") {
+    label = `TOOL ${payload.name || "?"}`;
+    kindClass = "sdk-tool";
+    try {
+      body = typeof payload.input === "string"
+        ? payload.input
+        : JSON.stringify(payload.input);
+    } catch (_) { body = String(payload.input || ""); }
+  } else if (kind === "tool_result") {
+    label = payload.is_error ? "RESULT(err)" : "RESULT";
+    kindClass = payload.is_error ? "sdk-error" : "sdk-result";
+    body = payload.preview || "";
+  } else {
+    label = kind.toUpperCase(); kindClass = "sdk-misc";
+    try { body = JSON.stringify(payload); } catch (_) { body = String(payload); }
+  }
+
+  // Collapse whitespace + truncate so each event is exactly one row.
+  // The full body still lands in the run-log below; this pane is for
+  // an at-a-glance live view, not the full transcript.
+  const preview = (body || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, _SDK_BODY_PREVIEW_CHARS);
+
+  const wasAtBottom =
+    feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 8;
+
+  const line = document.createElement("div");
+  line.className = `sdk-line ${kindClass}`;
+  line.innerHTML =
+    `<span class="sdk-line-tag">[${escapeHtml(tag)}]</span> ` +
+    `<span class="sdk-line-label">${escapeHtml(label)}</span>: ` +
+    `<span class="sdk-line-body">${escapeHtml(preview)}</span>`;
+  feed.appendChild(line);
+
+  while (feed.children.length > _SDK_MAX_LINES) {
+    feed.removeChild(feed.firstChild);
+  }
+  if (wasAtBottom) feed.scrollTop = feed.scrollHeight;
+}
+
+function _appendLiveLogLine(id, payload) {
+  // Backfill events are redundant — renderJob's /log fetch already
+  // populated the pre. Streaming starts strictly after backfill_done.
+  if (payload.backfill) return;
+  const pre = document.querySelector(
+    `pre.run-log[data-job-id="${(window.CSS && CSS.escape) ? CSS.escape(id) : id}"]`,
+  );
+  if (!pre) return;
+  const wasAtBottom =
+    pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 12;
+  const tsPrefix = payload.ts ? `[${payload.ts}] ` : "";
+  const raw = tsPrefix + (payload.line || "") + "\n";
+  // Use colorizeRunLog so the appended line picks up the same styling
+  // as polled renders (agent tags get colored, paths underlined, etc.).
+  let colored = raw;
+  try {
+    colored = colorizeRunLog(raw, null);
+  } catch (_) {
+    colored = escapeHtml(raw);
+  }
+  pre.insertAdjacentHTML("beforeend", colored);
+  // Cap to last ~600KB so an unbounded live tail doesn't slow the DOM.
+  if (pre.textContent.length > 700_000) {
+    // Slice from the textContent baseline, then re-colorize once.
+    const tail = pre.textContent.slice(-500_000);
+    try {
+      pre.innerHTML = colorizeRunLog(tail, null);
+    } catch (_) {
+      pre.textContent = tail;
+    }
+  }
+  if (wasAtBottom) pre.scrollTop = pre.scrollHeight;
+}
+
+function _openLiveStream(id) {
+  _closeLiveStream();
+  if (typeof EventSource === "undefined") return;
+  let es;
+  try {
+    es = new EventSource(`${API}/jobs/${id}/stream`);
+  } catch (_) {
+    return;
+  }
+  liveStream = es;
+  liveStreamJobId = id;
+  liveStreamConnected = false;
+
+  es.addEventListener("log", (e) => {
+    if (liveStreamJobId !== id) return;
+    try {
+      _appendLiveLogLine(id, JSON.parse(e.data));
+    } catch (_) {}
+  });
+  es.addEventListener("meta", (e) => {
+    if (liveStreamJobId !== id) return;
+    // Only structural changes (status / flag / lifecycle) need a full
+    // detail.innerHTML rebuild. Token / turn / compaction deltas would
+    // otherwise re-render every ~350ms during an active agent turn and
+    // visibly drift the user's scroll position. The slow poller still
+    // refreshes the tokens-pill every 8s, which is good enough.
+    try {
+      const payload = JSON.parse(e.data);
+      if (payload && payload.status_update) {
+        _scheduleMetaRefresh(id);
+      }
+    } catch (_) {}
+  });
+  es.addEventListener("sdk", (e) => {
+    if (liveStreamJobId !== id) return;
+    try {
+      _renderSdkEvent(id, JSON.parse(e.data));
+    } catch (_) {}
+  });
+  es.addEventListener("backfill_done", () => {
+    liveStreamConnected = true;
+    // Now that the live stream is providing events, widen the poll
+    // interval so we don't fight the stream with full re-renders.
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = setInterval(async () => {
+        const job = await renderJob(id);
+        if (job && ["finished", "failed", "no_flag"].includes(job.status)) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+          await refreshJobs();
+          await refreshStats();
+        }
+      }, 8000);
+    }
+  });
+  es.addEventListener("done", () => {
+    _closeLiveStream();
+    // Final structural refresh so result-block file links + cost
+    // pill update one last time.
+    renderJob(id, { force: true });
+    refreshJobs();
+    refreshStats();
+  });
+  es.onerror = () => {
+    // EventSource auto-reconnects unless we explicitly close. If the
+    // browser flags the stream as permanently closed, surrender and
+    // let the (still-running) 2s poller carry the panel forward.
+    if (!liveStream) return;
+    if (liveStream.readyState === EventSource.CLOSED) {
+      liveStream = null;
+      liveStreamJobId = null;
+      liveStreamConnected = false;
+    }
+  };
+}
+
+function _closeLiveStream() {
+  if (liveStream) {
+    try { liveStream.close(); } catch (_) {}
+  }
+  liveStream = null;
+  liveStreamJobId = null;
+  liveStreamConnected = false;
+  if (_metaRefreshTimer) {
+    clearTimeout(_metaRefreshTimer);
+    _metaRefreshTimer = null;
+  }
+}
+
 // Run-log timestamp display mode. Logs are written in UTC by the
 // orchestrator (`[HH:MM:SS]`). Default is UTC so behavior is
 // unchanged for users who haven't opted in. The toggle button in
@@ -706,6 +928,9 @@ async function selectJob(id) {
       await refreshStats();
     }
   }, 2000);
+  // Live SSE feed on top of the poller. backfill_done widens the
+  // poller's interval; onerror lets it fall back to fast-polling.
+  _openLiveStream(id);
 }
 
 function _openJobModal(id) {
@@ -723,6 +948,7 @@ function _closeJobModal() {
   if (m) m.hidden = true;
   document.body.classList.remove("modal-open");
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  _closeLiveStream();
   selectedJob = null;
   document.querySelectorAll("#jobs-list li").forEach((li) =>
     li.classList.remove("selected"),
@@ -789,6 +1015,26 @@ async function renderJob(id, opts = {}) {
   // 2-second poll. Capture it now and restore after the replace, but only
   // if we're still on the same job (a fresh job starts at the top).
   const prevModalScrollTop = detail.scrollTop;
+
+  // Preserve the live SDK panel state too. Without this, every poll
+  // re-render rebuilds .sdk-live with its `hidden` attribute set, and
+  // the panel only re-appears on the next SDK event — i.e. it
+  // "flickers in and out" every poll cycle.
+  const prevSdkPanel = detail.querySelector(".sdk-live");
+  const prevSdkFeedHTML = (prevSdkPanel && isSameJob)
+    ? prevSdkPanel.querySelector(".sdk-live-feed")?.innerHTML || null
+    : null;
+  const prevSdkFeedScroll = (prevSdkPanel && isSameJob)
+    ? (prevSdkPanel.querySelector(".sdk-live-feed")?.scrollTop ?? 0)
+    : 0;
+  const prevSdkFeedAtBottom = (() => {
+    if (!prevSdkPanel || !isSameJob) return true;
+    const f = prevSdkPanel.querySelector(".sdk-live-feed");
+    if (!f) return true;
+    return f.scrollTop + f.clientHeight >= f.scrollHeight - 8;
+  })();
+  const prevSdkVisible = !!(prevSdkPanel && isSameJob && !prevSdkPanel.hidden);
+  const prevSdkCollapsed = !!(prevSdkPanel && prevSdkPanel.classList.contains("collapsed"));
 
   // File-link helper. Left-click opens the syntax-highlighting preview
   // modal; middle-click / Ctrl+click / right-click "Open in new tab" still
@@ -930,9 +1176,32 @@ async function renderJob(id, opts = {}) {
       `  cache create:   ${tcc.toLocaleString()}\n` +
       `  cache read:     ${tcr.toLocaleString()}` +
       (typeof job.cost_usd === "number" ? `\n  cost:           $${job.cost_usd.toFixed(6)}` : "");
+    // Δ since previous poll — gives the run-log footer a live
+    // "↓ X tokens" counter like Claude Code's status line. Cache
+    // bumps usually dwarf output (per-turn input is mostly cached
+    // prompt + tool results), so we surface both arrows separately.
+    let deltaTag = "";
+    if (job.status === "running") {
+      const prev = _prevTokens[id];
+      const turnsRegressed = prev && prev.turns != null && turns < prev.turns;
+      if (prev && !turnsRegressed) {
+        const dCache = tcr - (prev.cache_read || 0);
+        const dOut = to - (prev.output || 0);
+        const dIn = ti - (prev.input || 0);
+        const upTotal = dCache + dIn;
+        const parts = [];
+        if (dOut > 0) parts.push(`↓${fmtN(dOut)}`);
+        if (upTotal > 0) parts.push(`↑${fmtN(upTotal)}`);
+        if (parts.length) deltaTag = ` <span class="tokens-delta">(${parts.join(" ")})</span>`;
+        else                 deltaTag = ` <span class="tokens-delta idle">(idle)</span>`;
+      }
+      _prevTokens[id] = { cache_read: tcr, output: to, input: ti, turns };
+    } else {
+      delete _prevTokens[id];
+    }
     // Always show cache_read — for prompt-cache-heavy runs it's
     // where almost all the input lives.
-    tokensPill = `<span class="tokens-pill" title="${escapeHtml(fullTitle)}">📊 in ${fmtN(ti)} · out ${fmtN(to)} · cache ${fmtN(tcr)}${turnTag}${cost}</span>`;
+    tokensPill = `<span class="tokens-pill" title="${escapeHtml(fullTitle)}">📊 in ${fmtN(ti)} · out ${fmtN(to)} · cache ${fmtN(tcr)}${turnTag}${cost}${deltaTag}</span>`;
   }
 
   // Soft-timeout decision banner. Fires when the worker's wall-clock
@@ -1103,6 +1372,14 @@ async function renderJob(id, opts = {}) {
     ${flagBlock}
     ${logFindingsBlock}
     ${resultBlock}
+    <div class="sdk-live" data-job-id="${id}" hidden>
+      <div class="sdk-live-head">
+        <span class="sdk-live-dot"></span>
+        <span class="sdk-live-label">live agent activity</span>
+        <button class="sdk-live-toggle" data-action="toggle-sdk-live">hide</button>
+      </div>
+      <div class="sdk-live-feed"></div>
+    </div>
     <h4>Run log <small style="color:#8b949e;font-weight:normal">(auto-follows when scrolled to bottom)</small></h4>
     <div class="run-log-window">
       <div class="run-log-titlebar">
@@ -1126,6 +1403,30 @@ async function renderJob(id, opts = {}) {
   // Spin up the per-second live timer when a running pill is on screen.
   if (job.status === "running") _ensureLivePillTimer();
 
+  // Restore the live SDK panel FIRST — visibility before scroll. The
+  // rebuilt markup starts with `hidden`, so if we touched scroll while
+  // the panel was hidden the browser would clamp to 0. Same applies to
+  // the outer detail.scrollTop below: hidden panel = shorter document
+  // = clamped scroll. Sequence: feed content → visibility → collapsed
+  // → feed scroll → outer scroll.
+  const newSdkPanel = detail.querySelector(".sdk-live");
+  if (newSdkPanel) {
+    const f = newSdkPanel.querySelector(".sdk-live-feed");
+    if (f && prevSdkFeedHTML !== null) {
+      f.innerHTML = prevSdkFeedHTML;
+    }
+    if (prevSdkVisible) newSdkPanel.hidden = false;
+    if (_sdkLiveHidden || prevSdkCollapsed) {
+      newSdkPanel.classList.add("collapsed");
+      const tBtn = newSdkPanel.querySelector('.sdk-live-toggle');
+      if (tBtn) tBtn.textContent = "show";
+    }
+    if (f && prevSdkFeedHTML !== null) {
+      // Now that the feed is visible + populated, scrollHeight is real.
+      f.scrollTop = prevSdkFeedAtBottom ? f.scrollHeight : prevSdkFeedScroll;
+    }
+  }
+
   const newPre = detail.querySelector("pre.run-log");
   if (newPre) {
     if (!isSameJob || prevAtBottom) {
@@ -1136,7 +1437,8 @@ async function renderJob(id, opts = {}) {
   }
   // Restore the modal-body scroll for same-job re-renders so reading the
   // retry-hint chip / description / result links isn't yanked back to the
-  // top every 2 seconds.
+  // top every 2 seconds. Runs AFTER the SDK panel visibility restore so
+  // the document height matches what it was at capture time.
   if (isSameJob) {
     detail.scrollTop = prevModalScrollTop;
   }
@@ -1285,6 +1587,25 @@ async function renderJob(id, opts = {}) {
     tzBtn.addEventListener("click", () => {
       _setRunlogTz(runlogTz === "utc" ? "local" : "utc");
     });
+  }
+
+  const sdkLiveBtn = detail.querySelector('.sdk-live-toggle[data-action="toggle-sdk-live"]');
+  if (sdkLiveBtn) {
+    sdkLiveBtn.addEventListener("click", () => {
+      _sdkLiveHidden = !_sdkLiveHidden;
+      try { localStorage.setItem("sdk_live_hidden", _sdkLiveHidden ? "1" : "0"); } catch (_) {}
+      const panel = detail.querySelector('.sdk-live');
+      if (panel) {
+        panel.classList.toggle("collapsed", _sdkLiveHidden);
+        sdkLiveBtn.textContent = _sdkLiveHidden ? "show" : "hide";
+      }
+    });
+    // Apply the saved preference on initial render.
+    const panel = detail.querySelector('.sdk-live');
+    if (panel && _sdkLiveHidden) {
+      panel.classList.add("collapsed");
+      sdkLiveBtn.textContent = "show";
+    }
   }
 
   for (const btn of detail.querySelectorAll(".copy-btn")) {

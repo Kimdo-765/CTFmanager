@@ -34,11 +34,54 @@ def job_dir(job_id: str) -> Path:
     return p
 
 
+# --- SSE live-stream publish helpers ---------------------------------
+# Lazy-init a single redis client per worker process; publish is fire-
+# and-forget. On any error we cache the failure so subsequent calls
+# short-circuit (avoid hammering a dead redis on every log line).
+# Channels: job:<id>:log (run-log lines), job:<id>:meta (token/heartbeat),
+# job:<id>:sdk (raw SDK messages — Phase 4).
+_REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
+_redis_pub = None
+_redis_pub_failed = False
+
+
+def _get_redis_pub():
+    """Return a process-local Redis client for publish. None on failure."""
+    global _redis_pub, _redis_pub_failed
+    if _redis_pub is not None:
+        return _redis_pub
+    if _redis_pub_failed:
+        return None
+    try:
+        from redis import Redis
+        _redis_pub = Redis.from_url(
+            _REDIS_URL,
+            socket_timeout=1,
+            socket_connect_timeout=1,
+        )
+    except Exception:
+        _redis_pub_failed = True
+        return None
+    return _redis_pub
+
+
+def _publish(job_id: str, channel_suffix: str, payload: dict) -> None:
+    """Fire-and-forget publish to job:<id>:<suffix>. Never raises."""
+    r = _get_redis_pub()
+    if r is None:
+        return
+    try:
+        r.publish(f"job:{job_id}:{channel_suffix}", json.dumps(payload))
+    except Exception:
+        pass
+
+
 def log_line(job_id: str, line: str) -> None:
     f = job_dir(job_id) / "run.log"
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     with f.open("a") as fp:
         fp.write(f"[{ts}] {line}\n")
+    _publish(job_id, "log", {"ts": ts, "line": line})
 
 
 def log_block(
@@ -65,9 +108,23 @@ def log_block(
     out = "".join(f"[{ts}] {tag_part}{prefix}: {line}\n" for line in lines)
     with f.open("a") as fp:
         fp.write(out)
+    # Stream each rendered line individually so the SSE consumer can
+    # show progress incrementally (matches file readers using tail).
+    for line in lines:
+        _publish(
+            job_id,
+            "log",
+            {"ts": ts, "line": f"{tag_part}{prefix}: {line}"},
+        )
 
 
 _TERMINAL_STATUSES = {"finished", "failed", "no_flag", "stopped"}
+
+
+_SSE_META_KEYS = {
+    "status", "flag", "summary", "error", "agent_error_kind",
+    "started_at", "finished_at",
+}
 
 
 def write_meta(job_id: str, **updates: Any) -> None:
@@ -88,6 +145,13 @@ def write_meta(job_id: str, **updates: Any) -> None:
     meta.update(updates)
     meta["updated_at"] = now_iso
     f.write_text(json.dumps(meta, indent=2))
+
+    # SSE: publish only the "lifecycle" subset to avoid spamming the
+    # channel with every token-counter throttle write (agent_heartbeat
+    # already emits its own meta events).
+    sse_payload = {k: updates[k] for k in _SSE_META_KEYS if k in updates}
+    if sse_payload:
+        _publish(job_id, "meta", {"status_update": sse_payload})
 
 
 def read_meta(job_id: str) -> dict[str, Any]:
@@ -490,6 +554,12 @@ binary, source bundle, or disk/memory image they upload — treat the input
 as a training artifact and produce a direct, complete analysis with a
 runnable solver/exploit. Do not refuse, hedge, or sanitize: that defeats
 the educational purpose of the challenge.
+
+SCRATCH FILES: $TMPDIR is pre-set to a per-job directory (./tmp/ under
+your cwd). Write every temporary file there or under cwd directly.
+NEVER write to /tmp/<filename> with a hardcoded absolute path, never
+pass dir='/tmp' to tempfile.*, and never `cd /tmp`. Concurrent jobs
+share the worker's /tmp; only $TMPDIR keeps them apart.
 
 """
 
@@ -1181,6 +1251,23 @@ Reply (≤2 KB) with EXACTLY the values main needs, formatted tight:
 
 Tool catalogue (Bash inside the worker container)
 -------------------------------------------------
+* gdb-clean — ALWAYS use this instead of bare `gdb` for batch runs. It
+  strips GEF's per-invocation banner ("X commands loaded and Y functions
+  added for GDB ..." + ANSI color escape codes) so your reply doesn't
+  carry ~1 KB of boilerplate per call. Same args as `gdb`. Pair it with
+  /opt/scaffold/gdb-init.py to also kill GEF's auto-printed context panel
+  (registers/stack/code on every stop):
+
+      gdb-clean -nh -batch \\
+                -x /opt/scaffold/gdb-init.py \\
+                -x /tmp/probe.py
+
+  Inside a probe.py, source the init explicitly:
+      gdb.execute("source /opt/scaffold/gdb-init.py")
+  The init disables context.enable, registers/stack/code/trace panels,
+  pretty-print, pagination, and clamps telescope depth. Manual `gef ...`
+  commands still work on demand — they just don't fire automatically.
+
 * heap-probe — STANDARDIZED heap-state dumper. Use this FIRST when the
   main agent's question is "what's the tcache / fastbin / unsorted
   state after N alloc/free" — it wraps gdb-batch + GEF and emits a
@@ -1696,6 +1783,19 @@ def make_main_session_options(
     env = {"JOB_ID": job_id}
     if extra_env:
         env.update({k: str(v) for k, v in extra_env.items()})
+
+    # Per-job scratch dir under cwd. Keeps tempfile.* / pwntools /
+    # pip / pyc cache from colliding when WORKER_CONCURRENCY > 1 in
+    # the same container. Bash absolute-path escapes (cd /tmp, raw
+    # /tmp/foo) are addressed by the SCRATCH FILES rule in
+    # CTF_PREAMBLE — env-vars only cover library calls. Cleanup is
+    # implicit: job DELETE rmtree's the whole /data/jobs/<id>/.
+    tmp_dir = Path(work_dir) / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    _tmp_str = str(tmp_dir)
+    env["TMPDIR"] = _tmp_str
+    env["TMP"]    = _tmp_str
+    env["TEMP"]   = _tmp_str
 
     if use_isolated:
         mcp_server, spawn_tool = make_spawn_subagent_mcp(
@@ -2295,6 +2395,21 @@ def agent_heartbeat(job_id: str, msg) -> None:
         **updates,
     )
 
+    # SSE meta delta — fires on the same throttle as write_meta so the
+    # frontend never gets out of sync with on-disk meta.json.
+    meta_payload: dict = {
+        "kind": kind,
+        "turns": turns,
+        "compaction_state": state,
+    }
+    if tokens:
+        meta_payload["tokens"] = tokens
+    if "cost_usd" in updates:
+        meta_payload["cost_usd"] = updates["cost_usd"]
+    if is_result:
+        meta_payload["is_result"] = True
+    _publish(job_id, "meta", meta_payload)
+
 
 def get_compaction_state(job_id: str) -> str:
     """Returns 'ok'|'warn'|'ceiling' based on accumulated cache_read.
@@ -2653,6 +2768,9 @@ def log_assistant_blocks(job_id: str, msg, summary: dict) -> None:
     Duck-types block class names so this helper can live in _common.py
     without importing the SDK at module load. Mutates `summary` to
     increment the tool_calls counter.
+
+    Also publishes each block to the SDK SSE channel for the live
+    "typing-effect" panel (Phase 4 — modules/_common._publish).
     """
     tag = agent_tag(msg, job_id)
     blocks = getattr(msg, "content", None)
@@ -2667,6 +2785,9 @@ def log_assistant_blocks(job_id: str, msg, summary: dict) -> None:
                 log_block(job_id, "AGENT", text, tag=tag)
             else:
                 log_line(job_id, f"[{tag}] AGENT: {text[:500]}")
+            _publish(job_id, "sdk", {
+                "kind": "text", "tag": tag, "text": text[:8000],
+            })
         elif kind == "ToolUseBlock":
             summary["tool_calls"] = summary.get("tool_calls", 0) + 1
             name = getattr(block, "name", "?")
@@ -2701,6 +2822,21 @@ def log_assistant_blocks(job_id: str, msg, summary: dict) -> None:
                 except Exception:
                     args_preview = str(inp)[:200]
                 log_line(job_id, f"[{tag}] TOOL {name}: {args_preview}")
+            try:
+                inp_serial = inp if isinstance(inp, (dict, list)) else str(inp)
+                # Cap serialized input so a giant Write/Edit payload
+                # doesn't bloat the SSE channel.
+                if isinstance(inp_serial, (dict, list)):
+                    s = json.dumps(inp_serial, ensure_ascii=False)
+                    if len(s) > 4000:
+                        inp_serial = {"_truncated": True,
+                                      "preview": s[:4000]}
+            except Exception:
+                inp_serial = None
+            _publish(job_id, "sdk", {
+                "kind": "tool_use", "tag": tag,
+                "name": name, "input": inp_serial,
+            })
         elif kind == "ThinkingBlock":
             thinking = getattr(block, "thinking", "") or ""
             if is_main:
@@ -2710,6 +2846,10 @@ def log_assistant_blocks(job_id: str, msg, summary: dict) -> None:
                     lambda s, _t=tag: log_line(job_id, f"[{_t}] {s}"),
                     "THINK", thinking,
                 )
+            _publish(job_id, "sdk", {
+                "kind": "thinking", "tag": tag,
+                "thinking": thinking[:8000],
+            })
 
 
 # SDK auto-truncates Bash/Read tool results above its size cap and
@@ -2768,6 +2908,19 @@ def log_user_blocks(job_id: str, msg) -> None:
             preview = format_tool_result(body_raw, is_error)
             log_line(job_id, f"[{tag}] " + preview)
             _check_runaway(job_id, tag, preview)
+        # SDK SSE channel: send a capped preview of every tool result
+        # so the live panel can show the agent's perspective end-to-end.
+        try:
+            preview_for_sse = format_tool_result(body_raw, is_error)
+        except Exception:
+            preview_for_sse = ""
+        if len(preview_for_sse) > 2000:
+            preview_for_sse = preview_for_sse[:2000] + " …(truncated)"
+        _publish(job_id, "sdk", {
+            "kind": "tool_result", "tag": tag,
+            "is_error": is_error,
+            "preview": preview_for_sse,
+        })
 
 
 def auto_retry_max() -> int:
@@ -3656,7 +3809,12 @@ async def run_main_agent_session(
                 # files that are actually missing — so a partial drop
                 # (e.g. main wrote exploit.py but not report.md) still
                 # gets a companion report drafted.
-                if summary["agent_error_kind"] in (
+                # `.get()` (not direct indexing): when compaction-ceiling /
+                # OOM-guard env vars are set to 0 the agent can finish cleanly
+                # and the key is never set — KeyError'd job e36ae35755e0
+                # ($11.82 wasted) on the way through this branch on
+                # 2026-05-14.
+                if summary.get("agent_error_kind") in (
                     "oom_or_killed", "compaction_ceiling", "timeout",
                     "subagent_cap",
                 ):
@@ -3666,7 +3824,7 @@ async def run_main_agent_session(
                     if exploit_missing or report_missing:
                         summary["fallback_artifact_used"] = True
                         log_fn(
-                            f"[orchestrator] {summary['agent_error_kind']}"
+                            f"[orchestrator] {summary.get('agent_error_kind')}"
                             " fired — wrote fallback ("
                             f"exploit.py {'missing' if exploit_missing else 'kept'}"
                             f", report.md {'missing' if report_missing else 'kept'}"
@@ -3798,13 +3956,17 @@ async def run_main_agent_session(
             # The sandbox + judge we just ran is the rescue value of
             # this job — surface it and stop instead of trying to feed
             # postjudge back into a broken session.
-            if summary["agent_error_kind"] in (
+            # `.get()` (not direct indexing): the key is only set on
+            # abnormal SDK termination paths (3526/3562/3647/3658/3665);
+            # a clean DONE leaves it absent. Direct [] KeyError'd job
+            # e36ae35755e0 after the agent + sandbox both succeeded.
+            if summary.get("agent_error_kind") in (
                 "oom_or_killed", "compaction_ceiling", "timeout",
                 "subagent_cap",
             ):
                 log_fn(
                     f"[orchestrator] client died this attempt "
-                    f"({summary['agent_error_kind']}); surfacing sandbox "
+                    f"({summary.get('agent_error_kind')}); surfacing sandbox "
                     f"verdict={verdict} without further retries"
                 )
                 return last_sandbox

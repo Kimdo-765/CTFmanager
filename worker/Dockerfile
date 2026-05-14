@@ -165,6 +165,16 @@ RUN ln -sf /app/worker/chal_libc_fix.py /usr/local/bin/chal-libc-fix \
 RUN ln -sf /app/worker/heap_probe.py /usr/local/bin/heap-probe \
  && chmod +x /app/worker/heap_probe.py
 
+# Expose `gdb-clean` — gdb wrapper that strips GEF's per-invocation
+# banner (~1 KB of "X commands loaded and Y functions added" + ANSI
+# color codes) so the debugger subagent gets clean, terse output.
+# Source `gdb-init.py` first inside a probe to additionally disable
+# GEF's auto-printed context panel on every stop.
+RUN ln -sf /app/worker/gdb_clean.sh /usr/local/bin/gdb-clean \
+ && chmod +x /app/worker/gdb_clean.sh \
+ && mkdir -p /opt/scaffold \
+ && ln -sf /app/worker/gdb_init.py /opt/scaffold/gdb-init.py
+
 # Copy-paste exploit scaffolds for heap-pwn chals. The main agent does
 # `cp /opt/scaffold/heap_menu.py ./exploit.py` and edits the TODOs.
 # Scaffolds load ./.chal-libs/libc_profile.json automatically, so the
