@@ -318,12 +318,38 @@ MISSION (read first, follow strictly)
          subagent_type="recon",
          prompt="<one specific question with the path(s) to look at>"
        )
-   It returns a ≤2 KB summary; your context stays small. Use this
-   for EVERY heavy investigation, not only at the start of the run:
-   any disasm walk, source-tree grep, libc symbol/offset/gadget
-   lookup, decomp summary, rootfs unpack — first instinct should be
-   to delegate. Doing it yourself in Bash is reserved for short
-   verifications (one-line file Read, single curl, single nc probe).
+   It returns a ≤2 KB summary; your context stays small.
+
+   MANDATORY ROUTING RULE — apply BEFORE every tool call:
+     · Bash output you expect > ~4 KB (objdump, readelf -a, strings,
+       full file Read, ls -R, find, grep across many files, ghiant
+       summary, ROPgadget dump, one_gadget, …)              → recon
+     · File Read where the file is > 200 lines OR you don't know
+       its size                                              → recon
+     · Any "scan / map / inventory" question across multiple files
+       (`which functions take user input`, `which sinks call
+        printf`, `where is the unbounded read`)              → recon
+     · Disasm walks of more than one function                → recon
+     · Libc symbol / offset / gadget / one_gadget lookups   → recon
+     · Decomp triage of any non-trivial binary              → recon
+     · "Quick check" of a file you've already read           → Bash/Read
+     · Running compiled probes, single-line curl/nc, build  → Bash
+     · Writing exploit.py / report.md (only YOU can do this) → Write
+
+   You will be evaluated on whether main's cache_read stays low.
+   Direct Bash output above the threshold is the single largest
+   driver — each `objdump -d ./bin/<n>` adds 100-300 KB of *.text
+   to your cache forever. Recon absorbs it in its own subprocess
+   and only the 2 KB summary lands in your context. The end-of-run
+   judge specifically checks `subagent_spawns` vs `tool_calls`; a
+   ratio below 1:8 is graded down as "main did the work".
+
+   Use recon for EVERY heavy investigation, not only at the start
+   of the run: any disasm walk, source-tree grep, libc symbol /
+   offset / gadget lookup, decomp summary, rootfs unpack — first
+   instinct should be to delegate. Doing it yourself in Bash is
+   reserved for short verifications (one-line file Read, single
+   curl, single nc probe).
 
    DELEGATE DYNAMIC analysis to the `debugger` subagent — gdb,
    strace, ltrace, qemu-user. The debugger AUTOMATICALLY patchelf's
@@ -1781,6 +1807,92 @@ def make_standalone_options(
         permission_mode="bypassPermissions",
         env=env,
     )
+
+
+async def run_pre_recon(
+    *,
+    job_id: str,
+    work_dir,
+    model: str | None,
+    prompt: str,
+    log_fn,
+    timeout_s: float = 240.0,
+    tag: str = "pre-recon",
+) -> str:
+    """Run a recon subagent BEFORE main's first turn so main starts with
+    the static-analysis summary already in its user_prompt. Eliminates
+    main's "should I delegate?" decision (which is consistently mis-made
+    in favor of direct Bash analysis, bloating main's cache_read).
+
+    Spawned as a STANDALONE ClaudeSDKClient with ``make_standalone_options``
+    — same isolation contract as `spawn_subagent` MCP, so main never
+    sees recon's investigation context. Returns ONLY recon's final text
+    (joined assistant TextBlocks), capped at 8 KB.
+
+    Best-effort: any failure returns an empty string so the caller can
+    fall back to the normal "main delegates as needed" flow.
+    """
+    import asyncio as _asyncio
+    try:
+        from claude_agent_sdk import (
+            AssistantMessage,
+            ClaudeSDKClient,
+            ResultMessage,
+        )
+    except Exception as e:
+        log_fn(f"[{tag}] SDK import failed ({e}); skipping pre-recon")
+        return ""
+
+    options = make_standalone_options(
+        "recon", model, work_dir, job_id,
+    )
+    chunks: list[str] = []
+
+    async def _drive() -> None:
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
+            async for msg in client.receive_response():
+                if isinstance(msg, AssistantMessage):
+                    for block in (getattr(msg, "content", None) or []):
+                        if type(block).__name__ == "TextBlock":
+                            txt = getattr(block, "text", "") or ""
+                            if txt.strip():
+                                chunks.append(txt)
+                                # Mirror the MCP-spawned-subagent log
+                                # shape so the panel renders the same.
+                                log_line(
+                                    job_id,
+                                    f"[{tag}] AGENT: {txt[:500]}",
+                                )
+                        elif type(block).__name__ == "ToolUseBlock":
+                            nm = getattr(block, "name", "?")
+                            inp = getattr(block, "input", None) or {}
+                            try:
+                                preview = json.dumps(inp)[:200]
+                            except Exception:
+                                preview = str(inp)[:200]
+                            log_line(
+                                job_id,
+                                f"[{tag}] TOOL {nm}: {preview}",
+                            )
+                elif isinstance(msg, ResultMessage):
+                    cost = getattr(msg, "total_cost_usd", None)
+                    if isinstance(cost, (int, float)) and cost:
+                        log_fn(f"[{tag}] cost: ${cost:.4f}")
+
+    try:
+        await _asyncio.wait_for(_drive(), timeout=timeout_s)
+    except _asyncio.TimeoutError:
+        log_fn(f"[{tag}] timed out after {timeout_s}s — falling back")
+        return ""
+    except Exception as e:
+        log_fn(f"[{tag}] crashed: {e!r} — falling back")
+        return ""
+
+    out = "".join(chunks).strip()
+    if len(out) > 8000:
+        out = out[:8000] + "\n…(truncated)"
+    return out
 
 
 def make_main_session_options(

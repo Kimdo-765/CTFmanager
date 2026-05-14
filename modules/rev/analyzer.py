@@ -16,6 +16,7 @@ from modules._common import (
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
+    run_pre_recon,
     scan_job_for_flags,
     soft_timeout_watchdog,
     write_meta,
@@ -59,6 +60,55 @@ async def _run_agent(
         resume_sid=resume_sid,
     )
     user_prompt = build_user_prompt(binary_name, description, auto_run)
+
+    # Auto-pre-recon — recon does the static triage before main's first
+    # turn so main starts with the inventory in its prompt instead of
+    # having to decide "should I delegate?". Skipped on retries (main
+    # is resuming a prior session) and when no binary is staged.
+    if binary_name and not resume_sid:
+        recon_question = (
+            "STATIC TRIAGE REQUEST (pre-flight for the main solver writer).\n\n"
+            f"BINARY: ./bin/{binary_name}   (cwd = work dir)\n\n"
+            f"If `./decomp/` is missing, run `ghiant ./bin/{binary_name}` "
+            "ONCE to populate it (project cached under ./.ghidra_proj/).\n\n"
+            "REPLY in ≤2 KB, as compact bullets, with these sections:\n"
+            "  ARCH         — `file` summary in one line\n"
+            "  PROTECTIONS  — checksec\n"
+            "  LANGUAGE     — C/C++ vs Go vs Rust vs .NET vs packed?\n"
+            "  FUNCTIONS    — names + sizes of the interesting funcs "
+            "(main, check_password / verify / decrypt / serial routines, "
+            "flag-derivation paths). Ignore stdlib stubs.\n"
+            "  FLAG PATH    — where is the flag string built / read / "
+            "printed? cite file:addr.\n"
+            "  CONSTANTS    — XOR keys, AES keys, hashes, magic bytes "
+            "embedded in .data/.rodata that the solver will need.\n"
+            "  CANDIDATES   — ranked HIGH/MED/LOW with technique name + "
+            "file:line (`HIGH brute-force serial via known constant @ 0x..`).\n\n"
+            "DO NOT propose solver code. Facts only. Cite file:line "
+            "for every claim."
+        )
+        log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
+        recon_reply = await run_pre_recon(
+            job_id=job_id,
+            work_dir=work_dir,
+            model=model,
+            prompt=recon_question,
+            log_fn=lambda s: log_line(job_id, s),
+        )
+        if recon_reply:
+            user_prompt = (
+                "PRE-RECON COMPLETED — the orchestrator already ran a "
+                "recon subagent on your behalf. Its 2 KB summary is "
+                "below. START from this; do not re-run the same triage "
+                "yourself.\n\n"
+                "==== RECON REPLY ===="
+                f"\n{recon_reply}\n"
+                "==== END RECON ====\n\n"
+            ) + user_prompt
+            log_line(
+                job_id,
+                f"[pre-recon] reply ready ({len(recon_reply)} chars)",
+            )
 
     log_line(job_id, f"Launching Claude agent (model={model})")
     if resume_sid:

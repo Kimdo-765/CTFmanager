@@ -15,6 +15,7 @@ from modules._common import (
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
+    run_pre_recon,
     scan_job_for_flags,
     soft_timeout_watchdog,
     write_meta,
@@ -50,6 +51,59 @@ async def _run_agent(
         resume_sid=resume_sid,
     )
     user_prompt = build_user_prompt(src_root, target, description, auto_run)
+
+    # Auto-pre-recon — recon identifies the cipher + parameters before
+    # main's first turn so main starts with the math already framed.
+    if src_root and not resume_sid:
+        recon_question = (
+            "STATIC TRIAGE REQUEST (pre-flight for the main solver writer).\n\n"
+            f"CHALLENGE FILES: {src_root}   (read-only)\n"
+            + (f"REMOTE TARGET: {target}\n" if target else "")
+            + "\n"
+            "REPLY in ≤2 KB, as compact bullets, with these sections:\n"
+            "  SOURCE FILES — every script/source in src_root, one line "
+            "each (path · purpose). Ignore READMEs unless they carry "
+            "challenge specifics.\n"
+            "  CIPHER       — name the primitive (RSA / AES-CBC / "
+            "ChaCha20 / ECDSA / custom LFSR / etc.) and the public "
+            "parameters (modulus bit-size, key length, IV reuse?, "
+            "PRG seed?). cite source file:line.\n"
+            "  CIPHERTEXT   — exact path(s) + format (hex/b64/raw "
+            "bytes). Provide the length and first few bytes.\n"
+            "  KEY MATERIAL — what's known (public key, leaked nonce, "
+            "partial bits, oracle endpoint)? What's secret?\n"
+            "  CANDIDATES   — ranked HIGH/MED/LOW attack name with "
+            "rationale (`HIGH coppersmith — high bits of p leaked at "
+            "line 47`). Reference standard names: small-e, common "
+            "modulus, partial-key, padding oracle, lattice/LLL, "
+            "Coppersmith, NTRU, LWE.\n"
+            "  SOLVER NOTES — should the solver use SageMath? List the "
+            "libs needed (pycryptodome / gmpy2 / sympy / z3).\n\n"
+            "DO NOT propose solver code. Facts only. Cite file:line "
+            "for every claim."
+        )
+        log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
+        recon_reply = await run_pre_recon(
+            job_id=job_id,
+            work_dir=work_dir,
+            model=model,
+            prompt=recon_question,
+            log_fn=lambda s: log_line(job_id, s),
+        )
+        if recon_reply:
+            user_prompt = (
+                "PRE-RECON COMPLETED — the orchestrator already ran a "
+                "recon subagent on your behalf. Its 2 KB summary is "
+                "below. START from this; do not re-grep the source "
+                "yourself.\n\n"
+                "==== RECON REPLY ===="
+                f"\n{recon_reply}\n"
+                "==== END RECON ====\n\n"
+            ) + user_prompt
+            log_line(
+                job_id,
+                f"[pre-recon] reply ready ({len(recon_reply)} chars)",
+            )
 
     log_line(job_id, f"Launching Claude agent (model={model})")
     if resume_sid:

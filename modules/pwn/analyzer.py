@@ -18,6 +18,7 @@ from modules._common import (
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
+    run_pre_recon,
     scan_job_for_flags,
     soft_timeout_watchdog,
     write_meta,
@@ -25,6 +26,64 @@ from modules._common import (
 from modules._runner import attempt_sandbox_run
 from modules.pwn.prompts import SYSTEM_PROMPT, build_user_prompt, looks_heap_advanced
 from modules.settings_io import apply_to_env, get_setting
+
+
+def _build_pre_recon_prompt(
+    *,
+    binary_name: str,
+    target: str | None,
+    heap_advanced: bool,
+    chal_unpacked: bool,
+) -> str:
+    """Build the prompt for the orchestrator-driven recon subagent that
+    runs BEFORE main's first turn. Recon's job: static-map the binary
+    so main starts with a 2 KB inventory instead of having to do its
+    own objdump walk."""
+    parts: list[str] = []
+    parts.append(
+        "STATIC TRIAGE REQUEST (pre-flight for the main exploit writer)."
+    )
+    parts.append(
+        f"BINARY: ./bin/{binary_name}"
+        + (f"   (cwd = work dir; ./.chal-libs/ holds the chal libs)"
+           if chal_unpacked else "")
+    )
+    if target:
+        parts.append(f"REMOTE: {target}")
+    parts.append(
+        "If `./decomp/` is missing, run `ghiant ./bin/" + binary_name + "` "
+        "ONCE to populate it (the project is cached under "
+        "./.ghidra_proj/ so subsequent reads are fast)."
+    )
+    parts.append(
+        "REPLY in ≤2 KB, as compact bullets, with these sections:\n"
+        "  ARCH         — `file` summary in one line\n"
+        "  PROTECTIONS  — checksec: RELRO / Stack / NX / PIE\n"
+        "  LIBC         — `./.chal-libs/libc_profile.json` version + "
+        "any blacklisted_techniques (read libc_profile.json if present)\n"
+        "  FUNCTIONS    — names + sizes of the user-controllable funcs "
+        "(main, menu handlers, parsers). Ignore stdlib stubs.\n"
+        "  CANDIDATES   — ranked HIGH/MED/LOW with bug class + file:line\n"
+        "                 e.g. `HIGH heap.UAF — secure_free@b21 frees "
+        "without unsetting the dangling ptr` (be specific)\n"
+        "  PRIMITIVES   — for each HIGH: what the attacker writes / reads / "
+        "controls (8 bytes at canary? full chunk? size field?)\n"
+    )
+    if heap_advanced:
+        parts.append(
+            "HEAP CHAL — ALSO report:\n"
+            "  ALLOC/FREE SIG — secure_malloc / secure_free header layout "
+            "(in-band size, canary location, freelist pointer mangling?)\n"
+            "  HOOKS_ALIVE   — confirm libc_profile.json's `hooks_alive` "
+            "matches the actual libc (cross-check on __free_hook offset).\n"
+            "  RECOMMENDED CHAIN — pick ONE from libc_profile.json's "
+            "recommended_techniques given the primitives above."
+        )
+    parts.append(
+        "DO NOT propose exploit code. DO NOT speculate. Facts only. "
+        "Cite file:line / file:addr for every claim."
+    )
+    return "\n\n".join(parts)
 
 
 def _is_shared_lib(p: Path) -> bool:
@@ -337,6 +396,49 @@ async def _run_agent(
         effective_binary_name, target, description, auto_run,
         chal_unpacked=chal_unpacked,
     )
+
+    # Auto-pre-recon — let recon do the static triage BEFORE main's
+    # first turn so main starts with the 2 KB summary in its prompt
+    # instead of having to decide "should I delegate?". Skip for
+    # remote-only jobs (no binary to map) and for retries where main
+    # is resuming a prior session (has its own context to lean on).
+    if effective_binary_name and not resume_sid:
+        recon_question = _build_pre_recon_prompt(
+            binary_name=effective_binary_name,
+            target=target,
+            heap_advanced=heap_kw,
+            chal_unpacked=chal_unpacked,
+        )
+        log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
+        recon_reply = await run_pre_recon(
+            job_id=job_id,
+            work_dir=work_dir,
+            model=model,
+            prompt=recon_question,
+            log_fn=lambda s: log_line(job_id, s),
+        )
+        if recon_reply:
+            user_prompt = (
+                "PRE-RECON COMPLETED — the orchestrator already ran a "
+                "recon subagent on your behalf. Its 2 KB summary is "
+                "below. START from this; do not re-run the same triage "
+                "yourself. Spawn recon AGAIN for follow-up "
+                "questions if needed.\n\n"
+                "==== RECON REPLY ===="
+                f"\n{recon_reply}\n"
+                "==== END RECON ====\n\n"
+            ) + user_prompt
+            log_line(
+                job_id,
+                f"[pre-recon] reply ready ({len(recon_reply)} chars) "
+                f"— prepended to main user_prompt",
+            )
+        else:
+            log_line(
+                job_id,
+                "[pre-recon] empty reply — main starts without "
+                "pre-recon context (will need to delegate itself)",
+            )
 
     log_line(job_id, f"Launching Claude agent (model={model})")
     if resume_sid:

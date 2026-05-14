@@ -15,6 +15,7 @@ from modules._common import (
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
+    run_pre_recon,
     scan_job_for_flags,
     soft_timeout_watchdog,
     write_meta,
@@ -53,6 +54,60 @@ async def _run_agent(
         log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")
 
     user_prompt = build_user_prompt(src_root, target_url, description, auto_run)
+
+    # Auto-pre-recon — recon maps the source tree (routes, sinks, auth)
+    # before main's first turn so main starts with a route inventory
+    # instead of `find . -type f` walking the codebase itself. Skipped
+    # for remote-only jobs (no source to grep) and on retries.
+    if src_root and not resume_sid:
+        recon_question = (
+            "STATIC TRIAGE REQUEST (pre-flight for the main exploit writer).\n\n"
+            f"SOURCE ROOT: {src_root}   (read-only)\n"
+            + (f"REMOTE TARGET: {target_url}\n" if target_url else "")
+            + "\n"
+            "REPLY in ≤2 KB, as compact bullets, with these sections:\n"
+            "  STACK        — language + framework + DB (Flask, Express, "
+            "Spring, …). Cite the entry-point file.\n"
+            "  ROUTES       — list every HTTP route the app exposes. "
+            "format: `METHOD /path  →  file:line  (handler_name)`. "
+            "Group by file when tight.\n"
+            "  AUTH         — login / session / token plumbing in one "
+            "paragraph. Where are creds stored, what crypto is used, "
+            "what's the session cookie name?\n"
+            "  USER INPUT   — every reachable parameter sink (request "
+            "args / JSON body / headers / file upload paths). file:line.\n"
+            "  CANDIDATES   — ranked HIGH/MED/LOW with bug class + "
+            "file:line. Bug classes: SQLi, XSS, SSRF, RCE, LFI, "
+            "deserialization, JWT-misuse, path traversal, command "
+            "injection. Quote the unsafe line.\n"
+            "  FLAG PATH    — where does the flag get read / served? "
+            "(env var? /flag.txt? hardcoded string?)\n\n"
+            "DO NOT propose exploit code. Facts only. Cite file:line for "
+            "every claim."
+        )
+        log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
+        recon_reply = await run_pre_recon(
+            job_id=job_id,
+            work_dir=work_dir,
+            model=model,
+            prompt=recon_question,
+            log_fn=lambda s: log_line(job_id, s),
+        )
+        if recon_reply:
+            user_prompt = (
+                "PRE-RECON COMPLETED — the orchestrator already ran a "
+                "recon subagent on your behalf. Its 2 KB summary is "
+                "below. START from this; do not re-grep the tree "
+                "yourself.\n\n"
+                "==== RECON REPLY ===="
+                f"\n{recon_reply}\n"
+                "==== END RECON ====\n\n"
+            ) + user_prompt
+            log_line(
+                job_id,
+                f"[pre-recon] reply ready ({len(recon_reply)} chars)",
+            )
+
     log_line(job_id, f"Launching Claude agent (model={model})")
     log_line(job_id, f"Source root: {src_root or '(remote-only)'}")
 
