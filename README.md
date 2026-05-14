@@ -98,7 +98,7 @@ Five Claude-driven roles, each with its own context window:
    │  ClaudeSDKClient session → deliverables             │
    │  + auto-retry on postjudge feedback                 │
    │  + heartbeat + token/cost meter                     │
-   │  + spawn-cap + compaction guards + fallback         │
+   │  + SOFT_EJECT/FINAL_DRAFT budget guard + fallback   │
    └─┬─────────────────────┬───────────┬─────────────────┘
      │ mcp__team__         │ docker.sock          
      │ spawn_subagent      │                       
@@ -166,15 +166,31 @@ conversation history.
 
 ### Subagent isolation (default ON)
 
-Verified empirically (memory file `worker_fork_oom.md` and SDK
-source reading): the `claude-agent-sdk` runs ALL `AgentDefinition`
-contexts inside a **single** `claude` CLI Node.js subprocess.
-When main spawned via the legacy `Agent(subagent_type=...)` tool,
-the subagent's full conversation accumulated into main's Node.js
-heap — a few heap-pwn delegations easily pushed cache_read past
-5 M tokens and the V8 heap past the worker's cgroup `mem_limit`,
-SIGKILLing the CLI with `exit code -9`. Jobs 011a / 7c4a / ff82 /
-5c53 / c4f4 all died this way.
+The `claude-agent-sdk` runs ALL `AgentDefinition` contexts inside a
+**single** `claude` CLI Node.js subprocess. When main spawned via
+the legacy `Agent(subagent_type=...)` tool, the subagent's full
+conversation accumulated into main's Node.js heap — for long
+heap-pwn runs this means hundreds of KB per spawn lodge into the
+main session and inflate every subsequent prompt-cache hit.
+
+The MCP-based isolation path replaces that with per-spawn `claude`
+CLI subprocesses, so the heavy investigation lives in its own
+context and main only sees the final-text reply (typically a few KB).
+This keeps main's `cache_read` flat regardless of how many
+subagents you spawn, which is the whole point of the design.
+
+> History note: the codebase used to carry cgroup `mem_limit`s,
+> `CONTEXT_COMPACTION_THRESHOLD` / `HARD_CEILING` guards, and a
+> `SUBAGENT_SPAWN_CAP` hard-break. All three were defenses against
+> what looked like cumulative-heap OOM kills (`exit code -9`) on
+> long heap-pwn runs. Forensic investigation in May 2026 showed
+> every observed exit -9 was actually fratricide: the debugger
+> subagent's `pkill -9 -f "./prob"` matched its own claude CLI's
+> argv (the SDK passes the system_prompt via `--system-prompt`)
+> and SIGKILLed itself + sister subagents. The fix is comm-anchored
+> matching (`pkill -x prob`) in the debugger prompt; the OOM
+> defenses have been removed because they were responding to a
+> phantom failure mode.
 
 **How isolation works** (`make_spawn_subagent_mcp` +
 `make_standalone_options` in `modules/_common.py`):
@@ -185,8 +201,7 @@ SIGKILLing the CLI with `exit code -9`. Jobs 011a / 7c4a / ff82 /
    model cannot fall back to the in-process path even under
    `permission_mode=bypassPermissions`.
 2. Each `spawn_subagent(subagent_type, prompt)` call:
-   - increments `summary["subagent_spawns"]` (gated by
-     `SUBAGENT_SPAWN_CAP`),
+   - increments `summary["subagent_spawns"]`,
    - builds a standalone `ClaudeAgentOptions` with the requested
      agent's system prompt + tool list + model,
    - opens a fresh `ClaudeSDKClient` (= new `claude` CLI
@@ -198,32 +213,25 @@ SIGKILLing the CLI with `exit code -9`. Jobs 011a / 7c4a / ff82 /
    its in-process heap is fully released by the kernel.
 
 Main therefore only accumulates the subagent's final reply
-(typically a few KB) per delegation, not the subagent's whole
-investigation transcript (often hundreds of KB). On a job that
-runs 4 spawns the cumulative growth difference is ~1–2 MB of
-context (isolated) vs. ~1–2 MB **per spawn** (legacy in-process).
+(typically a few KB) per delegation. On a job that runs 4 spawns
+the cumulative growth difference is ~1–2 MB of context (isolated)
+vs. ~1–2 MB **per spawn** (legacy in-process).
 
-**Spawn cap**. `SUBAGENT_SPAWN_CAP` (default `4`) bounds the
-delegation count per run; the typical heap-pwn workflow is
-`recon × 2 + debugger × 1 + judge × 1`. At `count == cap` the
-orchestrator injects `SUBAGENT_CAP_USER_TURN` ("do the rest
-inline") into the next user turn; at `count > cap` it breaks
-the receive loop immediately, writes fallback artifacts, and
-dispatches the sandbox — main never gets to make a (cap+1)th
-spawn that would push it past safety.
+**Auto-pre-recon**. The orchestrator spawns a recon subagent BEFORE
+main's first turn (`run_pre_recon` in `modules/_common.py`) so main
+starts with a 2 KB triage summary already in its prompt instead of
+having to decide whether to delegate. Skipped for remote-only jobs
+and retries. See [Agent architecture](#agent-architecture).
 
-**Compaction guard**. `CONTEXT_COMPACTION_THRESHOLD` (SOFT, default
-6 M cache_read tokens) injects a "finalize now, no further
-subagent spawns" user turn. `CONTEXT_COMPACTION_HARD_CEILING`
-(default 10 M, well below the worker's 14g cgroup limit) cleanly
-aborts the main session, writes fallback artifacts, and runs the
-sandbox + judge cycle so the job ends as `no_flag` / `partial`
-rather than `failed` (= what the legacy single-Node.js-process
-sessions reached just before SIGKILL).
+**Spawn cap**. `SUBAGENT_SPAWN_CAP` (default `0` = unlimited) bounds
+the delegation count per run only as a runaway cost guard — not as
+an OOM defense. Set to a positive int (e.g. `30`) if you want to
+catch infinite-recursion model bugs; leave at 0 to allow free use,
+which is the recommended posture.
 
 **Rollback**. Set `USE_ISOLATED_SUBAGENTS=0` in `.env` to revert
-to the legacy `agents={}` in-process path. The cap + compaction
-guards still apply.
+to the legacy `agents={}` in-process path. The spawn cap still
+applies if you've set `SUBAGENT_SPAWN_CAP` to a positive int.
 
 ### sibling sandboxes — transient docker containers
 
@@ -346,9 +354,9 @@ Loop terminates on the FIRST hit among:
 ### Fallback artifact safety net
 
 When something stops main mid-run before it produced an artifact —
-budget exhausted, OOM/SIGKILL, soft-eject ignored, subagent cap
-exceeded, compaction ceiling crossed — the orchestrator does **not**
-abort the job. Instead `write_fallback_artifacts(work_dir, log_fn)`
+budget exhausted, SDK transport killed, soft timeout — the
+orchestrator does **not** abort the job. Instead
+`write_fallback_artifacts(work_dir, log_fn)`
 (in `modules/_common.py`) drops a probe-only `exploit.py` + a brief
 `report.md` into the work dir, then **continues into the sandbox +
 judge dispatch** as if main had finished normally. The job ends as
@@ -562,8 +570,6 @@ All knobs live in two places:
    |---|---|---|
    | `HOST_DATA_DIR` | `./data` | absolute host path for sibling-container bind mounts |
    | `WORKER_CONCURRENCY` | `3` | parallel job slots |
-   | `WORKER_MEM_LIMIT` | `14g` | cgroup memory cap on the worker. Sized so the main `claude` CLI Node.js heap has room to grow under a heap-pwn run + the isolated subagent subprocesses share the same container. Set to `0` to disable, or lower if your host has less RAM. |
-   | `WORKER_MEMSWAP_LIMIT` | `18g` | total cgroup memory+swap. Default = `WORKER_MEM_LIMIT` + 4 GiB so the worker can spill to swap during transient context spikes without invoking the host OOM-killer. |
    | `JOB_TTL_DAYS` | `7` | auto-delete jobs older than N days (`0`=keep) |
    | `JOB_TIMEOUT` | `6000` | soft job timeout in seconds — see [Timeout & soft-deadline decision](#timeout--soft-deadline-decision) |
    | `WEB_PORT` | `8000` | host port |
@@ -576,9 +582,7 @@ All knobs live in two places:
    | `ENABLE_JUDGE` | `1` | wrap every `auto_run` runner execution with the 3-stage judge (pre / stall-supervise / post). Set to `0` to skip judge calls entirely. See [judge](#judge-modules_judgepy). |
    | `AUTO_RETRY_MAX` | `-1` | postjudge-driven inline retries within a single job. `0` disables the loop (legacy fire-and-forget). Positive int caps at exactly N retries on top of the initial run. `-1` / `inf` / `unlimited` lets the loop run until natural exit (success, no actionable hint, error, user Stop, timeout). See [auto-retry triangle](#auto-retry-triangle). |
    | `USE_ISOLATED_SUBAGENTS` | `1` | when `1` (default), main delegates via the MCP tool `mcp__team__spawn_subagent` — each subagent runs in its own `claude` CLI subprocess and only the final-text reply lands in main's history. Set to `0` for the legacy in-process `agents={}` path (kept as a fast rollback). See [Subagent isolation](#subagent-isolation-default-on). |
-   | `SUBAGENT_SPAWN_CAP` | `4` | hard cap on subagent delegations per run. Typical workflow uses `recon × 2 + debugger × 1 + judge × 1`. At `count == cap` a "no more spawns" user-turn is injected; at `count > cap` the receive loop breaks immediately and the fallback path runs. Set to `0` to disable. |
-   | `CONTEXT_COMPACTION_THRESHOLD` | `6000000` | SOFT cache_read ceiling. When main's accumulated `cache_read_input_tokens` crosses this, the orchestrator injects a "finalize now, no further subagent spawns" user-turn. `0` disables both compaction guards. |
-   | `CONTEXT_COMPACTION_HARD_CEILING` | `10000000` | HARD ceiling. Crossing this cleanly aborts main, writes fallback artifacts, runs sandbox + postjudge — designed to land below the worker `mem_limit` so OOM never fires inside the SDK. |
+   | `SUBAGENT_SPAWN_CAP` | `0` | runaway cost guard. `0` = unlimited (recommended — aggressive delegation is encouraged for context efficiency, and the orchestrator already auto-spawns a recon subagent before main's first turn). Set to a positive int to bound how many delegations one run can make. |
 
 2. **Settings tab** in the UI — writes to `/data/settings.json`, overrides `.env`
    without restart for: Anthropic API key, Claude model, Auth token, Job TTL,
@@ -806,13 +810,12 @@ HexTech_CTF_TOOL/
   Use `--build-arg INSTALL_PWNDBG=0` if you want a leaner image.
 - **`scaffold.aslr_retry` + `heap-probe` + spawn hygiene** —
   `DEBUGGER_AGENT_PROMPT` mandates AT MOST ONE inferior process
-  alive at a time (`pkill -9 -f ./prob; pkill -9 -f gdbserver`
-  before any new spawn). Combined with **subagent isolation** (each
-  delegation runs in its own `claude` CLI subprocess, see
-  [Subagent isolation](#subagent-isolation-default-on)) and the
-  worker's mem/memswap cgroup limits, this prevents the OOM-on-
-  delegation failure mode that historically killed long heap runs
-  with `exit code -9`.
+  alive at a time. Cleanup uses comm-anchored matching
+  (`pkill -9 -x prob`, `pkill -9 -x gdbserver`) — **never** `pkill -f`,
+  because the SDK passes `system_prompt` as a CLI argv and `-f` would
+  match the agent's own claude CLI process. That fratricide accounted
+  for every observed `exit code -9` in prior heap-pwn runs; the
+  comm-anchored fix eliminates it.
 - **Decompile-vs-assembly workflow** (WORKFLOW step 3.5 in
   `modules/pwn/prompts.py`): for heap / int-overflow / signedness
   / OOB-index chals, *primitive validation* is mandatory before

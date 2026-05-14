@@ -239,9 +239,9 @@ launches the debugger in its OWN claude CLI subprocess. The subagent
 runs to completion and returns its FINAL response text as the tool
 result. main never sees the subagent's full conversation history —
 only the summary it chose to write. (Legacy `Agent(...)` is also
-available if `USE_ISOLATED_SUBAGENTS=0`, but you should prefer the
-isolated MCP tool: it's the only way the worker survives a
-multi-spawn heap-pwn run without OOMing.)
+available if `USE_ISOLATED_SUBAGENTS=0`, but prefer the isolated MCP
+tool: it keeps main's cache_read small by routing the heavy
+investigation through its own subprocess.)
 
   mcp__team__spawn_subagent(
     subagent_type="debugger",

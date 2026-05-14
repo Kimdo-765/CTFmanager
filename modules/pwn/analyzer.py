@@ -248,11 +248,10 @@ def _autobootstrap_libc(
         autoboot couldn't pick a canonical binary; caller falls back to
         the upload filename.
 
-    Why: jobs 9d58fe152fba / 011a6d486d53 (and the earlier OOM pair)
-    skipped chal-libc-fix entirely because the model dove into decompile
-    analysis and never looped back to step 5 of the workflow. With the
+    Why: models repeatedly dove into decompile analysis and never
+    looped back to step 5 of the workflow (chal-libc-fix). With the
     profile missing, the rest of the heap pipeline (scaffold templates,
-    heap-probe, judge failure_code matrix) operate on absent data.
+    heap-probe, judge failure_code matrix) operates on absent data.
     Pre-baking it shifts the pipeline from model-action-dependent to
     deterministic.
 
@@ -355,10 +354,10 @@ async def _run_agent(
             pass
 
     # Pre-bake ./.chal-libs/libc_profile.json BEFORE the agent's first
-    # turn. The earlier OOM jobs (1d00be30d4e9 / a914ca943ed2 / 9d58fe152fba)
-    # all skipped this step model-side and the rest of the heap pipeline
-    # became dead code as a result. Doing it here makes the profile
-    # data deterministic; the agent only has to READ it.
+    # turn. Models historically skipped this step and the rest of the
+    # heap pipeline (scaffold templates, heap-probe, judge failure
+    # matrix) became dead code as a result. Doing it here makes the
+    # profile data deterministic; the agent only has to READ it.
     _profile, autoboot_elf_name = _autobootstrap_libc(
         staged_bin, work_dir, lambda s: log_line(job_id, s),
         job_id=job_id,

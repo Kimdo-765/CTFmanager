@@ -386,12 +386,10 @@ MISSION (read first, follow strictly)
    `claude` CLI subprocess. When the subagent finishes, the
    subprocess dies — its full investigation conversation is GONE.
    You receive only the subagent's final text response as the tool
-   result. This is intentional: it's the only way the worker survives
-   a multi-spawn heap-pwn run without OOMing on a single-process
-   heap (the prior `Agent(subagent_type=...)` path accumulated the
-   subagent's whole context into your heap, which is what killed
-   jobs 011a6d486d53 / 7c4a6a4c7581 / ff8240803dc2 / 5c5334381583 /
-   c4f49803edfe).
+   result. This is the whole point of the isolated path: the
+   subagent absorbs the heavy disasm / decomp / grep work in its
+   own context, and ONLY the summary lands in yours. Your
+   cache_read stays small even on long heap-pwn runs.
 
    Practical implications:
      · Ask SPECIFIC questions — the subagent has no memory of your
@@ -399,13 +397,12 @@ MISSION (read first, follow strictly)
      · Batch questions — ONE spawn that answers 3-5 things is much
        cheaper than 3-5 spawns. Each spawn has fixed fork overhead
        (~2-3 s + cold prompt cache).
-     · You can still spawn multiple subagents per run (cap default
-       is 4 — typical heap-pwn workflow is ~2 recon + 1 debugger +
-       1 judge). The cap fires post-turn warning at count == cap
-       and hard-breaks the receive loop at count > cap.
+     · Spawn as many subagents as the work calls for. Default cap
+       is 0 (unlimited) via `SUBAGENT_SPAWN_CAP`; set to a positive
+       int only as a runaway cost guard.
      · If the legacy `Agent` tool is still in your tool list
        (USE_ISOLATED_SUBAGENTS=0), prefer the MCP form anyway —
-       isolation is strictly the safer path.
+       isolation keeps your context smaller.
 3. BUDGET (soft 10, FINAL_DRAFT trigger ~150, fallback safety net):
    * SOFT — after ~10 tool calls without a draft {short}, STOP
      investigating and write the draft from your best hypothesis.
@@ -427,27 +424,6 @@ MISSION (read first, follow strictly)
      reaching production is a sign of analysis failure; if you see
      `agent_error_kind=budget_fallback` in any prior run, please
      draft earlier next time.
-
-3.5. CONTEXT COMPACTION GUARD (independent of #3, fires on memory not
-   tool-call count):
-   * SOFT — at 8 M accumulated `cache_read_input_tokens` (configurable
-     via `CONTEXT_COMPACTION_THRESHOLD`) the orchestrator injects a
-     `COMPACTION_USER_TURN` message into your conversation telling
-     you to STOP investigating, finalize the artifact, and end your
-     turn. DO NOT spawn debugger / recon after seeing it — the SDK
-     child process spawn is the documented OOM-trigger.
-   * HARD — at 14 M accumulated cache_read tokens (`COMPACTION_HARD_
-     CEILING`) the orchestrator ends your session cleanly with
-     `agent_error_kind=compaction_ceiling`. Whatever exploit.py +
-     report.md you've written are preserved; the auto-retry loop
-     then forks a fresh session whose first user-turn is the
-     postjudge feedback from the just-completed sandbox run — your
-     work continues with a small context.
-   This guard exists because jobs 011a6d486d53 (3.6 M tokens,
-   OOM at debugger spawn) and 7c4a6a4c7581 (13.5 M tokens, OOM
-   at debugger spawn) both wrote a working exploit and then died
-   trying to debug it. The compaction loop preserves your progress
-   instead.
 
 JUDGE GATE (mandatory before you finalize)
 ------------------------------------------
@@ -526,8 +502,8 @@ a single subagent turn.
    strings -a on a libc, full `objdump -d`, etc.) DO NOT let the raw
    result land in your tool-result. The output is copied verbatim
    into your conversation context — 200 lines of brute-force "guess:"
-   blocks (as job 011a6d486d53 did right before OOM) eats 30-50 KB of
-   context and pushes the SDK closer to its memory cap. Pattern:
+   blocks eat 30-50 KB of cache_read per turn and inflate the
+   prompt-cache cost for the rest of the run. Pattern:
 
        <cmd> 2>&1 | tee /tmp/sweep.out | head -5   # peek
        wc -l /tmp/sweep.out                         # size
@@ -1531,11 +1507,11 @@ Hard rules
   strace runs per delegation. If main asks 5 distinct questions in
   one prompt, answer them in one combined gdb session whenever
   possible (single -ex chain) instead of 5 spawns.
-* PROCESS HYGIENE — CRITICAL for heap chals (failures 1d00be30d4e9 /
-  a914ca943ed2 / 9d58fe152fba all OOM'd from spawn fan-out):
-    AT MOST ONE inferior process alive at a time.
-    BEFORE spawning a new `./prob` / `./bin/<n>` / `gdb -p PID` /
-    `gdbserver` / driver script: clean up first.
+* PROCESS HYGIENE — keep ONE inferior alive at a time. Stale
+  `./prob` / `gdbserver` / driver processes from earlier probes
+  occupy file descriptors + pty slots and confuse `ps` reads.
+  BEFORE spawning a new `./prob` / `./bin/<n>` / `gdb -p PID` /
+  `gdbserver` / driver script: clean up first.
 
     NEVER use `pkill -f` for cleanup — the Claude Agent SDK passes
     your system_prompt as `--system-prompt <prompt>` to the `claude`
@@ -1558,20 +1534,11 @@ Hard rules
     drivers under a tight `timeout 5 python3 …` and `wait` on
     background pids in the same Bash call so no driver outlives the
     call that spawned it.
-
-    Each pwntools `process(...)` keeps ~30-80 MB resident; gdb adds
-    another ~150 MB; concurrent inferiors stack quickly past the
-    worker's mem_limit (default 8 GB) and trip the cgroup OOM-killer
-    on the bundled `claude` CLI — your whole job dies with exit
-    code -9 before you can finish the report. Use one Bash call to
-    kill stale processes between probes, and DO NOT fork driver
-    scripts into the background unless you immediately wait/kill
-    them at the end of the same Bash call.
-* OUTPUT-REDIRECT QUOTA — CRITICAL. Job 9d58fe152fba died because
-  a `./prob < stdin > /tmp/probe_out3.bin` looped forever after
-  EOF and wrote 4.2 GiB to /tmp before the OOM-killer fired.
-  Stdout-piped-to-claude has a RUNAWAY_OUTPUT guard; STDOUT-REDIRECTED-
-  TO-A-FILE does NOT. Whenever you redirect to a file:
+* OUTPUT-REDIRECT QUOTA — when you write to a file, cap it.
+  A loop that reads past EOF can dump GiB to /tmp in seconds
+  (one observed run wrote 4.2 GiB before timing out). Stdout-piped-
+  to-claude has a RUNAWAY_OUTPUT guard; STDOUT-REDIRECTED-TO-A-FILE
+  does NOT. Whenever you redirect to a file:
     1. ALWAYS bound the command with a tight `timeout` AND a stdin
        that explicitly closes (`< /tmp/probe.in` not `< /dev/stdin`).
     2. Cap the receiver. Pick ONE:
@@ -1581,8 +1548,7 @@ Hard rules
     3. After any subprocess run, `pkill -9 -x <comm>` (NOT `-f`; see
        PROCESS HYGIENE above for why cmdline matching self-immolates)
        AND `ps -eo pid,comm,args | grep <prob>` to confirm no
-       zombie/defunct procs are accumulating. A `<defunct>` row is
-       a leaked file handle still consuming memory inside the cgroup.
+       zombie/defunct procs are accumulating.
     4. `du -sh /tmp/probe_*` before each new spawn — if any file
        exceeds 100 MiB, `rm -f` it and re-run with a `head -c` cap.
 * heap-probe FIRST: when main's question is about heap state at N
@@ -1716,19 +1682,19 @@ build_recon_agents = build_team_agents
 # ─────────────────────────────────────────────────────────────
 # Verified empirically (see memory/worker_fork_oom.md): the SDK runs
 # ALL agent contexts inside a single `claude` CLI Node.js process.
-# When main spawns `Agent(subagent_type=...)`, the subagent's
-# conversation accumulates into main's process heap. A few heap-pwn
-# subagent spawns push the combined cache_read past 5 M tokens and
-# the V8 heap past the cgroup mem_limit → SIGKILL → job dies.
-#
-# The MCP-based path below replaces the built-in `Agent` tool with a
-# custom `spawn_subagent` MCP tool. Each call to that tool creates a
-# FRESH `ClaudeSDKClient` (= fresh `claude` CLI subprocess) for the
+# When main spawns `Agent(subagent_type=...)` (legacy path), the
+# subagent's conversation accumulates into main's process heap and
+# inflates main's cache_read by KB per subagent step. The MCP-based
+# path below replaces the built-in `Agent` tool with a custom
+# `spawn_subagent` MCP tool. Each call to that tool creates a FRESH
+# `ClaudeSDKClient` (= fresh `claude` CLI subprocess) for the
 # subagent. The subagent runs to completion, returns its final text
 # response, and the subprocess dies. main only ever sees the final
 # text as a tool_result — the subagent's full conversation never
-# touches main's heap. This is what "main / recon / debugger /
-# judge are independent agents" means at the OS process level.
+# touches main's context. This is what "main / recon / debugger /
+# judge are independent agents" means at the OS process level, and
+# it's the reason isolated mode keeps main's cache_read small even
+# on long heap-pwn runs.
 
 _AGENT_PROMPT_BY_TYPE = {
     # Filled lazily — RECON_AGENT_PROMPT etc. are defined later in
@@ -2252,64 +2218,6 @@ _token_state: dict[str, dict[str, int]] = {}
 _token_seen_ids: dict[str, set[str]] = {}
 _token_turns: dict[str, int] = {}
 
-# Per-job compaction-warning state. Tracks whether we've already
-# emitted the SOFT context-compaction warning to main this run, so
-# the same advisory doesn't fire on every heartbeat once threshold
-# is crossed.
-_compaction_warned: dict[str, bool] = {}
-
-
-# Context-compaction thresholds (env-tunable).
-# Heuristic: pre-OOM jobs accumulated cache_read 3.6M (011a) → 13.5M
-# (7c4a). The first ones hit OOM at 8 GiB; 7c4a hit 12 GiB. A SOFT
-# warn at 8M leaves the agent ~3 turns to draft/save artifacts before
-# the HARD ceiling at 14M (where the heartbeat sets compaction_pending
-# and run_main_agent_session ejects the session for a fork-based
-# retry). Set CONTEXT_COMPACTION_THRESHOLD=0 to disable both.
-def _compaction_thresholds() -> tuple[int, int]:
-    try:
-        soft = int(os.environ.get("CONTEXT_COMPACTION_THRESHOLD", "8000000"))
-    except ValueError:
-        soft = 8_000_000
-    try:
-        hard = int(os.environ.get("CONTEXT_COMPACTION_HARD_CEILING", "14000000"))
-    except ValueError:
-        hard = 14_000_000
-    if soft <= 0:
-        return 0, 0
-    if hard < soft:
-        hard = int(soft * 1.75)
-    return soft, hard
-
-
-# Heuristic message the orchestrator can inject as a user-turn when
-# the soft threshold is crossed. Kept out of the heartbeat fn so the
-# main-session loop can include it in its own client.query() call
-# without coupling to the heartbeat's throttle.
-COMPACTION_USER_TURN = """\
-🧠 CONTEXT COMPACTION WARNING — accumulated cache_read tokens crossed
-the soft threshold. The SDK process inside the worker container is
-nearing its memory cap; spawning a subagent (debugger, recon) RIGHT
-NOW is the documented trigger that has OOM-killed every recent heap
-chal (jobs 011a6d486d53, 7c4a6a4c7581). What to do — in order:
-
-  1. STOP investigating. Do NOT delegate to debugger or recon.
-  2. If `./exploit.py` exists, verify the JUDGE GATE was run on its
-     CURRENT state and update `./report.md` with the failure
-     hypothesis from your most recent run.
-  3. If `./exploit.py` is incomplete, finalize it from your best
-     hypothesis right now — even a one-shot attempt is more useful
-     than a debugger spawn that OOM's the run before it finishes.
-  4. End your turn cleanly. The orchestrator's auto-retry loop will
-     pick up the postjudge feedback and the next attempt starts
-     with a fresh, smaller context.
-
-If you ignore this and spawn a subagent anyway, the next AGENT_ERROR
-in run.log will reference this very warning. Drafting > debugging
-when context is full.
-"""
-
-
 SOFT_EJECT_USER_TURN = """\
 ⏰ TOOL-CALL BUDGET ALERT — you have burned 80%+ of the
 INVESTIGATION_BUDGET (default 100 tool calls per analyzer run) WITHOUT
@@ -2409,43 +2317,6 @@ why you skipped them. This nudge fires once per job.
 """
 
 
-SUBAGENT_CAP_USER_TURN = """\
-🛑 SUBAGENT SPAWN CAP REACHED — you've spawned the budgeted number
-of subagents for this run. DO NOT call `mcp__team__spawn_subagent`
-(or the legacy `Agent` tool) again this session.
-
-Why this cap exists: each subagent invocation adds its
-final-text reply to your conversation history, and (in the
-legacy in-process path) the subagent's intermediate tool
-calls accumulate into the same Node.js heap that runs you.
-Across a heap-pwn run that produced enough delegations to
-push the worker past its cgroup limit, jobs 011a6d486d53 /
-7c4a6a4c7581 / ff8240803dc2 / 5c5334381583 / c4f49803edfe
-all SIGKILLed at a spawn moment. The cap is the budget, not
-a punishment — you've used what you were given.
-
-What to do INSTEAD:
-
-1. Any debugger work you'd have delegated → run inline with
-   `bash -lc 'gdb -batch -nx -x /tmp/probe.gdb ./prob'`. The
-   `chal-libc-fix` patchelf has already aligned the binary to the
-   chal's libc, so an inline gdb session gives you the same facts
-   without a fresh subagent context.
-
-2. Any recon question → grep / Read on the existing decomp/*.c
-   files directly. The decompiler already ran during autoboot and
-   the recon results from your earlier spawns are still in scope.
-
-3. Finalize ./exploit.py + ./report.md NOW from your best hypothesis.
-   The fallback safety net is still active — but landing a real
-   exploit before any further analysis is the cheaper path.
-
-This warning fires ONCE per job. If you ignore it and try another
-spawn, the orchestrator hard-breaks the receive loop on the next
-spawn attempt and falls back to sandbox dispatch immediately.
-"""
-
-
 _TOKEN_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -2521,25 +2392,6 @@ def agent_heartbeat(job_id: str, msg) -> None:
         if isinstance(model_usage, dict):
             updates["model_usage"] = model_usage
 
-    # Compaction threshold check. Reads CACHE_READ accumulation and
-    # mirrors a `compaction_state` field into meta.json so:
-    #   "ok"       — under SOFT, nothing to do
-    #   "warn"     — between SOFT and HARD; main session should
-    #                soft-eject (drafted by run_main_agent_session).
-    #   "ceiling"  — at/above HARD; main session must terminate
-    #                cleanly so the retry loop can fork a fresh
-    #                session with a smaller starting context.
-    soft, hard = _compaction_thresholds()
-    state = "ok"
-    if soft > 0:
-        cr = int((tokens or {}).get("cache_read_input_tokens") or 0)
-        if cr >= hard:
-            state = "ceiling"
-        elif cr >= soft:
-            state = "warn"
-    if state != "ok":
-        updates["compaction_state"] = state
-
     now = _time.monotonic()
     last = _heartbeat_state.get(job_id, 0.0)
     throttled = (not is_result) and (now - last < _HEARTBEAT_MIN_INTERVAL_S)
@@ -2561,7 +2413,6 @@ def agent_heartbeat(job_id: str, msg) -> None:
     meta_payload: dict = {
         "kind": kind,
         "turns": turns,
-        "compaction_state": state,
     }
     if tokens:
         meta_payload["tokens"] = tokens
@@ -2570,35 +2421,6 @@ def agent_heartbeat(job_id: str, msg) -> None:
     if is_result:
         meta_payload["is_result"] = True
     _publish(job_id, "meta", meta_payload)
-
-
-def get_compaction_state(job_id: str) -> str:
-    """Returns 'ok'|'warn'|'ceiling' based on accumulated cache_read.
-    Used by run_main_agent_session to decide soft-eject vs. hard-abort.
-    Reads the same in-memory accumulator agent_heartbeat updates, so
-    callers don't need to round-trip through meta.json.
-    """
-    soft, hard = _compaction_thresholds()
-    if soft <= 0:
-        return "ok"
-    tok = _token_state.get(job_id) or {}
-    cr = int(tok.get("cache_read_input_tokens") or 0)
-    if cr >= hard:
-        return "ceiling"
-    if cr >= soft:
-        return "warn"
-    return "ok"
-
-
-def mark_compaction_warned(job_id: str) -> bool:
-    """First call returns True (caller should fire the warning); later
-    calls return False (warning already fired this job). One-shot guard
-    so we don't re-warn every turn after the threshold is crossed.
-    """
-    if _compaction_warned.get(job_id):
-        return False
-    _compaction_warned[job_id] = True
-    return True
 
 
 # Per-job map { tool_use_id: subagent_type } — populated when the main
@@ -2738,17 +2560,16 @@ def classify_agent_error(message: str) -> str | None:
     if "auth" in low or "401" in low or "credential" in low:
         return "auth"
     if "exit code -9" in low or "sigkill" in low or "killed by signal 9" in low:
-        return "oom_or_killed"
+        return "killed"
     return "unknown"
 
 
 # Approximate per-million-token prices in USD (Anthropic public pricing,
-# 2026-Q2). Only used as a FALLBACK when the SDK's authoritative
-# `ResultMessage.total_cost_usd` never arrives — the typical case is
-# SIGKILL / OOM on the bundled `claude` CLI before it can emit the
-# final accounting message, which historically left meta.cost_usd at
-# $0.00 even for runs that obviously spent dollars (see the
-# 1d00be30d4e9 / a914ca943ed2 OOM jobs).
+# 2026-Q2). Used as a FALLBACK when the SDK's authoritative
+# `ResultMessage.total_cost_usd` never arrives — e.g. the bundled
+# `claude` CLI gets SIGKILLed mid-stream before emitting the final
+# accounting message, leaving meta.cost_usd at $0.00 even for runs
+# that obviously spent dollars.
 # Tuple shape: (input, cache_create, cache_read, output) per Mtok.
 _MODEL_RATES_USD_PER_MTOK = {
     "opus":   (15.0, 18.75, 1.50, 75.0),
@@ -3331,19 +3152,20 @@ def _pick_present_artifact(
     return None
 
 
-# Minimal pwntools skeleton the orchestrator drops in when budget /
-# compaction / OOM fires WITHOUT main producing an exploit.py. The
-# scaffold's only job is to land SOMETHING runnable so the sandbox +
-# postjudge path activates, which means the next auto-retry hand-off
-# carries an actionable artifact instead of an empty failed job.
-# Loads libc_profile.json if present so re-entries inherit the staged
-# glibc symbols + how2heap recommendation.
+# Minimal pwntools skeleton the orchestrator drops in when the budget
+# is exhausted or the SDK transport dies WITHOUT main producing an
+# exploit.py. The scaffold's only job is to land SOMETHING runnable
+# so the sandbox + postjudge path activates, which means the next
+# auto-retry hand-off carries an actionable artifact instead of an
+# empty failed job. Loads libc_profile.json if present so re-entries
+# inherit the staged glibc symbols + how2heap recommendation.
 _FALLBACK_EXPLOIT_TEMPLATE = '''\
 #!/usr/bin/env python3
-"""Auto-generated fallback exploit — main session exhausted its budget /
-hit OOM before drafting a real exploit. This skeleton exists ONLY so
-the sandbox + postjudge cycle can fire and feed a real retry hint
-into the next attempt. Replace with proper chain on /retry.
+"""Auto-generated fallback exploit — main session exhausted its
+budget or the SDK transport died before drafting a real exploit.
+This skeleton exists ONLY so the sandbox + postjudge cycle can fire
+and feed a real retry hint into the next attempt. Replace with proper
+chain on /retry.
 """
 from __future__ import annotations
 
@@ -3399,9 +3221,9 @@ _FALLBACK_REPORT_TEMPLATE = '''\
 # Fallback report (auto-generated)
 
 **Status**: `exploit_status: aborted` — main session exhausted its tool-call
-budget / hit OOM / hit compaction ceiling without producing a working
-exploit. The orchestrator dropped a probe-only skeleton at `./exploit.py`
-so the sandbox + postjudge cycle still fires.
+budget or the SDK transport died without producing a working exploit.
+The orchestrator dropped a probe-only skeleton at `./exploit.py` so the
+sandbox + postjudge cycle still fires.
 
 ## What the auto-fallback knows
 
@@ -3707,67 +3529,6 @@ async def run_main_agent_session(
             f"user-turn after current turn ends."
         )
 
-    # Subagent-spawn hard cap. With the isolated MCP path each
-    # `spawn_subagent` invocation runs in its own claude CLI
-    # subprocess, but the subagent's final-text reply still grows
-    # main's conversation history (a few KB per spawn). With the
-    # legacy in-process `Agent` path the subagent's WHOLE context
-    # accumulates into main's Node.js heap. Either way, unbounded
-    # delegation eventually pushes the worker past its cgroup
-    # mem_limit. Jobs 011a/7c4a/ff82/5c53/c4f4 all OOMed at a
-    # spawn moment under the legacy path.
-    #
-    # Two-stage enforcement:
-    #
-    #  (a) WARN at cap — fires when summary["subagent_spawns"] == cap.
-    #      Sets `subagent_cap_pending` for post-turn injection of
-    #      SUBAGENT_CAP_USER_TURN. Works only if main yields its
-    #      turn before the next spawn (often it does NOT — see
-    #      job c4f49803edfe: 8 minutes of continuous tool calls
-    #      with no turn boundary).
-    #
-    #  (b) BREAK at cap+1 — when main emits another Agent spawn
-    #      AFTER the cap, we set `subagent_cap_break` and break the
-    #      receive loop on the next yield. Same recovery path as
-    #      compaction_ceiling: idempotent fallback artifact write,
-    #      pending flags cleared, fall through to sandbox dispatch.
-    #      Best-effort against the SDK's fork race; the fallback +
-    #      higher memswap_limit are the layered safety net.
-    subagent_cap_fired = {"value": False}
-    subagent_cap_pending = {"value": False}
-    subagent_cap_break = {"value": False}
-
-    def _maybe_subagent_cap() -> None:
-        try:
-            cap = int(os.environ.get("SUBAGENT_SPAWN_CAP", "4"))
-        except ValueError:
-            cap = 4
-        if cap <= 0:
-            return
-        count = int(summary.get("subagent_spawns", 0))
-        if count >= cap and not subagent_cap_fired["value"]:
-            subagent_cap_fired["value"] = True
-            subagent_cap_pending["value"] = True
-            log_fn(
-                f"SUBAGENT_CAP_REACHED: {count}/{cap} Agent spawns. "
-                f"Will inject 'no more spawns' user-turn after current "
-                f"turn ends."
-            )
-        if count > cap and not subagent_cap_break["value"]:
-            subagent_cap_break["value"] = True
-            log_fn(
-                f"SUBAGENT_CAP_EXCEEDED: {count}/{cap} Agent spawns "
-                f"— breaking receive loop NOW so the in-flight fork "
-                f"is killed before it OOMs the worker."
-            )
-
-    # State for the compaction guard. The SOFT warning is injected
-    # as a user-turn AT MOST ONCE per session. The HARD ceiling
-    # triggers a clean abort + retry-loop fork so the next attempt
-    # starts with a small context.
-    compaction_warn_pending = {"value": False}
-    compaction_ceiling_hit = {"value": False}
-
     # Final-draft last-chance guard. When budget_exceeded fires WITHOUT
     # an artifact, we inject FINAL_DRAFT_USER_TURN and give main ONE
     # more turn to write the draft. Only after that turn also fails to
@@ -3795,90 +3556,6 @@ async def run_main_agent_session(
                         log_user_blocks(job_id, msg)
                     _maybe_soft_eject(summary.get("tool_calls", 0))
                     _maybe_scaffold_nudge(summary.get("tool_calls", 0))
-                    _maybe_subagent_cap()
-                    # If main went past the cap (emitted Agent #cap+1
-                    # without yielding its turn), break the receive
-                    # loop NOW so the SDK kills the in-flight fork
-                    # before it OOMs the worker. Treat the same as
-                    # compaction_ceiling: write fallback + clear
-                    # pending flags + fall through to sandbox dispatch.
-                    if subagent_cap_break["value"]:
-                        count = int(summary.get("subagent_spawns", 0))
-                        try:
-                            cap = int(os.environ.get(
-                                "SUBAGENT_SPAWN_CAP", "4"))
-                        except ValueError:
-                            cap = 4
-                        exploit_missing = not (work_dir / "exploit.py").is_file()
-                        report_missing = not (work_dir / "report.md").is_file()
-                        write_fallback_artifacts(work_dir, log_fn)
-                        if exploit_missing or report_missing:
-                            summary["fallback_artifact_used"] = True
-                        summary["agent_error"] = (
-                            f"subagent spawn cap exceeded "
-                            f"({count}/{cap})"
-                        )
-                        summary["agent_error_kind"] = "subagent_cap"
-                        _snapshot_cost(summary, "SUBAGENT_CAP_EXCEEDED")
-                        final_draft_pending["value"] = False
-                        compaction_warn_pending["value"] = False
-                        soft_eject_pending["value"] = False
-                        scaffold_nudge_pending["value"] = False
-                        subagent_cap_pending["value"] = False
-                        break
-                    # Compaction state check — must come BEFORE
-                    # budget_exceeded so an OOM-imminent run can fork
-                    # rather than abort with "no artifact".
-                    cstate = get_compaction_state(job_id)
-                    if cstate == "ceiling" and not compaction_ceiling_hit["value"]:
-                        compaction_ceiling_hit["value"] = True
-                        cr = int((_token_state.get(job_id) or {}).get(
-                            "cache_read_input_tokens") or 0)
-                        log_fn(
-                            f"COMPACTION_CEILING: cache_read={cr:,} crossed "
-                            f"hard ceiling. Writing fallback artifact + "
-                            f"ending main session so the sandbox path "
-                            "still fires before OOM kills the SDK."
-                        )
-                        # write_fallback_artifacts is idempotent — calls
-                        # are no-ops on files that already exist, so we
-                        # always call it unconditionally to guarantee
-                        # report.md gets drafted even when main wrote
-                        # exploit.py but not the report companion.
-                        exploit_missing = not (work_dir / "exploit.py").is_file()
-                        report_missing = not (work_dir / "report.md").is_file()
-                        write_fallback_artifacts(work_dir, log_fn)
-                        if exploit_missing or report_missing:
-                            summary["fallback_artifact_used"] = True
-                        summary["agent_error"] = (
-                            f"context compaction ceiling reached "
-                            f"(cache_read={cr})"
-                        )
-                        summary["agent_error_kind"] = "compaction_ceiling"
-                        _snapshot_cost(summary, "COMPACTION_CEILING")
-                        # We're at the OOM doorstep — don't feed any
-                        # more user-turn injections into this session.
-                        # Clearing the pending flags lets us skip past
-                        # the post-loop client.query blocks straight to
-                        # sandbox dispatch.
-                        final_draft_pending["value"] = False
-                        compaction_warn_pending["value"] = False
-                        soft_eject_pending["value"] = False
-                        scaffold_nudge_pending["value"] = False
-                        subagent_cap_pending["value"] = False
-                        # Break so sandbox + postjudge still runs with
-                        # the fallback artifact; the job ends as
-                        # no_flag/partial instead of failed.
-                        break
-                    elif cstate == "warn" and mark_compaction_warned(job_id):
-                        compaction_warn_pending["value"] = True
-                        cr = int((_token_state.get(job_id) or {}).get(
-                            "cache_read_input_tokens") or 0)
-                        log_fn(
-                            f"COMPACTION_WARN: cache_read={cr:,} crossed "
-                            f"soft threshold. Will inject finalize-now "
-                            f"user-turn after main's current turn ends."
-                        )
                     # Budget check is SUPPRESSED during the FINAL_DRAFT
                     # turn — `tool_calls` and missing-artifact state
                     # carry over from the previous turn, so re-running
@@ -3951,34 +3628,27 @@ async def run_main_agent_session(
                 kind = classify_agent_error(msg_text)
                 summary["agent_error"] = msg_text
                 summary["agent_error_kind"] = kind
-                # SIGKILL on the bundled `claude` CLI surfaces here as
-                # `Command failed with exit code -9`. Reclassify so the
-                # job's error_kind isn't lost as "unknown".
+                # SIGKILL on the bundled `claude` CLI would surface here
+                # as `Command failed with exit code -9`. Historically
+                # every observed exit -9 was a fratricide from the
+                # debugger subagent's `pkill -f "./prob"` matching its
+                # own cmdline (fixed via pkill -x, see commit 15a5f85);
+                # real cgroup OOM has not been observed. Classify as
+                # "killed" if we get an unknown -9; the sandbox path
+                # below still picks up whatever main managed to write.
                 if kind in (None, "unknown") and (
                     "exit code -9" in msg_text or "killed" in msg_text.lower()
                 ):
-                    summary["agent_error_kind"] = "oom_or_killed"
+                    summary["agent_error_kind"] = "killed"
                 log_fn(f"AGENT_ERROR ({summary['agent_error_kind']}): {msg_text[:400]}")
                 _snapshot_cost(summary, "AGENT_ERROR")
-                # OOM/SIGKILL/timeout: keep the run alive. Even if main
-                # already wrote exploit.py, the receive loop blew up
-                # before we could dispatch the sandbox — so we MUST fall
-                # through to the sandbox/postjudge block below instead of
-                # returning early (job ff8240803dc2: exploit.py present
-                # but sandbox=null because this branch short-circuited).
-                # write_fallback_artifacts is idempotent — it only writes
-                # files that are actually missing — so a partial drop
-                # (e.g. main wrote exploit.py but not report.md) still
-                # gets a companion report drafted.
-                # `.get()` (not direct indexing): when compaction-ceiling /
-                # OOM-guard env vars are set to 0 the agent can finish cleanly
-                # and the key is never set — KeyError'd job e36ae35755e0
-                # ($11.82 wasted) on the way through this branch on
-                # 2026-05-14.
-                if summary.get("agent_error_kind") in (
-                    "oom_or_killed", "compaction_ceiling", "timeout",
-                    "subagent_cap",
-                ):
+                # SDK transport may have died on this exception. Keep
+                # the run alive: drop a fallback artifact if main never
+                # wrote one, clear pending user-turn injections, and
+                # fall through to sandbox dispatch. The fallback path
+                # makes the job end as no_flag/partial instead of
+                # failed even if main didn't produce a real exploit.
+                if summary.get("agent_error_kind") in ("killed", "timeout"):
                     exploit_missing = not (work_dir / "exploit.py").is_file()
                     report_missing = not (work_dir / "report.md").is_file()
                     write_fallback_artifacts(work_dir, log_fn)
@@ -3997,17 +3667,9 @@ async def run_main_agent_session(
                             " fired but main already produced both "
                             "artifacts — proceeding to sandbox"
                         )
-                    # SDK client is dead after this exception (the
-                    # underlying `claude` CLI got SIGKILLed). Clear any
-                    # pending user-turn injections so the post-loop
-                    # blocks below don't try `client.query(...)` on a
-                    # broken transport and crash a second time. We want
-                    # to land in the sandbox/postjudge dispatch instead.
                     final_draft_pending["value"] = False
-                    compaction_warn_pending["value"] = False
                     soft_eject_pending["value"] = False
                     scaffold_nudge_pending["value"] = False
-                    subagent_cap_pending["value"] = False
                 else:
                     return last_sandbox
 
@@ -4019,29 +3681,6 @@ async def run_main_agent_session(
                 final_draft_pending["value"] = False
                 log_fn("[orchestrator] injecting FINAL_DRAFT last-chance user-turn")
                 await client.query(FINAL_DRAFT_USER_TURN)
-                continue
-
-            # ---- Subagent-spawn cap injection ----
-            # Fires when summary["subagent_spawns"] crosses
-            # SUBAGENT_SPAWN_CAP. Higher priority than the other
-            # injections because the next concurrent SDK CLI fork is
-            # the documented OOM trigger (5c5334381583: 3.1M cache_read
-            # + 3rd Agent spawn → SIGKILL).
-            if subagent_cap_pending["value"]:
-                subagent_cap_pending["value"] = False
-                log_fn("[orchestrator] injecting subagent-cap user-turn")
-                await client.query(SUBAGENT_CAP_USER_TURN)
-                continue
-
-            # ---- Compaction soft warning injection ----
-            # If we crossed the SOFT threshold inside the just-ended
-            # turn, inject the COMPACTION_USER_TURN now and let main
-            # respond (finalize the artifact, no subagent spawns). The
-            # ceiling case was already handled inline above (clean abort).
-            if compaction_warn_pending["value"]:
-                compaction_warn_pending["value"] = False
-                log_fn("[orchestrator] injecting compaction warning user-turn")
-                await client.query(COMPACTION_USER_TURN)
                 continue
 
             # ---- Soft-eject (budget 80%) user-turn injection ----
@@ -4111,20 +3750,15 @@ async def run_main_agent_session(
                 )
                 return last_sandbox
 
-            # If the SDK client died on this attempt (OOM / SIGKILL /
-            # timeout / compaction-ceiling), the transport is dead and
-            # any `client.query(retry_hint)` below would crash again.
-            # The sandbox + judge we just ran is the rescue value of
-            # this job — surface it and stop instead of trying to feed
-            # postjudge back into a broken session.
+            # If the SDK transport died on this attempt (SIGKILL /
+            # timeout), any `client.query(retry_hint)` below would
+            # crash again. The sandbox + judge we just ran is the
+            # rescue value of this job — surface it and stop instead
+            # of trying to feed postjudge back into a broken session.
             # `.get()` (not direct indexing): the key is only set on
-            # abnormal SDK termination paths (3526/3562/3647/3658/3665);
-            # a clean DONE leaves it absent. Direct [] KeyError'd job
-            # e36ae35755e0 after the agent + sandbox both succeeded.
-            if summary.get("agent_error_kind") in (
-                "oom_or_killed", "compaction_ceiling", "timeout",
-                "subagent_cap",
-            ):
+            # abnormal SDK termination paths; a clean DONE leaves
+            # it absent.
+            if summary.get("agent_error_kind") in ("killed", "timeout"):
                 log_fn(
                     f"[orchestrator] client died this attempt "
                     f"({summary.get('agent_error_kind')}); surfacing sandbox "
