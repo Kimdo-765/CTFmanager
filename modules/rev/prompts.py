@@ -74,15 +74,14 @@ Patchelfs the binary against the chal's bundled libc first if one
 is provided. Useful when the binary computes something at runtime
 that's tedious to invert statically (or when it self-modifies):
 
-  Agent(
-    description="trace decryption loop",
+  mcp__team__spawn_subagent(
     subagent_type="debugger",
     prompt=(
-      "GOAL: print the dynamically-computed key bytes\\n"
-      "BINARY: ./bin/foo\\n"
-      "INPUT: 'AAAAAAAAAAAAAAAA' (16 bytes)\\n"
-      "BREAKPOINTS: at xor_loop+0x14, dump *(char*)$rdi for 16 iters\\n"
-      "CONSTRAINTS: stripped binary, key derived from time(NULL)\\n"
+      "GOAL: print the dynamically-computed key bytes\n"
+      "BINARY: ./bin/foo\n"
+      "INPUT: 'AAAAAAAAAAAAAAAA' (16 bytes)\n"
+      "BREAKPOINTS: at xor_loop+0x14, dump *(char*)$rdi for 16 iters\n"
+      "CONSTRAINTS: stripped binary, key derived from time(NULL)\n"
     ),
   )
 

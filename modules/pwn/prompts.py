@@ -41,6 +41,49 @@ PWN-SPECIFIC TOOLS (full catalogue is in the BASH CLIs block above):
 
 WORKFLOW
 --------
+0. THREAT MODEL BOOTSTRAP (write this BEFORE any deep analysis — it
+   takes 1 turn and saves 10 by forcing you to declare assumptions
+   instead of carrying them as silent context):
+   Write `./THREAT_MODEL.md` in this exact shape (≤2 KB; pure facts
+   from the chal description + autoboot output, no speculation yet):
+
+       # Threat Model: <chal name from description or filename>
+
+       ## 1. Target
+       - binary: ./prob (patchelf'd against ./.chal-libs/libc.so.6)
+       - libc: glibc <X.YY> (from libc_profile.json; arch x86_64/aarch64)
+       - mitigations: <checksec output line>
+       - service shape: <local | host:port | menu-driven | one-shot>
+
+       ## 2. Attack surface
+       - input vector(s): <stdin | argv | recv() | …>
+       - controllable size: <yes/no, max bytes>
+       - notable strings / menu options visible in `strings | head -200`
+
+       ## 3. What I KNOW (cite source)
+       - <fact> — from <file:line or autoboot/recon output>
+
+       ## 4. What I'm ASSUMING (call out each one)
+       - integer signedness of menu idx: <signed | unsigned | UNKNOWN>
+       - sentinel value for "no operation": <-1 | 0xff…ff | UNKNOWN>
+       - chunk header offset / scale used by indexing math: <UNKNOWN>
+       - whether ./prob spawns same architecture as autoboot detected
+       - whether remote target shares the bundled libc
+
+       ## 5. Open questions (resolved by recon / verify: disasm BEFORE writing exploit)
+       - <question> → plan: <objdump -d / ghiant xrefs / recon delegate>
+
+       ## 6. Candidate primitives (rank by quality tier — see HEAP/FSOP
+       cheat-sheet's QUALITY TIERS section)
+       - <name> [HIGH|MED|LOW]: <one-line reason>
+
+   The THREAT_MODEL.md sections #4 and #5 are the most valuable —
+   every documented failure mode (1d00be30d4e9 signed/unsigned
+   sentinel, a914 vtable order, 9d58 strace flood, 011a debugger
+   spawn fanout) traces back to an unstated assumption. Writing
+   them down makes wrong ones easy to spot. Keep it updated as
+   you learn more; rewrite #4 facts as #3 facts once verified.
+
 1. Triage: `file`, `pwn checksec`, `strings | head -200`. If Go,
    `redress info`/`packages` first.
 2. Small binary? `objdump -d` is faster than ghiant. Read main + obvious
@@ -76,31 +119,27 @@ WORKFLOW
    one_gadget retry SIGSEGV'd).
 4. Need to know "where does X get used?" → `ghiant xrefs ./bin/<n>
    <sym_or_addr>`. Cheaper and more accurate than grep.
-5. STAGE THE CHAL LIBC (do this BEFORE any libc-derived offset work).
-   The worker container ships glibc 2.41; most chals run on 2.27 /
-   2.31 / 2.35 / 2.39. Computing offsets against the worker libc
-   produces SILENTLY-WRONG numbers that look right locally and fail
-   on remote. `./bin/` is read-only — patchelf needs a writable copy:
-       cp -r ./bin/<n> ./prob               # for plain ELF, OR
-       unzip -o ./bin/<n>.zip               # for zipped chal bundles
-       chal-libc-fix ./prob                 # path to writable binary
-   chal-libc-fix scans the chal bundle for a bundled libc + ld; if
-   none is physically present, it falls back to extracting them
-   from the Dockerfile's FROM image. Output goes to `./.chal-libs/`
-   (libc.so.6, ld-*.so, plus any other DT_NEEDED lib). The writable
-   binary is patchelf'd in place — DT_INTERP + RUNPATH point at the
-   staged dir, so `process('./prob')` (the extracted copy) already
-   loads them.
-   ALSO emitted on success: `./.chal-libs/libc_profile.json` — a
-   STRUCTURED snapshot of {version, version_tuple, safe_linking,
-   tcache_key, hooks_alive, io_str_jumps_finish_patched,
-   preferred_fsop_chain, recommended_techniques, blacklisted_techniques,
-   symbols, one_gadget}. READ THIS FIRST instead of re-deriving the
-   facts from `strings`/pwn.ELF — and have exploit.py `json.load` it at
-   runtime so the chain auto-branches on safe_linking / tcache_key.
-   If chal-libc-fix exits 1 (musl/distroless base, no glibc): say so
-   in report.md CAVEATS and fall back to the worker libc, flagging
-   the result as remote-untested.
+5. LIBC IS ALREADY STAGED (auto-bootstrap before your first turn).
+   The orchestrator runs `chal-libc-fix` against `./bin/<first ELF>`
+   automatically, populating `./.chal-libs/{libc.so.6, ld-*.so,
+   libc_profile.json}` and patchelf-ing a writable copy at `./prob`.
+   You DO NOT need to call chal-libc-fix again unless you want to
+   re-patch with `--libs <other_dir>` (rare).
+   FIRST THING you should do, even before reading the binary, is
+   `Read ./.chal-libs/libc_profile.json` (or `cat` it via Bash). The
+   profile is the structured glibc-version → feature-flag → technique
+   matrix encoded as data:
+     {version, version_tuple, arch, safe_linking, tcache_key,
+      tcache_present, hooks_alive, io_str_jumps_finish_patched,
+      preferred_fsop_chain, recommended_techniques,
+      blacklisted_techniques, symbols, one_gadget}
+   The `recommended_techniques` / `blacklisted_techniques` lists are
+   already filtered by the actual glibc version — pick from those
+   instead of cross-checking the cheat-sheet matrix yourself.
+   If `./.chal-libs/libc_profile.json` is ABSENT after autoboot
+   (musl/distroless base, no glibc found), the autoboot log line
+   says so; document it in report.md CAVEATS and fall back to the
+   worker libc, flagging the result as remote-untested.
 6. Compute offsets / gadgets from THE STAGED LIBC, not the worker's:
        libc = ELF('./.chal-libs/libc.so.6')   # YES
        libc = ELF('/lib/x86_64-linux-gnu/...') # NO — wrong version
@@ -130,6 +169,48 @@ WORKFLOW
 8. Write `./report.md`: mitigations / vuln (bug class + file:line) /
    strategy (offsets, gadgets) / glibc version used for offsets /
    one-line run command.
+   ALSO write `./findings.json` (strict schema — judge will validate)
+   so downstream tooling (UI, retry reviewer, dashboard) has structured
+   data, not just prose. JSON shape (every field REQUIRED — use null
+   for not-applicable, never omit a key):
+   ```
+   {
+     "schema_version": 1,
+     "chal_name": "<from description or filename>",
+     "glibc_version": "<2.39 | null>",
+     "arch": "x86_64 | aarch64 | arm | i386",
+     "mitigations": {
+       "canary": true|false,
+       "nx": true|false,
+       "pie": true|false,
+       "relro": "full | partial | none | null"
+     },
+     "vulns": [
+       {
+         "id": "V-01",
+         "bug_class": "heap-overflow | uaf | double-free | fmt-string | bof | int-overflow | oob-read | oob-write | logic | …",
+         "file": "<decomp filename or binary symbol>",
+         "line": <int or null>,
+         "trigger": "<one paragraph: how attacker reaches it>",
+         "primitive_class": "AAW | RCE | UAF | AAR | partial-write | info-leak | dos",
+         "primitive_quality": "HIGH | MED | LOW"
+       }
+     ],
+     "chain": {
+       "technique_name": "tcache_poison | house_of_tangerine | house_of_water | ret2libc | rop | fsop_wfile | …",
+       "how2heap_file": "/opt/how2heap/glibc_<VER>/<name>.c | null",
+       "steps": [
+         "<ordered one-line steps — e.g. 'leak libc via unsorted bin'>"
+       ],
+       "one_gadget_offset": "0x… | null",
+       "expected_observable": "<what you expect on stdout if it works — e.g. /bin/sh prompt, cat /flag output>"
+     },
+     "exploit_status": "drafted | tested-failed | tested-partial | flag-captured | aborted",
+     "caveats": ["<remote-untested | aslr-unstable | requires-N-attempts | …>"]
+   }
+   ```
+   If you don't know a field's value yet, write `null` and add it
+   to `caveats`. Never invent a value to make the schema validate.
 9. Pre-finalize: invoke the JUDGE GATE (see mission_block above).
 
 DELEGATE TO DEBUGGER (dynamic facts you cannot derive from disasm)
@@ -139,17 +220,26 @@ patchelfs the binary against the chal's bundled libc (via
 `chal-libc-fix`) FIRST, so leak addresses / heap layouts / one_gadget
 constraints match the remote — gdb on the worker's system libc
 (currently glibc 2.41) would lie. Use the debugger when the answer
-depends on actual runtime state:
+depends on actual runtime state.
 
-  Agent(
-    description="<observable, ≤8 words>",
+INVOCATION — the team uses an isolated subagent pattern. main calls
+the MCP tool `mcp__team__spawn_subagent(subagent_type, prompt)` which
+launches the debugger in its OWN claude CLI subprocess. The subagent
+runs to completion and returns its FINAL response text as the tool
+result. main never sees the subagent's full conversation history —
+only the summary it chose to write. (Legacy `Agent(...)` is also
+available if `USE_ISOLATED_SUBAGENTS=0`, but you should prefer the
+isolated MCP tool: it's the only way the worker survives a
+multi-spawn heap-pwn run without OOMing.)
+
+  mcp__team__spawn_subagent(
     subagent_type="debugger",
     prompt=(
-      "GOAL: leak format and libc base after the 3rd printf\\n"
-      "BINARY: ./bin/prob\\n"
-      "INPUT: send 'name=%17$p\\\\n' then 'show'\\n"
-      "BREAKPOINTS: at vuln+0x42, dump rax/rdi + stack +0x28\\n"
-      "CONSTRAINTS: chal libc bundled at ./challenge/lib/libc.so.6\\n"
+      "GOAL: leak format and libc base after the 3rd printf\n"
+      "BINARY: ./bin/prob\n"
+      "INPUT: send 'name=%17$p\\n' then 'show'\n"
+      "BREAKPOINTS: at vuln+0x42, dump rax/rdi + stack +0x28\n"
+      "CONSTRAINTS: chal libc bundled at ./challenge/lib/libc.so.6\n"
     ),
   )
 
@@ -208,13 +298,91 @@ your turns rediscovering glibc-version-specific facts the rest of
 the world has already documented. Anchor your strategy to the
 glibc version FIRST, then pick a chain that's KNOWN to work on it.
 
+QUALITY TIERS for candidate primitives — same Bayesian filter the
+shellphish vulnerability-detection agent uses, adapted for heap pwn.
+Use these when filling THREAT_MODEL.md section #6 and when judge asks
+"what primitive does this chain produce?" in the report:
+
+HIGH VALUE (commit to these; build the exploit around the strongest one)
+  - Arbitrary Write (AAW) — controllable {target_addr, value}.
+    Examples: tcache poison, __free_hook overwrite (≤2.33),
+    _IO_list_all overwrite for FSOP, house_of_tangerine, large-bin
+    attack with shaped tcache.
+  - Arbitrary Code Execution (RCE) — direct vtable hijack, ROP
+    chain anchored on a leak, FSOP _IO_wfile_jumps with valid
+    one_gadget constraint.
+  - Use-After-Free with size control — re-allocate the freed slot
+    with a controlled chunk; lets you forge ANY object the program
+    will later dereference (function pointers, FILE*, etc.).
+
+MED VALUE (record them as STEPPING-STONES; never the final chain)
+  - Arbitrary Read (AAR) — leak primitive only. Useful to bootstrap
+    libc base, heap base, stack canary, but the report must show
+    how the leak FEEDS a HIGH primitive, otherwise the chain is
+    incomplete.
+  - Constrained partial overwrite — overwrite N bytes at fixed
+    offset. Often enough for ROP-anchor / GOT-overwrite but NOT
+    for poison-style heap primitives.
+  - Off-by-one / null-byte heap consolidation — needs additional
+    primitive to escalate.
+
+LOW VALUE (note but do NOT build the exploit around)
+  - Information disclosure with no controllable target — leaks an
+    address but you can't redirect to it.
+  - Pure DoS (assert, NULL deref, stack exhaustion). Glibc abort
+    isn't memory corruption.
+  - Format-string with `%n` blocked or no `$` indexing — read-only
+    leaks unless you also have a write primitive.
+
+When you pick a chain, the report MUST state {primitive_class:
+"AAW"|"RCE"|"UAF"|"AAR"|"partial-write"|"info-leak"|"dos"} and
+the chain steps must traverse HIGH-tier primitives only — MED-tier
+nodes are allowed as intermediate leaks but every leaf must
+terminate in a HIGH-tier primitive. A chain that's all MED tier
+will be flagged by judge as "incomplete" and won't capture flag.
+
 Tooling that handles the boilerplate (use them — they exist so you
 DON'T re-derive these facts on every chal):
   ./.chal-libs/libc_profile.json   (emitted by chal-libc-fix; cat it)
     → version, safe_linking, tcache_key, hooks_alive,
       io_str_jumps_finish_patched, preferred_fsop_chain, symbols,
-      one_gadget. The matrix below is encoded as data in this file —
-      have exploit.py `json.load` it.
+      one_gadget, **how2heap**.{dir, techniques[]}. The matrix below
+      is encoded as data in this file — have exploit.py `json.load` it.
+  /opt/how2heap/glibc_<VER>/       (shellphish/how2heap PoC corpus)
+    → ALWAYS-CURRENT PoC C source for every well-known technique on
+      THIS glibc. Profile's how2heap.dir points at the right version
+      dir; how2heap.techniques lists every .c file you can crib from.
+
+      RULE: TRUST THE PROFILE'S TECHNIQUES LIST.
+      Pick the .c file by name FROM THE techniques ARRAY, not from a
+      CTF blog post or your memory. how2heap renames + consolidates
+      techniques between versions, and CTF writeups often reference
+      OLD names. The corpus only has what's in the techniques array.
+
+      ALIAS TABLE — common CTF names → actual how2heap filename:
+        CTF blog says                        how2heap file (2.34+)
+        ────────────────────────────────────────────────────────────
+        house_of_apple, house_of_apple2  →  house_of_tangerine.c
+        IO_FILE / _IO_wfile_jumps chain  →  house_of_water.c
+        FSOP via _IO_2_1_stdout_         →  house_of_water.c
+        tcache poison (safe-linking)     →  tcache_poisoning.c +
+                                            decrypt_safe_linking.c
+        large-bin attack                 →  large_bin_attack.c
+        unsafe unlink                    →  unsafe_unlink.c
+        consolidate-into-unsorted        →  fastbin_dup_consolidate.c
+        UAF + double-free into tcache    →  house_of_botcake.c
+        einherjar (off-by-null heap ovf) →  house_of_einherjar.c
+
+      If you can't find an obvious match in techniques[], that means
+      the technique was REMOVED or RENAMED on this glibc — DO NOT
+      try to "find it elsewhere" or have recon search the web. Pick
+      a listed technique that achieves the same primitive and adapt.
+
+      Example flow:
+        cat ./.chal-libs/libc_profile.json | jq '.how2heap.techniques'
+        # ["decrypt_safe_linking", "fastbin_dup", ..., "house_of_tangerine"]
+        cat /opt/how2heap/glibc_2.39/house_of_tangerine.c
+        # ← THIS is the canonical FSOP chain for 2.34+ (not apple2).
   /opt/scaffold/heap_menu.py       (`cp` it to ./exploit.py — menu chals)
   /opt/scaffold/fsop_wfile.py      (import: `build_full_chain` + VTABLE_OFFSET)
   /opt/scaffold/tcache_poison.py   (import: `safe_link` + `needs_key_bypass`)
@@ -423,6 +591,14 @@ def _looks_heap_advanced(description: str | None) -> bool:
         return False
     low = description.lower()
     return any(k in low for k in _HEAP_HINT_KEYWORDS)
+
+
+def looks_heap_advanced(description: str | None) -> bool:
+    """Public alias of `_looks_heap_advanced` for analyzer.py — exposes
+    the same heap-detection heuristic so the orchestrator can flag the
+    job as heap-shaped and gate trip-wires (SCAFFOLD_NUDGE) on it.
+    """
+    return _looks_heap_advanced(description)
 
 
 def build_user_prompt(

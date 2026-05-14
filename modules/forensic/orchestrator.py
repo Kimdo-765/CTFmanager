@@ -128,12 +128,23 @@ async def _claude_summary(
 ) -> dict:
     work_dir = _job_dir(job_id)
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
+    # Per-job scratch dir (see modules/_common.py make_main_session_options
+    # for rationale). Cleanup is implicit via job DELETE rmtree.
+    tmp_dir = Path(work_dir) / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    _tmp_str = str(tmp_dir)
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         model=model,
         cwd=str(work_dir),
         allowed_tools=["Read", "Bash", "Glob", "Grep", "Write"],
         permission_mode="bypassPermissions",
+        env={
+            "JOB_ID": job_id,
+            "TMPDIR": _tmp_str,
+            "TMP":    _tmp_str,
+            "TEMP":   _tmp_str,
+        },
     )
     prompt = build_user_prompt(target_os, kind, description)
     _log(job_id, f"Launching Claude summary agent (model={model})")

@@ -233,6 +233,17 @@ def run_in_sandbox(
         env["CALLBACK_URL"] = cb
         env["COLLECTOR_URL"] = f"{cb.rstrip('/')}/api/collector/{job_id}"
 
+    # Per-job scratch dir inside the sandbox. Host path
+    # /data/jobs/<id>/tmp/ ↔ container path <workdir>/tmp/. The host
+    # dir is created in attempt_sandbox_run before this is reached;
+    # we set the env vars unconditionally so tempfile.* in the
+    # exploit lands inside the job's bind-mount (cleaned up by job
+    # DELETE rmtree) instead of the shared container /tmp.
+    _sandbox_tmp = f"{workdir}/tmp"
+    env["TMPDIR"] = _sandbox_tmp
+    env["TMP"]    = _sandbox_tmp
+    env["TEMP"]   = _sandbox_tmp
+
     client = docker.from_env()
     container = client.containers.run(
         image=image,
@@ -321,6 +332,10 @@ def attempt_sandbox_run(
     if not (work_dir / script_filename).exists():
         log_fn(f"[runner] {script_filename} missing, cannot auto-run")
         return None
+
+    # Per-job scratch dir for sandboxed exploit (sees it as /work/tmp).
+    # Cleanup is implicit via job DELETE rmtree on /data/jobs/<id>/.
+    (work_dir / "tmp").mkdir(parents=True, exist_ok=True)
 
     enable_judge = _judge_enabled()
 

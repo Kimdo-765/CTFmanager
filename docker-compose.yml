@@ -42,16 +42,38 @@ services:
     build:
       context: .
       dockerfile: worker/Dockerfile
-    # Cap worker memory so a runaway heap-chal exploit loop or a
-    # debugger subagent spawning concurrent ./prob + gdb instances
-    # can't trigger the host OOM-killer (which kills the bundled
-    # `claude` CLI as the largest process — surfaced as
-    # `Command failed with exit code -9` and a lost run). With a
-    # cgroup limit the OOM stays inside the container; the SDK
-    # session ends cleanly with an error_kind we can classify.
-    # Override via .env if you have a different RAM budget.
-    mem_limit: ${WORKER_MEM_LIMIT:-8g}
-    memswap_limit: ${WORKER_MEM_LIMIT:-8g}
+    # Cap worker memory so a runaway heap-chal exploit loop or
+    # cumulative subagent context bloat can't trigger the host
+    # OOM-killer. With a cgroup limit the OOM stays inside the
+    # container; the SDK session ends cleanly with an error_kind
+    # we can classify, the fallback artifact path runs, and the
+    # sandbox + judge cycle still completes. Override via .env
+    # for hosts with different RAM budgets.
+    #
+    # History:
+    #   - 8g → 12g (job 011a6d486d53): legacy in-process subagent
+    #     path accumulated debugger context into main's Node.js
+    #     heap; OOMed at ~3.6M cache_read.
+    #   - 12g → 14g (job 5c5334381583): OOM at 3.1M cache_read
+    #     — single-process heap growth, NOT the fork-spike model
+    #     older comments suggested. Verified by reading the SDK's
+    #     subprocess_cli.py + query.py: each ClaudeSDKClient owns
+    #     ONE claude CLI Node.js subprocess; AgentDefinitions are
+    #     sub-conversations inside that process, not separate
+    #     OS-level forks.
+    #   - 14g RAM + 18g memswap (job c4f49803edfe): 4Gi of host
+    #     swap dedicated to worker absorbs heap growth during
+    #     long heap-pwn investigations. Host has 15Gi RAM + 4Gi
+    #     swap; leaves ~1Gi free for API/Redis/system.
+    #
+    # The MCP isolated-subagent path (USE_ISOLATED_SUBAGENTS=1,
+    # default ON) reduces the cumulative-heap pressure
+    # significantly because each subagent now runs in its own
+    # claude CLI subprocess and only its final-text reply lands
+    # in main's history. These limits are still load-bearing for
+    # the legacy fallback path and for runaway exploit loops.
+    mem_limit: ${WORKER_MEM_LIMIT:-14g}
+    memswap_limit: ${WORKER_MEMSWAP_LIMIT:-18g}
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
@@ -64,9 +86,16 @@ services:
       # (Sonnet/Opus ~64k) becomes the effective limit. Override in
       # .env to throttle if needed.
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: ${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-999999}
-      # Trip-wire: kill investigation-loop runaway before the SDK
-      # exhausts its conversation context. 0 disables.
-      INVESTIGATION_BUDGET: ${INVESTIGATION_BUDGET:-0}
+      # Trip-wire: at this many tool calls without an artifact, the
+      # orchestrator FALLS BACK to a probe-only skeleton at exploit.py
+      # so the sandbox + postjudge path still runs (job ends as
+      # no_flag/partial instead of failed). Default raised 100 → 150
+      # after jobs d8de/0bb1/13a3 hit budget cleanly but never produced
+      # an artifact even after FINAL_DRAFT push; the higher cap gives
+      # Sonnet-4.6 enough rope to land a real draft while the fallback
+      # path guarantees the run never aborts. A soft eject + scaffold
+      # nudge fire well before the cap; the fallback is the safety net.
+      INVESTIGATION_BUDGET: ${INVESTIGATION_BUDGET:-150}
       # Max postjudge-driven auto retries within a single job (in
       # addition to the first attempt). When auto_run is on and the
       # sandbox returns a non-success verdict with an actionable
@@ -80,6 +109,25 @@ services:
       #     soft/hard timeout
       # Default: -1 (unlimited). Override via .env if you want a cap.
       AUTO_RETRY_MAX: ${AUTO_RETRY_MAX:--1}
+      # Context-compaction guard. When the accumulated
+      # `cache_read_input_tokens` for the main session crosses
+      # CONTEXT_COMPACTION_THRESHOLD (SOFT), the orchestrator injects a
+      # "finalize now, no subagent spawns" user-turn. When it crosses
+      # CONTEXT_COMPACTION_HARD_CEILING, the main session is aborted
+      # cleanly so the auto-retry loop forks a fresh session before the
+      # SDK CLI gets OOM-killed (the documented failure mode of jobs
+      # 011a6d486d53 / 7c4a6a4c7581). Set SOFT=0 to disable both.
+      #
+      # HARD lowered 14M → 10M after job ff8240803dc2: real RAM usage
+      # crossed the 12g cgroup limit at ~11.3M cache_read tokens, well
+      # below the prior 14M ceiling, so the orchestrator never got a
+      # chance to fork cleanly — the CLI was SIGKILLed by the kernel
+      # first. The new ceiling fires the clean-abort path at 10M so
+      # we always beat the OS OOM-killer to it. SOFT stays at 6M so the
+      # warning fires comfortably before the ceiling, giving main one
+      # full turn to finalize without subagents.
+      CONTEXT_COMPACTION_THRESHOLD: ${CONTEXT_COMPACTION_THRESHOLD:-6000000}
+      CONTEXT_COMPACTION_HARD_CEILING: ${CONTEXT_COMPACTION_HARD_CEILING:-10000000}
     volumes:
       - ./data:/data
       - ./modules:/app/modules:ro

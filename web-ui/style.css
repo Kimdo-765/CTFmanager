@@ -512,6 +512,20 @@ button[type="submit"], #refresh-jobs {
   white-space: nowrap;
   letter-spacing: 0.2px;
 }
+/* Live Δ inside the tokens pill — refreshed every poll cycle so the
+   run-log footer feels like Claude Code's "↓ X tokens" status line.
+   `.idle` is when the poll cycle saw zero growth — a quick visual
+   hint that the agent is silent (paired with the liveness pill's
+   silent/dead state). */
+.tokens-pill .tokens-delta {
+  margin-left: 0.45em;
+  font-weight: 600;
+  color: #3fb950;
+}
+.tokens-pill .tokens-delta.idle {
+  color: #6e7681;
+  font-weight: 400;
+}
 #job-detail pre {
   background: #161b22;
   padding: 0.75rem;
@@ -643,6 +657,81 @@ button[type="submit"], #refresh-jobs {
 .markdown-rendered hr {
   border: 0; border-top: 1px solid #30363d; margin: 1rem 0;
 }
+
+/* Live SDK activity panel — fixed-height log-tail above the run-log.
+   Each AssistantMessage block (text / thinking / tool_use / tool_result)
+   becomes ONE row inside a stable container. No card chrome, no
+   animations — the panel size never reflows when new events arrive. */
+.sdk-live {
+  margin: 0 0 0.6rem;
+  background: #0d1117;
+  border: 1px solid #1f2933;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.sdk-live.collapsed .sdk-live-feed { display: none; }
+.sdk-live-head {
+  display: flex; align-items: center; gap: 0.45rem;
+  background: linear-gradient(#1d232c, #14181f);
+  border-bottom: 1px solid #1f2933;
+  padding: 0.3rem 0.65rem;
+  font-size: 0.72rem;
+  color: #8b949e;
+  letter-spacing: 0.4px;
+  user-select: none;
+}
+.sdk-live.collapsed .sdk-live-head { border-bottom: 0; }
+.sdk-live-dot {
+  display: inline-block; width: 0.5rem; height: 0.5rem;
+  border-radius: 50%;
+  background: #58a6ff;
+  opacity: 0.85;
+}
+.sdk-live-label {
+  text-transform: uppercase;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.sdk-live-toggle {
+  margin-left: auto;
+  background: #21262d;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  padding: 0.05rem 0.5rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.68rem;
+  cursor: pointer;
+  user-select: none;
+}
+.sdk-live-toggle:hover { background: #30363d; color: #f0f6fc; }
+.sdk-live-feed {
+  display: block;
+  padding: 0.35rem 0.6rem;
+  height: 200px;            /* fixed — no reflow when new events arrive */
+  overflow-y: auto;
+  background: #0b0d12;
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code",
+               SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+.sdk-line {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0;
+  color: #d6d3c0;
+}
+.sdk-line-tag   { color: #8b949e; }
+.sdk-line-body  { color: #d6d3c0; }
+.sdk-text  .sdk-line-label { color: #58a6ff; font-weight: 600; }
+.sdk-think .sdk-line-label { color: #6e7681; }
+.sdk-think .sdk-line-body  { color: #8b949e; font-style: italic; }
+.sdk-tool  .sdk-line-label { color: #d29922; font-weight: 600; }
+.sdk-result .sdk-line-label { color: #3fb950; font-weight: 600; }
+.sdk-error  .sdk-line-label { color: #f85149; font-weight: 600; }
+.sdk-error  .sdk-line-body  { color: #ff7b72; }
+
 
 /* Run log "terminal" chrome: a window frame around the <pre>, with a
    macOS-style traffic-light header. Plain visual upgrade — does not

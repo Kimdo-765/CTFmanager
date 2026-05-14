@@ -64,6 +64,18 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 COPY worker/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# angr — installed in an isolated layer, no-deps from system pip so the
+# core requirements.txt resolver can't be blocked by angr's pinned
+# unicorn rc (which conflicts with our capstone>=5). The `|| true`
+# guarantees that a broken angr release on PyPI cannot break the
+# entire worker image — the agent just won't have symbolic execution
+# until the conflict is fixed upstream. Pinned to a known-good
+# release that brings its own resolved dep tree.
+ARG ANGR_VERSION=9.2.214
+RUN pip install --no-cache-dir "angr==${ANGR_VERSION}" 2>&1 | tail -5 || true \
+ && python3 -c "import angr; print('angr OK', angr.__version__)" 2>&1 \
+   || echo "[WARN] angr install failed; symbolic-execution tooling unavailable"
+
 # one_gadget — finds libc one-shot RCE gadgets (constraints + offset).
 # Standard tool the pwn agent reaches for after locating libc; cheaper
 # than building a full ROP chain when one_gadget conditions hold.
@@ -153,11 +165,32 @@ RUN ln -sf /app/worker/chal_libc_fix.py /usr/local/bin/chal-libc-fix \
 RUN ln -sf /app/worker/heap_probe.py /usr/local/bin/heap-probe \
  && chmod +x /app/worker/heap_probe.py
 
+# Expose `gdb-clean` — gdb wrapper that strips GEF's per-invocation
+# banner (~1 KB of "X commands loaded and Y functions added" + ANSI
+# color codes) so the debugger subagent gets clean, terse output.
+# Source `gdb-init.py` first inside a probe to additionally disable
+# GEF's auto-printed context panel on every stop.
+RUN ln -sf /app/worker/gdb_clean.sh /usr/local/bin/gdb-clean \
+ && chmod +x /app/worker/gdb_clean.sh \
+ && mkdir -p /opt/scaffold \
+ && ln -sf /app/worker/gdb_init.py /opt/scaffold/gdb-init.py
+
 # Copy-paste exploit scaffolds for heap-pwn chals. The main agent does
 # `cp /opt/scaffold/heap_menu.py ./exploit.py` and edits the TODOs.
 # Scaffolds load ./.chal-libs/libc_profile.json automatically, so the
 # version-matrix branching is data-driven instead of prose-driven.
 COPY scaffold /opt/scaffold
+
+# shellphish/how2heap — canonical glibc-version-keyed PoC corpus for
+# every well-known heap technique (fastbin_dup, house_of_*,
+# tcache_poisoning, unsafe_unlink, large_bin_attack, etc.). Cloned at
+# build time so the agent can read the EXACT PoC source for the chal's
+# detected glibc version (matched against ./.chal-libs/libc_profile.json
+# `version_tuple`). Source-only — we don't compile or run any of the
+# PoCs, just reference them as known-good chain templates.
+RUN git clone --depth 1 https://github.com/shellphish/how2heap.git /opt/how2heap \
+ && rm -rf /opt/how2heap/.git \
+ && echo "how2heap: $(ls -d /opt/how2heap/glibc_* | wc -l) glibc-version dirs, $(find /opt/how2heap/glibc_* -name '*.c' | wc -l) PoCs"
 
 ENV PYTHONPATH=/app
 

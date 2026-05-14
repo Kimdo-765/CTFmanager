@@ -34,11 +34,54 @@ def job_dir(job_id: str) -> Path:
     return p
 
 
+# --- SSE live-stream publish helpers ---------------------------------
+# Lazy-init a single redis client per worker process; publish is fire-
+# and-forget. On any error we cache the failure so subsequent calls
+# short-circuit (avoid hammering a dead redis on every log line).
+# Channels: job:<id>:log (run-log lines), job:<id>:meta (token/heartbeat),
+# job:<id>:sdk (raw SDK messages — Phase 4).
+_REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
+_redis_pub = None
+_redis_pub_failed = False
+
+
+def _get_redis_pub():
+    """Return a process-local Redis client for publish. None on failure."""
+    global _redis_pub, _redis_pub_failed
+    if _redis_pub is not None:
+        return _redis_pub
+    if _redis_pub_failed:
+        return None
+    try:
+        from redis import Redis
+        _redis_pub = Redis.from_url(
+            _REDIS_URL,
+            socket_timeout=1,
+            socket_connect_timeout=1,
+        )
+    except Exception:
+        _redis_pub_failed = True
+        return None
+    return _redis_pub
+
+
+def _publish(job_id: str, channel_suffix: str, payload: dict) -> None:
+    """Fire-and-forget publish to job:<id>:<suffix>. Never raises."""
+    r = _get_redis_pub()
+    if r is None:
+        return
+    try:
+        r.publish(f"job:{job_id}:{channel_suffix}", json.dumps(payload))
+    except Exception:
+        pass
+
+
 def log_line(job_id: str, line: str) -> None:
     f = job_dir(job_id) / "run.log"
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     with f.open("a") as fp:
         fp.write(f"[{ts}] {line}\n")
+    _publish(job_id, "log", {"ts": ts, "line": line})
 
 
 def log_block(
@@ -65,9 +108,23 @@ def log_block(
     out = "".join(f"[{ts}] {tag_part}{prefix}: {line}\n" for line in lines)
     with f.open("a") as fp:
         fp.write(out)
+    # Stream each rendered line individually so the SSE consumer can
+    # show progress incrementally (matches file readers using tail).
+    for line in lines:
+        _publish(
+            job_id,
+            "log",
+            {"ts": ts, "line": f"{tag_part}{prefix}: {line}"},
+        )
 
 
 _TERMINAL_STATUSES = {"finished", "failed", "no_flag", "stopped"}
+
+
+_SSE_META_KEYS = {
+    "status", "flag", "summary", "error", "agent_error_kind",
+    "started_at", "finished_at",
+}
 
 
 def write_meta(job_id: str, **updates: Any) -> None:
@@ -88,6 +145,13 @@ def write_meta(job_id: str, **updates: Any) -> None:
     meta.update(updates)
     meta["updated_at"] = now_iso
     f.write_text(json.dumps(meta, indent=2))
+
+    # SSE: publish only the "lifecycle" subset to avoid spamming the
+    # channel with every token-counter throttle write (agent_heartbeat
+    # already emits its own meta events).
+    sse_payload = {k: updates[k] for k in _SSE_META_KEYS if k in updates}
+    if sse_payload:
+        _publish(job_id, "meta", {"status_update": sse_payload})
 
 
 def read_meta(job_id: str) -> dict[str, Any]:
@@ -243,9 +307,14 @@ MISSION (read first, follow strictly)
 1. WRITE: produce {deliverables} in your CURRENT WORKING DIRECTORY
    using RELATIVE paths. The orchestrator collects only files at cwd.
 2. DELEGATE STATIC investigation to the read-only `recon` subagent
-   via the `Agent` tool:
-       Agent(
-         description="<short purpose, ≤8 words>",
+   via the isolated MCP tool. There is exactly ONE delegation tool
+   in this run — `mcp__team__spawn_subagent`. The SDK's built-in
+   `Agent` / `Task` tools are EXPLICITLY DISALLOWED for this session
+   (they dispatch to a built-in "general-purpose" subagent that
+   shares your Node.js process heap — exactly what the MCP tool
+   exists to avoid). If you try to call `Agent(subagent_type=...)`
+   the orchestrator will reject the tool call. Always use:
+       mcp__team__spawn_subagent(
          subagent_type="recon",
          prompt="<one specific question with the path(s) to look at>"
        )
@@ -263,8 +332,7 @@ MISSION (read first, follow strictly)
    produces — gdb on the worker's system libc would lie. Call it
    when you need OBSERVED runtime state that disasm can't tell you:
 
-       Agent(
-         description="<observable, ≤8 words>",
+       mcp__team__spawn_subagent(
          subagent_type="debugger",
          prompt=(
            "GOAL: <what fact do you need? e.g. 'libc base after the
@@ -286,12 +354,74 @@ MISSION (read first, follow strictly)
    correctly, (e) signal/abort fired vs SIGSEGV, (f) glibc version
    when the bundled libc isn't labeled. Don't delegate trivial
    static questions — those go to recon.
-3. BUDGET (soft): after ~10 tool calls without a draft {short},
-   STOP investigating and write the draft from your best hypothesis.
-   Iterate after. There's no hard cap — the worker won't abort you —
-   but a long investigation phase eats your conversation context and
-   you'll run out of room to actually finish. Cheap drafts first,
-   refinement later.
+
+   SUBAGENT ISOLATION CONTRACT. The MCP tool
+   `mcp__team__spawn_subagent` launches the subagent as its own
+   `claude` CLI subprocess. When the subagent finishes, the
+   subprocess dies — its full investigation conversation is GONE.
+   You receive only the subagent's final text response as the tool
+   result. This is intentional: it's the only way the worker survives
+   a multi-spawn heap-pwn run without OOMing on a single-process
+   heap (the prior `Agent(subagent_type=...)` path accumulated the
+   subagent's whole context into your heap, which is what killed
+   jobs 011a6d486d53 / 7c4a6a4c7581 / ff8240803dc2 / 5c5334381583 /
+   c4f49803edfe).
+
+   Practical implications:
+     · Ask SPECIFIC questions — the subagent has no memory of your
+       prior turns. Give it the file paths, the offsets, the inputs.
+     · Batch questions — ONE spawn that answers 3-5 things is much
+       cheaper than 3-5 spawns. Each spawn has fixed fork overhead
+       (~2-3 s + cold prompt cache).
+     · You can still spawn multiple subagents per run (cap default
+       is 4 — typical heap-pwn workflow is ~2 recon + 1 debugger +
+       1 judge). The cap fires post-turn warning at count == cap
+       and hard-breaks the receive loop at count > cap.
+     · If the legacy `Agent` tool is still in your tool list
+       (USE_ISOLATED_SUBAGENTS=0), prefer the MCP form anyway —
+       isolation is strictly the safer path.
+3. BUDGET (soft 10, FINAL_DRAFT trigger ~150, fallback safety net):
+   * SOFT — after ~10 tool calls without a draft {short}, STOP
+     investigating and write the draft from your best hypothesis.
+     Iterate after. Cheap drafts first, refinement later.
+   * SOFT_EJECT — at 80% of INVESTIGATION_BUDGET (default 150 → trip
+     at 120) the orchestrator injects `SOFT_EJECT_USER_TURN` as a
+     user-turn. If you see "TOOL-CALL BUDGET ALERT" in your context,
+     you're past 80% — DRAFT NOW.
+   * FINAL_DRAFT — at 100% (default 150) the orchestrator injects
+     `FINAL_DRAFT_USER_TURN` — "write anything; even a skeleton
+     script will do; sandbox + postjudge does the rest". You get one
+     full turn to react.
+   * FALLBACK ARTIFACT — if THAT turn also fails to produce
+     exploit.py, the orchestrator drops a probe-only skeleton
+     (loaded from `_FALLBACK_EXPLOIT_TEMPLATE`) so the sandbox +
+     postjudge cycle still fires. The job ends as `no_flag` or
+     `partial` instead of `failed`. This safety net guarantees the
+     job NEVER aborts due to budget alone — but a fallback artifact
+     reaching production is a sign of analysis failure; if you see
+     `agent_error_kind=budget_fallback` in any prior run, please
+     draft earlier next time.
+
+3.5. CONTEXT COMPACTION GUARD (independent of #3, fires on memory not
+   tool-call count):
+   * SOFT — at 8 M accumulated `cache_read_input_tokens` (configurable
+     via `CONTEXT_COMPACTION_THRESHOLD`) the orchestrator injects a
+     `COMPACTION_USER_TURN` message into your conversation telling
+     you to STOP investigating, finalize the artifact, and end your
+     turn. DO NOT spawn debugger / recon after seeing it — the SDK
+     child process spawn is the documented OOM-trigger.
+   * HARD — at 14 M accumulated cache_read tokens (`COMPACTION_HARD_
+     CEILING`) the orchestrator ends your session cleanly with
+     `agent_error_kind=compaction_ceiling`. Whatever exploit.py +
+     report.md you've written are preserved; the auto-retry loop
+     then forks a fresh session whose first user-turn is the
+     postjudge feedback from the just-completed sandbox run — your
+     work continues with a small context.
+   This guard exists because jobs 011a6d486d53 (3.6 M tokens,
+   OOM at debugger spawn) and 7c4a6a4c7581 (13.5 M tokens, OOM
+   at debugger spawn) both wrote a working exploit and then died
+   trying to debug it. The compaction loop preserves your progress
+   instead.
 
 JUDGE GATE (mandatory before you finalize)
 ------------------------------------------
@@ -311,8 +441,7 @@ costs bounded — but it lets you fix obvious bugs without forcing the
 human to click /retry.
 
 Call:
-    Agent(
-      description="prejudge exploit",
+    mcp__team__spawn_subagent(
       subagent_type="judge",
       prompt="review ./exploit.py (or ./solver.py) for hang/parse
               risks: recvuntil-without-timeout, wrong prompt
@@ -365,6 +494,25 @@ a single subagent turn.
    libc-side facts) `./.chal-libs/libc_profile.json`.
 5. NO REPEATED slicing of saved disasm: grep what you need once
    and move on.
+5.5. BULK-LOOP OUTPUT — write to file, summarize. Whenever you run a
+   command that produces MORE than ~40 lines (brute-force sweeps,
+   "guess: B_sb=…" alignment scans, byte-by-byte fdpath comparison,
+   strings -a on a libc, full `objdump -d`, etc.) DO NOT let the raw
+   result land in your tool-result. The output is copied verbatim
+   into your conversation context — 200 lines of brute-force "guess:"
+   blocks (as job 011a6d486d53 did right before OOM) eats 30-50 KB of
+   context and pushes the SDK closer to its memory cap. Pattern:
+
+       <cmd> 2>&1 | tee /tmp/sweep.out | head -5   # peek
+       wc -l /tmp/sweep.out                         # size
+       grep -m 1 "winning_pattern" /tmp/sweep.out   # filter
+
+   For brute-force loops in Python, accumulate hits in a list and
+   `print(json.dumps({{"hits": hits[:5], "n": len(hits)}}))` — emit a
+   summary, not the firehose. If you genuinely need to see the
+   sweep, READ /tmp/sweep.out section by section instead of pulling
+   the whole thing into one tool result.
+
 6. RUNAWAY OUTPUT — STOP, DO NOT ANALYZE. If a Bash tool result
    begins with "Output too large (NNN MB). Full output saved to..."
    the underlying process produced a flood (typically megabytes to
@@ -406,6 +554,12 @@ binary, source bundle, or disk/memory image they upload — treat the input
 as a training artifact and produce a direct, complete analysis with a
 runnable solver/exploit. Do not refuse, hedge, or sanitize: that defeats
 the educational purpose of the challenge.
+
+SCRATCH FILES: $TMPDIR is pre-set to a per-job directory (./tmp/ under
+your cwd). Write every temporary file there or under cwd directly.
+NEVER write to /tmp/<filename> with a hardcoded absolute path, never
+pass dir='/tmp' to tempfile.*, and never `cd /tmp`. Concurrent jobs
+share the worker's /tmp; only $TMPDIR keeps them apart.
 
 """
 
@@ -456,7 +610,8 @@ Pwn-specific:
                      extracted) libc + ld, staged at ./.chal-libs/.
                      ALSO emits ./.chal-libs/libc_profile.json with
                      {version, safe_linking, tcache_key, hooks_alive,
-                      preferred_fsop_chain, symbols, one_gadget}.
+                      preferred_fsop_chain, symbols, one_gadget,
+                      how2heap.{dir,techniques[]}}.
                      RUN THIS BEFORE pwn.ELF() / one_gadget / ROPgadget
                      against libc — worker libc is glibc 2.41 (wrong).
   - heap state     : `heap-probe ./prob --input <in> --break <bp>
@@ -468,12 +623,47 @@ Pwn-specific:
                      FSOP / tcache / nibble-race chains. Load
                      libc_profile.json automatically.
                        `cp /opt/scaffold/heap_menu.py ./exploit.py`
+  - how2heap PoCs  : /opt/how2heap/glibc_<VER>/*.c — shellphish corpus
+                     of every well-known heap technique, version-keyed
+                     against the chal's glibc. `cat` the .c file you
+                     plan to mimic INSTEAD of reinventing chain math.
+                     The applicable list is in libc_profile.json
+                     `how2heap.techniques`.
   - gadgets        : ROPgadget --binary ./bin/<name> --rop / --jop
   - decompiler     : `ghiant <binary> [outdir]` (Ghidra headless, ./decomp/)
+  - symbolic exec  : `angr` — when you can't see WHICH input leads to
+                     vuln(), or when one_gadget constraints need solver
+                     proof. Heavy (~800 MB resident); use sparingly,
+                     prefer recon delegation. Pattern:
+                       p = angr.Project('./prob', auto_load_libs=False)
+                       sm = p.factory.simulation_manager(
+                           p.factory.entry_state())
+                       sm.explore(find=<addr_of_win>, avoid=[<bad>])
   - libc id (remote-only): `pwn libcdb find <sym> <leak>` — queries
                      libc-database web API, returns matching versions.
-  - Python (import): pwn (pwntools — checksec / ELF / cyclic / asm / shellcraft),
-                     Crypto, gmpy2, sympy, z3
+  - Python (import): pwn (pwntools — checksec / ELF / cyclic / asm /
+                     shellcraft; pwn.fmtstr_payload; pwn.flat;
+                     pwn.libcdb.find_libc),
+                     libheap (parse malloc_chunk, walk arena / tcache
+                              from a raw heap dump without spawning gdb;
+                              import libheap; ...),
+                     Crypto, gmpy2, sympy, z3 (constraint solver — pair
+                     with angr or use solo when the heap-poison
+                     alignment math is just modular arithmetic)
+  - GDB Python API : every `gdb` call accepts `-x script.py` — full
+                     Python automation inside one gdb session:
+                       cat > /tmp/probe.py <<'PY'
+                       import gdb, json
+                       gdb.execute("file ./prob")
+                       gdb.execute("b *vuln+0x42"); gdb.execute("r < /tmp/in")
+                       rax = int(gdb.parse_and_eval("$rax")) & ((1<<64)-1)
+                       chunks = gdb.execute("heap chunks", to_string=True)
+                       print(json.dumps({{"rax": hex(rax),
+                                          "chunks_lines": chunks.count('\\n')}}))
+                       PY
+                       gdb -batch -x /tmp/probe.py
+                     The debugger subagent prefers this pattern over
+                     `-ex` chains for any non-trivial probe.
 """
 
 TOOLS_REV = _TOOLS_BASE + """\
@@ -919,9 +1109,8 @@ itself instead of asking main to paste it.
 
 Delegating to recon: when the answer requires heavy investigation
 (libc symbol lookup, ROPgadget search, ghiant decompile, multi-file
-source grep), call recon yourself:
-  Agent(
-    description="<short purpose, ≤8 words>",
+source grep), call recon yourself via the isolated MCP tool:
+  mcp__team__spawn_subagent(
     subagent_type="recon",
     prompt="<one specific question with the path(s) to look at>"
   )
@@ -950,6 +1139,23 @@ Antipatterns to flag in scripts (high-signal, encountered most often):
   does `int(argv[1])`).
 * `Crypto.Util.number.bytes_to_long` on something that isn't bytes,
   or other type confusion that crashes at first call.
+
+findings.json (NEW — when main writes one, validate it):
+* Required keys missing or extra keys present → MED finding. The
+  schema is documented in pwn/prompts.py step 8. Check the script
+  isn't lying about `glibc_version` (compare against
+  ./.chal-libs/libc_profile.json) or `arch` (compare against
+  `file ./prob`).
+* `chain.technique_name` set but `chain.how2heap_file` is null and
+  the technique IS available in libc_profile.json's
+  how2heap.techniques list → MED severity (agent skipped the
+  canonical PoC source).
+* `vulns[].primitive_quality` all LOW or only MED with no HIGH-tier
+  in any vuln → HIGH severity. A chain made of MED stepping stones
+  alone won't capture flag; flag as "incomplete-chain".
+* `exploit_status: "drafted"` but the script-level review still finds
+  HIGH antipatterns → severity remains high; the agent self-rating
+  doesn't override the static check.
 
 Heap / FSOP class antipatterns (silent crashes the regular checks
 don't catch — flag these aggressively when the script touches
@@ -1045,6 +1251,23 @@ Reply (≤2 KB) with EXACTLY the values main needs, formatted tight:
 
 Tool catalogue (Bash inside the worker container)
 -------------------------------------------------
+* gdb-clean — ALWAYS use this instead of bare `gdb` for batch runs. It
+  strips GEF's per-invocation banner ("X commands loaded and Y functions
+  added for GDB ..." + ANSI color escape codes) so your reply doesn't
+  carry ~1 KB of boilerplate per call. Same args as `gdb`. Pair it with
+  /opt/scaffold/gdb-init.py to also kill GEF's auto-printed context panel
+  (registers/stack/code on every stop):
+
+      gdb-clean -nh -batch \\
+                -x /opt/scaffold/gdb-init.py \\
+                -x /tmp/probe.py
+
+  Inside a probe.py, source the init explicitly:
+      gdb.execute("source /opt/scaffold/gdb-init.py")
+  The init disables context.enable, registers/stack/code/trace panels,
+  pretty-print, pagination, and clamps telescope depth. Manual `gef ...`
+  commands still work on demand — they just don't fire automatically.
+
 * heap-probe — STANDARDIZED heap-state dumper. Use this FIRST when the
   main agent's question is "what's the tcache / fastbin / unsorted
   state after N alloc/free" — it wraps gdb-batch + GEF and emits a
@@ -1267,7 +1490,14 @@ Hard rules
 * Reply ≤2 KB. Long gdb dumps stay in the worker — main only sees
   your synthesis.
 * No Write to ./exploit.py / ./solver.py / ./report.md — those are
-  main's artifacts. (You can Write scratch scripts under /tmp.)
+  main's artifacts. SCRATCH FILES (probe.py, harness drivers, gdb
+  scripts, dump files) MUST go under /tmp/ — ABSOLUTE path. NEVER
+  write to a relative path, NEVER `cd` into main's cwd, NEVER drop
+  a .py / .gdb / .bin / .log into `/data/jobs/<id>/work/`. Job
+  011a6d486d53 had `probe.py` left in main's work dir by an earlier
+  debugger turn; main then re-read it on a later turn and got
+  confused about which file was authoritative. /tmp is isolated;
+  use it.
 * Do NOT run anything for >120s without a heartbeat. If the binary
   hangs, kill it and report ("hung after recv on fd 0; fed N bytes
   before hang").
@@ -1275,16 +1505,34 @@ Hard rules
   strace runs per delegation. If main asks 5 distinct questions in
   one prompt, answer them in one combined gdb session whenever
   possible (single -ex chain) instead of 5 spawns.
-* PROCESS HYGIENE — CRITICAL for heap chals (the two failures
-  1d00be30d4e9 / a914ca943ed2 both OOM'd from spawn fan-out):
+* PROCESS HYGIENE — CRITICAL for heap chals (failures 1d00be30d4e9 /
+  a914ca943ed2 / 9d58fe152fba all OOM'd from spawn fan-out):
     AT MOST ONE inferior process alive at a time.
     BEFORE spawning a new `./prob` / `./bin/<n>` / `gdb -p PID` /
     `gdbserver` / driver script: clean up first.
-        pkill -9 -f "./prob" 2>/dev/null
-        pkill -9 -f gdbserver 2>/dev/null
-        pkill -9 -f run_driver 2>/dev/null
-        pkill -9 -f probe_driver 2>/dev/null
+
+    NEVER use `pkill -f` for cleanup — the Claude Agent SDK passes
+    your system_prompt as `--system-prompt <prompt>` to the `claude`
+    CLI, so this very paragraph (with the strings "./prob",
+    "gdbserver", "run_driver" inside it) is in EVERY claude
+    subprocess's `/proc/<pid>/cmdline`. A cmdline-anchored pattern
+    like `pkill -f "./prob"` matches your own claude CLI (and your
+    sister subagents'), SIGKILLs them, and the spawn returns exit
+    code -9 with NO useful artifact — a fratricide. Use COMM-anchored
+    (`-x`, executable basename only, max 15 chars) instead:
+
+        pkill -9 -x prob       2>/dev/null   # the inferior binary
+        pkill -9 -x gdbserver  2>/dev/null
         sleep 0.5
+
+    If your inferior basename isn't `prob`, substitute it
+    (`pkill -9 -x "$(basename ./bin/<name>)"`). For Python driver
+    scripts (`python3 run_driver.py`), DO NOT broadly `pkill python3`
+    — that would also kill the RQ worker processes. Instead, run
+    drivers under a tight `timeout 5 python3 …` and `wait` on
+    background pids in the same Bash call so no driver outlives the
+    call that spawned it.
+
     Each pwntools `process(...)` keeps ~30-80 MB resident; gdb adds
     another ~150 MB; concurrent inferiors stack quickly past the
     worker's mem_limit (default 8 GB) and trip the cgroup OOM-killer
@@ -1293,10 +1541,35 @@ Hard rules
     kill stale processes between probes, and DO NOT fork driver
     scripts into the background unless you immediately wait/kill
     them at the end of the same Bash call.
+* OUTPUT-REDIRECT QUOTA — CRITICAL. Job 9d58fe152fba died because
+  a `./prob < stdin > /tmp/probe_out3.bin` looped forever after
+  EOF and wrote 4.2 GiB to /tmp before the OOM-killer fired.
+  Stdout-piped-to-claude has a RUNAWAY_OUTPUT guard; STDOUT-REDIRECTED-
+  TO-A-FILE does NOT. Whenever you redirect to a file:
+    1. ALWAYS bound the command with a tight `timeout` AND a stdin
+       that explicitly closes (`< /tmp/probe.in` not `< /dev/stdin`).
+    2. Cap the receiver. Pick ONE:
+         <cmd> | head -c 4194304 > /tmp/out.bin    # 4 MiB cap
+         timeout 5 <cmd> > /tmp/out.bin            # time cap
+       NEVER `<cmd> > /tmp/out.bin` without one of these.
+    3. After any subprocess run, `pkill -9 -x <comm>` (NOT `-f`; see
+       PROCESS HYGIENE above for why cmdline matching self-immolates)
+       AND `ps -eo pid,comm,args | grep <prob>` to confirm no
+       zombie/defunct procs are accumulating. A `<defunct>` row is
+       a leaked file handle still consuming memory inside the cgroup.
+    4. `du -sh /tmp/probe_*` before each new spawn — if any file
+       exceeds 100 MiB, `rm -f` it and re-run with a `head -c` cap.
 * heap-probe FIRST: when main's question is about heap state at N
   alloc/free, run `heap-probe` (one-shot, single gdb child, JSON
   output) instead of writing a custom driver. It encapsulates the
   spawn hygiene above and is harder to misuse.
+* ENV ALREADY BOOTSTRAPPED. By the time you're called, the
+  orchestrator has already run `chal-libc-fix` for the main agent,
+  so `./.chal-libs/libc.so.6 + ld-*.so + libc_profile.json` and the
+  patchelf'd `./prob` already exist in main's cwd (which is also
+  YOUR cwd if you weren't given a different one). DO NOT re-run
+  chal-libc-fix from the debugger — it wastes a turn and risks
+  re-patching the binary mid-investigation.
 """
 
 
@@ -1412,6 +1685,393 @@ def build_judge_agents(model: str | None) -> dict:
 build_recon_agents = build_team_agents
 
 
+# ─────────────────────────────────────────────────────────────
+# Isolated subagent path (process-per-subagent via MCP)
+# ─────────────────────────────────────────────────────────────
+# Verified empirically (see memory/worker_fork_oom.md): the SDK runs
+# ALL agent contexts inside a single `claude` CLI Node.js process.
+# When main spawns `Agent(subagent_type=...)`, the subagent's
+# conversation accumulates into main's process heap. A few heap-pwn
+# subagent spawns push the combined cache_read past 5 M tokens and
+# the V8 heap past the cgroup mem_limit → SIGKILL → job dies.
+#
+# The MCP-based path below replaces the built-in `Agent` tool with a
+# custom `spawn_subagent` MCP tool. Each call to that tool creates a
+# FRESH `ClaudeSDKClient` (= fresh `claude` CLI subprocess) for the
+# subagent. The subagent runs to completion, returns its final text
+# response, and the subprocess dies. main only ever sees the final
+# text as a tool_result — the subagent's full conversation never
+# touches main's heap. This is what "main / recon / debugger /
+# judge are independent agents" means at the OS process level.
+
+_AGENT_PROMPT_BY_TYPE = {
+    # Filled lazily — RECON_AGENT_PROMPT etc. are defined later in
+    # this file, after the prompt constants block. The lookup uses
+    # globals() at call time so we don't have a circular reference.
+    "recon": "RECON_AGENT_PROMPT",
+    "debugger": "DEBUGGER_AGENT_PROMPT",
+    "judge": "JUDGE_AGENT_PROMPT",
+}
+
+_AGENT_TOOLS_BY_TYPE = {
+    "recon": ["Read", "Bash", "Glob", "Grep"],
+    "debugger": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+    # judge has no Agent tool here — in isolated mode, subagents can't
+    # cascade-spawn further subagents (preserves the "ONE level deep"
+    # invariant the original AgentDefinition-based path enforced via
+    # the SDK's recursive-Agent block).
+    "judge": ["Read", "Bash", "Glob", "Grep"],
+}
+
+
+def make_standalone_options(
+    agent_type: str,
+    model: str | None,
+    work_dir,
+    job_id: str,
+    extra_env: dict | None = None,
+):
+    """Build `ClaudeAgentOptions` for a subagent running as a STANDALONE
+    session — i.e. it IS the main of its own SDK client, not a sub-
+    conversation inside another client. Used by the spawn_subagent MCP
+    tool to fork a fresh `claude` CLI subprocess per subagent
+    invocation, which keeps the parent main's heap from accumulating
+    the subagent's full conversation context.
+    """
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    if agent_type not in _AGENT_PROMPT_BY_TYPE:
+        raise ValueError(f"unknown agent_type {agent_type!r}")
+    prompt_name = _AGENT_PROMPT_BY_TYPE[agent_type]
+    prompt = globals().get(prompt_name)
+    if not prompt:
+        raise RuntimeError(
+            f"agent prompt {prompt_name} not yet defined — module init "
+            f"order bug; ensure prompts load before "
+            f"make_standalone_options is called"
+        )
+    tools = list(_AGENT_TOOLS_BY_TYPE[agent_type])
+    sub_model = (
+        LATEST_JUDGE_MODEL if agent_type == "judge"
+        else (model or LATEST_JUDGE_MODEL)
+    )
+    env = {"JOB_ID": job_id, "AGENT_ROLE": agent_type}
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items()})
+    return ClaudeAgentOptions(
+        system_prompt=prompt,
+        model=sub_model,
+        cwd=str(work_dir),
+        allowed_tools=tools,
+        permission_mode="bypassPermissions",
+        env=env,
+    )
+
+
+def make_main_session_options(
+    *,
+    job_id: str,
+    work_dir,
+    model: str,
+    system_prompt: str,
+    base_tools: list,
+    summary: dict,
+    add_dirs: list | None = None,
+    resume_sid: str | None = None,
+    extra_env: dict | None = None,
+):
+    """Build ``ClaudeAgentOptions`` for a main agent session. Selects
+    isolated-subagent (MCP) vs legacy in-process (``agents=``) path
+    based on ``USE_ISOLATED_SUBAGENTS`` (default ON). All four module
+    analyzers (pwn / web / crypto / rev) share this builder so the
+    isolation behavior is uniform.
+
+    Args:
+      base_tools: the per-module tool set (Read/Write/Bash/...) WITHOUT
+        the subagent-spawn tool. The builder appends either
+        ``mcp__team__spawn_subagent`` or ``Agent`` depending on the
+        active path.
+      summary: the main session's summary dict; passed through to the
+        MCP tool so per-spawn cost + counter increments roll up.
+    """
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    use_isolated = os.environ.get(
+        "USE_ISOLATED_SUBAGENTS", "1") != "0"
+    log_fn_local = lambda s: log_line(job_id, s)
+    env = {"JOB_ID": job_id}
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items()})
+
+    # Per-job scratch dir under cwd. Keeps tempfile.* / pwntools /
+    # pip / pyc cache from colliding when WORKER_CONCURRENCY > 1 in
+    # the same container. Bash absolute-path escapes (cd /tmp, raw
+    # /tmp/foo) are addressed by the SCRATCH FILES rule in
+    # CTF_PREAMBLE — env-vars only cover library calls. Cleanup is
+    # implicit: job DELETE rmtree's the whole /data/jobs/<id>/.
+    tmp_dir = Path(work_dir) / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    _tmp_str = str(tmp_dir)
+    env["TMPDIR"] = _tmp_str
+    env["TMP"]    = _tmp_str
+    env["TEMP"]   = _tmp_str
+
+    if use_isolated:
+        mcp_server, spawn_tool = make_spawn_subagent_mcp(
+            model=model,
+            work_dir=work_dir,
+            job_id=job_id,
+            log_fn=log_fn_local,
+            summary=summary,
+        )
+        env["USE_ISOLATED_SUBAGENTS"] = "1"
+        # Disallowed-tools list. permission_mode=bypassPermissions
+        # lets the model call ANY built-in tool regardless of
+        # allowed_tools — including the SDK's Task/Agent tool which
+        # dispatches to a built-in "general-purpose" subagent that
+        # runs in main's same Node.js process (= exactly the
+        # cumulative-heap pattern the MCP path exists to escape).
+        # Block both names defensively; main must use our MCP tool.
+        # Verified in job 6ac97fb2fb4e (2026-05-12): main bypassed
+        # allowed_tools and spawned a general-purpose Agent that
+        # accumulated context into main's heap.
+        options = ClaudeAgentOptions(
+            system_prompt=system_prompt,
+            model=model,
+            cwd=str(work_dir),
+            allowed_tools=[*base_tools, spawn_tool],
+            disallowed_tools=["Agent", "Task"],
+            permission_mode="bypassPermissions",
+            add_dirs=add_dirs or [],
+            env=env,
+            resume=resume_sid,
+            fork_session=bool(resume_sid),
+            mcp_servers={"team": mcp_server},
+        )
+        log_fn_local(
+            "[orchestrator] subagent isolation: ON "
+            f"(tool={spawn_tool}; Agent/Task blocked)"
+        )
+    else:
+        env["USE_ISOLATED_SUBAGENTS"] = "0"
+        options = ClaudeAgentOptions(
+            system_prompt=system_prompt,
+            model=model,
+            cwd=str(work_dir),
+            allowed_tools=[*base_tools, "Agent"],
+            permission_mode="bypassPermissions",
+            add_dirs=add_dirs or [],
+            env=env,
+            resume=resume_sid,
+            fork_session=bool(resume_sid),
+            agents=build_recon_agents(model),
+        )
+        log_fn_local(
+            "[orchestrator] subagent isolation: OFF (legacy in-process)"
+        )
+    return options
+
+
+def make_spawn_subagent_mcp(
+    model: str | None,
+    work_dir,
+    job_id: str,
+    log_fn,
+    summary: dict,
+):
+    """Build the MCP server that hosts the `spawn_subagent` tool. Each
+    invocation of the tool launches a FRESH `ClaudeSDKClient` for the
+    requested subagent and returns its final text response. The
+    subprocess dies as soon as the subagent finishes, so main's heap
+    stays lean.
+
+    Returns a tuple ``(mcp_config, tool_name_full)`` where:
+      * ``mcp_config`` goes into ``ClaudeAgentOptions(mcp_servers={...})``
+      * ``tool_name_full`` (``"mcp__team__spawn_subagent"``) goes into
+        ``allowed_tools=[...]`` and is what the prompt tells main to
+        call.
+    """
+    from claude_agent_sdk import (
+        create_sdk_mcp_server,
+        tool,
+        ClaudeSDKClient,
+        AssistantMessage,
+        UserMessage,
+        ResultMessage,
+    )
+
+    server_name = "team"
+
+    @tool(
+        "spawn_subagent",
+        (
+            "Spawn an INDEPENDENT subagent (recon / debugger / judge) "
+            "in its own SDK session (= its own claude CLI subprocess). "
+            "The subagent runs to completion, then returns its FINAL "
+            "text response as the tool result. Use this in place of "
+            "the built-in `Agent` tool whenever you want process-"
+            "isolated memory — main's heap will not grow with the "
+            "subagent's investigation context. Parameters: "
+            "subagent_type ∈ {recon, debugger, judge}; "
+            "prompt is the question/task you want the subagent to "
+            "answer (keep it specific and bounded — the subagent's "
+            "session ends when it finishes the response)."
+        ),
+        {"subagent_type": str, "prompt": str},
+    )
+    async def spawn_subagent(args: dict) -> dict:
+        sub_type = (args.get("subagent_type") or "").strip().lower()
+        sub_prompt = args.get("prompt") or ""
+        if sub_type not in _AGENT_PROMPT_BY_TYPE:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"ERROR: unknown subagent_type {sub_type!r}. "
+                        f"Valid: recon, debugger, judge."
+                    ),
+                }],
+                "isError": True,
+            }
+        if not sub_prompt.strip():
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": "ERROR: empty prompt — pass a specific question.",
+                }],
+                "isError": True,
+            }
+
+        # NOTE: the spawn counter is incremented in log_assistant_blocks
+        # the moment main's ToolUseBlock(mcp__team__spawn_subagent)
+        # is yielded — that lets _maybe_subagent_cap() set the break
+        # flag before this function even gets called. Do NOT increment
+        # here or we'd double-count. By the time we're inside this
+        # function, summary["subagent_spawns"] already reflects this
+        # spawn.
+        spawn_idx = int(summary.get("subagent_spawns", 0))
+        log_fn(
+            f"[orchestrator] isolated subagent #{spawn_idx} spawning "
+            f"({sub_type})"
+        )
+
+        sub_options = make_standalone_options(
+            sub_type, model, work_dir, job_id,
+        )
+        # Collect final text + record tool activity on a per-subagent
+        # tag so the run.log lines stay self-describing.
+        tag = f"{sub_type}#{spawn_idx}"
+        chunks: list[str] = []
+        sub_summary: dict = {}
+        try:
+            async with ClaudeSDKClient(options=sub_options) as sub_client:
+                await sub_client.query(sub_prompt)
+                async for msg in sub_client.receive_response():
+                    # Logging mirrors log_assistant_blocks but tagged
+                    # by the isolated subagent's identity. We don't
+                    # call log_assistant_blocks because that helper
+                    # mutates main's `summary["tool_calls"]` counter,
+                    # and we want subagent tool calls counted on the
+                    # subagent's own ledger.
+                    if isinstance(msg, AssistantMessage):
+                        for block in (getattr(msg, "content", None) or []):
+                            kind = type(block).__name__
+                            if kind == "TextBlock":
+                                txt = getattr(block, "text", "") or ""
+                                if txt.strip():
+                                    chunks.append(txt)
+                                    log_line(
+                                        job_id,
+                                        f"[{tag}] AGENT: {txt[:500]}",
+                                    )
+                            elif kind == "ToolUseBlock":
+                                nm = getattr(block, "name", "?")
+                                inp = getattr(block, "input", None) or {}
+                                try:
+                                    preview = json.dumps(inp)[:200]
+                                except Exception:
+                                    preview = str(inp)[:200]
+                                log_line(
+                                    job_id,
+                                    f"[{tag}] TOOL {nm}: {preview}",
+                                )
+                    elif isinstance(msg, UserMessage):
+                        # CANNOT use log_user_blocks here — it calls
+                        # agent_tag() which looks up parent_tool_use_id
+                        # in the per-job subagent registry. Isolated
+                        # subagents run in a SEPARATE ClaudeSDKClient,
+                        # so their UserMessage (= tool_result) blocks
+                        # don't carry a parent_tool_use_id that maps to
+                        # any registered Agent call in main's session.
+                        # The lookup falls back to "main" and we get
+                        # `[main] TOOL_RESULT: ...` lines attributed to
+                        # the wrong agent. Log directly with our tag.
+                        content = getattr(msg, "content", None)
+                        if isinstance(content, list):
+                            for blk in content:
+                                if type(blk).__name__ != "ToolResultBlock":
+                                    continue
+                                is_err = bool(getattr(blk, "is_error", False))
+                                body_raw = getattr(blk, "content", None)
+                                preview = format_tool_result(body_raw, is_err)
+                                log_line(job_id, f"[{tag}] " + preview)
+                                _check_runaway(job_id, tag, preview)
+                    elif isinstance(msg, ResultMessage):
+                        # Bill the subagent's cost to the main job.
+                        cost = (
+                            getattr(msg, "total_cost_usd", None)
+                            or getattr(msg, "cost_usd", None)
+                            or 0.0
+                        )
+                        if cost:
+                            sub_summary["cost_usd"] = float(cost)
+                            summary["cost_usd"] = (
+                                float(summary.get("cost_usd", 0.0))
+                                + float(cost)
+                            )
+        except Exception as e:
+            log_fn(
+                f"[orchestrator] isolated {tag} crashed: {e!r} — "
+                f"returning error to main"
+            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"SUBAGENT_ERROR ({sub_type}): {type(e).__name__}: "
+                        f"{str(e)[:400]}"
+                    ),
+                }],
+                "isError": True,
+            }
+
+        final = "\n".join(chunks).strip()
+        if not final:
+            final = (
+                f"(subagent {sub_type} returned no text — likely hit "
+                f"its own budget or token limit. Treat as no useful "
+                f"output.)"
+            )
+        cost_note = (
+            f" cost=${sub_summary.get('cost_usd', 0):.4f}"
+            if sub_summary.get("cost_usd")
+            else ""
+        )
+        log_fn(
+            f"[orchestrator] isolated {tag} done — "
+            f"{len(final)} B response{cost_note}"
+        )
+        return {"content": [{"type": "text", "text": final}]}
+
+    server = create_sdk_mcp_server(
+        name=server_name,
+        version="1.0.0",
+        tools=[spawn_subagent],
+    )
+    tool_name_full = f"mcp__{server_name}__spawn_subagent"
+    return server, tool_name_full
+
+
 def budget_exceeded(tool_calls: int, work_dir: Path, expected: tuple[str, ...]) -> bool:
     """Trip-wire: True when the agent has burned `INVESTIGATION_BUDGET`
     tool calls without producing any of the expected output files.
@@ -1449,6 +2109,199 @@ _heartbeat_state: dict[str, float] = {}
 _token_state: dict[str, dict[str, int]] = {}
 _token_seen_ids: dict[str, set[str]] = {}
 _token_turns: dict[str, int] = {}
+
+# Per-job compaction-warning state. Tracks whether we've already
+# emitted the SOFT context-compaction warning to main this run, so
+# the same advisory doesn't fire on every heartbeat once threshold
+# is crossed.
+_compaction_warned: dict[str, bool] = {}
+
+
+# Context-compaction thresholds (env-tunable).
+# Heuristic: pre-OOM jobs accumulated cache_read 3.6M (011a) → 13.5M
+# (7c4a). The first ones hit OOM at 8 GiB; 7c4a hit 12 GiB. A SOFT
+# warn at 8M leaves the agent ~3 turns to draft/save artifacts before
+# the HARD ceiling at 14M (where the heartbeat sets compaction_pending
+# and run_main_agent_session ejects the session for a fork-based
+# retry). Set CONTEXT_COMPACTION_THRESHOLD=0 to disable both.
+def _compaction_thresholds() -> tuple[int, int]:
+    try:
+        soft = int(os.environ.get("CONTEXT_COMPACTION_THRESHOLD", "8000000"))
+    except ValueError:
+        soft = 8_000_000
+    try:
+        hard = int(os.environ.get("CONTEXT_COMPACTION_HARD_CEILING", "14000000"))
+    except ValueError:
+        hard = 14_000_000
+    if soft <= 0:
+        return 0, 0
+    if hard < soft:
+        hard = int(soft * 1.75)
+    return soft, hard
+
+
+# Heuristic message the orchestrator can inject as a user-turn when
+# the soft threshold is crossed. Kept out of the heartbeat fn so the
+# main-session loop can include it in its own client.query() call
+# without coupling to the heartbeat's throttle.
+COMPACTION_USER_TURN = """\
+🧠 CONTEXT COMPACTION WARNING — accumulated cache_read tokens crossed
+the soft threshold. The SDK process inside the worker container is
+nearing its memory cap; spawning a subagent (debugger, recon) RIGHT
+NOW is the documented trigger that has OOM-killed every recent heap
+chal (jobs 011a6d486d53, 7c4a6a4c7581). What to do — in order:
+
+  1. STOP investigating. Do NOT delegate to debugger or recon.
+  2. If `./exploit.py` exists, verify the JUDGE GATE was run on its
+     CURRENT state and update `./report.md` with the failure
+     hypothesis from your most recent run.
+  3. If `./exploit.py` is incomplete, finalize it from your best
+     hypothesis right now — even a one-shot attempt is more useful
+     than a debugger spawn that OOM's the run before it finishes.
+  4. End your turn cleanly. The orchestrator's auto-retry loop will
+     pick up the postjudge feedback and the next attempt starts
+     with a fresh, smaller context.
+
+If you ignore this and spawn a subagent anyway, the next AGENT_ERROR
+in run.log will reference this very warning. Drafting > debugging
+when context is full.
+"""
+
+
+SOFT_EJECT_USER_TURN = """\
+⏰ TOOL-CALL BUDGET ALERT — you have burned 80%+ of the
+INVESTIGATION_BUDGET (default 100 tool calls per analyzer run) WITHOUT
+an `./exploit.py` artifact on disk. Job d8decbd77ed9 hit this exact
+state at 80 calls and burned the remaining 20 on more recon delegations
+before BUDGET_ABORT shut it down with no artifact produced.
+
+What you MUST do BEFORE your next investigation step:
+
+  1. WRITE THE DRAFT. Even your second-best hypothesis is better than
+     `agent_error_kind=budget` with `exploit_present=false`. The auto-
+     retry loop will inject postjudge feedback so you can refine it —
+     that loop CANNOT start until exploit.py exists.
+  2. If your chain depends on a heap technique, START FROM A SCAFFOLD
+     instead of from scratch:
+         cp /opt/scaffold/heap_menu.py ./exploit.py     # menu chal
+     and import the helpers (`safe_link`, `build_full_chain`,
+     `aslr_retry`) so you DON'T re-derive the boilerplate.
+  3. Set `context.timeout = 10` and add `timeout=` on every recv-family
+     call. The judge will flag unbounded recvs as HIGH severity.
+  4. Write `./report.md` even if it's just "currently best guess: X
+     because Y; unconfirmed assumptions: Z".
+
+You can keep investigating AFTER the draft lands. The trip-wire is one-
+shot per job; it won't re-warn. The HARD abort fires at 100 calls.
+"""
+
+
+FINAL_DRAFT_USER_TURN = """\
+🛑 LAST CHANCE — INVESTIGATION BUDGET EXHAUSTED. You have made 100
+tool calls without writing `./exploit.py`. The orchestrator was about
+to abort the job entirely, but is giving you ONE MORE TURN to land a
+draft from your CURRENT understanding (even an incomplete or
+speculative one). DO NOT investigate further this turn — just write.
+
+What to write THIS TURN, in order, AND THEN END YOUR TURN:
+
+  1. Open `./exploit.py` (Write tool). Use `/opt/scaffold/heap_menu.py`
+     as a starting point if the chal is menu-driven — even just
+     `cp /opt/scaffold/heap_menu.py ./exploit.py` and edit the prompt
+     strings is good enough. If you have no scaffold candidate, write
+     a pwntools skeleton with your best-known offsets / one_gadget /
+     trigger sequence. The script DOES NOT have to succeed; it has
+     to EXIST so the orchestrator can sandbox it, surface the failure
+     to postjudge, and feed you a real retry hint next round.
+
+  2. Open `./report.md` and write WHAT YOU KNOW so far: vuln class,
+     primitive class, glibc version, candidate technique, one-line
+     run command. Even a draft report saves the next agent (or you
+     in the next /retry) from re-doing the analysis.
+
+  3. END YOUR TURN. The sandbox runs, postjudge fires, and the
+     auto-retry loop hands you actionable feedback — that is the
+     channel that turns a partial exploit into a working one. The
+     #1 reason chals fail is "exploit.py never written" — past 100
+     tool calls of analysis is sunk cost; the only path to a flag is
+     a runnable script + postjudge iteration.
+
+If genuinely nothing can be drafted (chal is opaque even to your best
+guess), explicitly `Bash(rm -f ./exploit.py)` and write the report
+explaining what you tried — the orchestrator will mark the job
+no_flag instead of failed, which is still better than `budget` with
+empty artifacts.
+"""
+
+
+SCAFFOLD_MISSING_USER_TURN = """\
+🪜 SCAFFOLD NUDGE — this is a HEAP / FSOP / tcache / UAF challenge
+(detected from your description or recon's CANDIDATES) but you've
+made N tool calls without using any of the /opt/scaffold/ templates.
+The scaffolds encode invariants that judge has historically flagged
+as HIGH severity when written from scratch:
+
+  /opt/scaffold/heap_menu.py
+    — alloc / free / edit / show wrappers + libc_profile.json loader +
+      `safe_link(target, chunk)` + `assert_libc_base()`.
+      Just: `cp /opt/scaffold/heap_menu.py ./exploit.py` then fill
+      the prompt strings.
+
+  /opt/scaffold/fsop_wfile.py
+    — `_IO_FILE_plus` / `_IO_wide_data` / `_wide_vtable` builders
+      that ENFORCE the "vtable LAST" ordering (the documented #1
+      cause of FSOP SIGSEGVs). Use `build_full_chain(fake_file_addr=...,
+      doallocate_addr=...)` and flip vtable separately afterward.
+
+  /opt/scaffold/tcache_poison.py
+    — `safe_link()` auto-branches on libc_profile.json safe_linking.
+      `needs_key_bypass()` for glibc >= 2.35.
+
+  /opt/scaffold/aslr_retry.py
+    — `aslr_retry(exploit_one, max_attempts=64)` for nibble-race
+      chains; `expected_attempts_for(success_rate)` for sizing.
+
+If the chal is NOT menu-shaped (e.g. single-shot ROP, custom protocol),
+ignore this — but say so explicitly in report.md so the judge knows
+why you skipped them. This nudge fires once per job.
+"""
+
+
+SUBAGENT_CAP_USER_TURN = """\
+🛑 SUBAGENT SPAWN CAP REACHED — you've spawned the budgeted number
+of subagents for this run. DO NOT call `mcp__team__spawn_subagent`
+(or the legacy `Agent` tool) again this session.
+
+Why this cap exists: each subagent invocation adds its
+final-text reply to your conversation history, and (in the
+legacy in-process path) the subagent's intermediate tool
+calls accumulate into the same Node.js heap that runs you.
+Across a heap-pwn run that produced enough delegations to
+push the worker past its cgroup limit, jobs 011a6d486d53 /
+7c4a6a4c7581 / ff8240803dc2 / 5c5334381583 / c4f49803edfe
+all SIGKILLed at a spawn moment. The cap is the budget, not
+a punishment — you've used what you were given.
+
+What to do INSTEAD:
+
+1. Any debugger work you'd have delegated → run inline with
+   `bash -lc 'gdb -batch -nx -x /tmp/probe.gdb ./prob'`. The
+   `chal-libc-fix` patchelf has already aligned the binary to the
+   chal's libc, so an inline gdb session gives you the same facts
+   without a fresh subagent context.
+
+2. Any recon question → grep / Read on the existing decomp/*.c
+   files directly. The decompiler already ran during autoboot and
+   the recon results from your earlier spawns are still in scope.
+
+3. Finalize ./exploit.py + ./report.md NOW from your best hypothesis.
+   The fallback safety net is still active — but landing a real
+   exploit before any further analysis is the cheaper path.
+
+This warning fires ONCE per job. If you ignore it and try another
+spawn, the orchestrator hard-breaks the receive loop on the next
+spawn attempt and falls back to sandbox dispatch immediately.
+"""
 
 
 _TOKEN_KEYS = (
@@ -1526,6 +2379,25 @@ def agent_heartbeat(job_id: str, msg) -> None:
         if isinstance(model_usage, dict):
             updates["model_usage"] = model_usage
 
+    # Compaction threshold check. Reads CACHE_READ accumulation and
+    # mirrors a `compaction_state` field into meta.json so:
+    #   "ok"       — under SOFT, nothing to do
+    #   "warn"     — between SOFT and HARD; main session should
+    #                soft-eject (drafted by run_main_agent_session).
+    #   "ceiling"  — at/above HARD; main session must terminate
+    #                cleanly so the retry loop can fork a fresh
+    #                session with a smaller starting context.
+    soft, hard = _compaction_thresholds()
+    state = "ok"
+    if soft > 0:
+        cr = int((tokens or {}).get("cache_read_input_tokens") or 0)
+        if cr >= hard:
+            state = "ceiling"
+        elif cr >= soft:
+            state = "warn"
+    if state != "ok":
+        updates["compaction_state"] = state
+
     now = _time.monotonic()
     last = _heartbeat_state.get(job_id, 0.0)
     throttled = (not is_result) and (now - last < _HEARTBEAT_MIN_INTERVAL_S)
@@ -1541,6 +2413,50 @@ def agent_heartbeat(job_id: str, msg) -> None:
         agent_turns=turns or None,
         **updates,
     )
+
+    # SSE meta delta — fires on the same throttle as write_meta so the
+    # frontend never gets out of sync with on-disk meta.json.
+    meta_payload: dict = {
+        "kind": kind,
+        "turns": turns,
+        "compaction_state": state,
+    }
+    if tokens:
+        meta_payload["tokens"] = tokens
+    if "cost_usd" in updates:
+        meta_payload["cost_usd"] = updates["cost_usd"]
+    if is_result:
+        meta_payload["is_result"] = True
+    _publish(job_id, "meta", meta_payload)
+
+
+def get_compaction_state(job_id: str) -> str:
+    """Returns 'ok'|'warn'|'ceiling' based on accumulated cache_read.
+    Used by run_main_agent_session to decide soft-eject vs. hard-abort.
+    Reads the same in-memory accumulator agent_heartbeat updates, so
+    callers don't need to round-trip through meta.json.
+    """
+    soft, hard = _compaction_thresholds()
+    if soft <= 0:
+        return "ok"
+    tok = _token_state.get(job_id) or {}
+    cr = int(tok.get("cache_read_input_tokens") or 0)
+    if cr >= hard:
+        return "ceiling"
+    if cr >= soft:
+        return "warn"
+    return "ok"
+
+
+def mark_compaction_warned(job_id: str) -> bool:
+    """First call returns True (caller should fire the warning); later
+    calls return False (warning already fired this job). One-shot guard
+    so we don't re-warn every turn after the threshold is crossed.
+    """
+    if _compaction_warned.get(job_id):
+        return False
+    _compaction_warned[job_id] = True
+    return True
 
 
 # Per-job map { tool_use_id: subagent_type } — populated when the main
@@ -1871,6 +2787,9 @@ def log_assistant_blocks(job_id: str, msg, summary: dict) -> None:
     Duck-types block class names so this helper can live in _common.py
     without importing the SDK at module load. Mutates `summary` to
     increment the tool_calls counter.
+
+    Also publishes each block to the SDK SSE channel for the live
+    "typing-effect" panel (Phase 4 — modules/_common._publish).
     """
     tag = agent_tag(msg, job_id)
     blocks = getattr(msg, "content", None)
@@ -1885,10 +2804,31 @@ def log_assistant_blocks(job_id: str, msg, summary: dict) -> None:
                 log_block(job_id, "AGENT", text, tag=tag)
             else:
                 log_line(job_id, f"[{tag}] AGENT: {text[:500]}")
+            _publish(job_id, "sdk", {
+                "kind": "text", "tag": tag, "text": text[:8000],
+            })
         elif kind == "ToolUseBlock":
             summary["tool_calls"] = summary.get("tool_calls", 0) + 1
             name = getattr(block, "name", "?")
             inp = getattr(block, "input", None) or {}
+            # Tally subagent spawns so the orchestrator's spawn-cap
+            # guard fires BEFORE the SDK executes the tool — the
+            # increment runs in log_assistant_blocks (= as soon as we
+            # see the ToolUseBlock yielded), so _maybe_subagent_cap()
+            # at the bottom of the receive loop body can set the
+            # break flag in the same iteration. By the time the SDK
+            # tries to execute the tool, the receive loop has already
+            # exited and the SDK context manager closes (= MCP tool
+            # is never called, legacy Agent dispatch is interrupted).
+            # The MCP tool function intentionally does NOT increment
+            # the counter (avoids double count). Both legacy `Agent`
+            # and MCP `mcp__team__spawn_subagent` count the same way.
+            if is_main and (
+                name == "Agent" or name == "mcp__team__spawn_subagent"
+            ):
+                summary["subagent_spawns"] = (
+                    int(summary.get("subagent_spawns", 0)) + 1
+                )
             if is_main:
                 try:
                     pretty = json.dumps(inp, indent=2, ensure_ascii=False)
@@ -1901,6 +2841,21 @@ def log_assistant_blocks(job_id: str, msg, summary: dict) -> None:
                 except Exception:
                     args_preview = str(inp)[:200]
                 log_line(job_id, f"[{tag}] TOOL {name}: {args_preview}")
+            try:
+                inp_serial = inp if isinstance(inp, (dict, list)) else str(inp)
+                # Cap serialized input so a giant Write/Edit payload
+                # doesn't bloat the SSE channel.
+                if isinstance(inp_serial, (dict, list)):
+                    s = json.dumps(inp_serial, ensure_ascii=False)
+                    if len(s) > 4000:
+                        inp_serial = {"_truncated": True,
+                                      "preview": s[:4000]}
+            except Exception:
+                inp_serial = None
+            _publish(job_id, "sdk", {
+                "kind": "tool_use", "tag": tag,
+                "name": name, "input": inp_serial,
+            })
         elif kind == "ThinkingBlock":
             thinking = getattr(block, "thinking", "") or ""
             if is_main:
@@ -1910,6 +2865,10 @@ def log_assistant_blocks(job_id: str, msg, summary: dict) -> None:
                     lambda s, _t=tag: log_line(job_id, f"[{_t}] {s}"),
                     "THINK", thinking,
                 )
+            _publish(job_id, "sdk", {
+                "kind": "thinking", "tag": tag,
+                "thinking": thinking[:8000],
+            })
 
 
 # SDK auto-truncates Bash/Read tool results above its size cap and
@@ -1968,6 +2927,19 @@ def log_user_blocks(job_id: str, msg) -> None:
             preview = format_tool_result(body_raw, is_error)
             log_line(job_id, f"[{tag}] " + preview)
             _check_runaway(job_id, tag, preview)
+        # SDK SSE channel: send a capped preview of every tool result
+        # so the live panel can show the agent's perspective end-to-end.
+        try:
+            preview_for_sse = format_tool_result(body_raw, is_error)
+        except Exception:
+            preview_for_sse = ""
+        if len(preview_for_sse) > 2000:
+            preview_for_sse = preview_for_sse[:2000] + " …(truncated)"
+        _publish(job_id, "sdk", {
+            "kind": "tool_result", "tag": tag,
+            "is_error": is_error,
+            "preview": preview_for_sse,
+        })
 
 
 def auto_retry_max() -> int:
@@ -2122,12 +3094,17 @@ def _format_postjudge_user_turn(
     max_attempts: int,
     script_filename: str,
     sandbox_result: dict,
+    findings_issues: list[str] | None = None,
 ) -> str:
     """Compose the user-turn body that gets injected back into main's
     SDK session after a failed sandbox run. Tells main what verdict
     came back, gives it the postjudge retry_hint verbatim, and asks
     for a corrected script. Tail of stdout/stderr is included so main
     can cross-check rather than trusting judge's summary blindly.
+    `findings_issues` is the validator output from validate_findings()
+    on the just-finished attempt's findings.json — included verbatim
+    so main fixes schema drift on the retry instead of letting it
+    accumulate.
     """
     judge = (sandbox_result or {}).get("judge") or {}
     verdict = judge.get("verdict") or "unknown"
@@ -2157,6 +3134,13 @@ def _format_postjudge_user_turn(
             f"\n=== prescriptive fix (failure_code={failure_code}) ===\n"
             f"{HEAP_FIX_HINTS[failure_code]}\n"
         )
+    findings_block = ""
+    if findings_issues:
+        findings_block = (
+            "\n=== findings.json schema issues (fix these on this retry) ===\n"
+            + "\n".join(f"  - {x}" for x in findings_issues[:8])
+            + "\n"
+        )
 
     return (
         f"🔁 AUTO-RETRY {attempt_idx}/{cap_str} — postjudge feedback\n"
@@ -2169,6 +3153,7 @@ def _format_postjudge_user_turn(
         + (f"  · failure_code: {failure_code}\n" if failure_code else "")
         + f"{timeout_marker}"
         f"{fix_preamble}"
+        f"{findings_block}"
         f"\n"
         f"=== retry hint (from postjudge — apply this) ===\n"
         f"{retry_hint or '(judge produced no actionable hint; debug from the tails below)'}\n"
@@ -2202,6 +3187,238 @@ def _pick_present_artifact(
         if (work_dir / n).is_file():
             return n
     return None
+
+
+# Minimal pwntools skeleton the orchestrator drops in when budget /
+# compaction / OOM fires WITHOUT main producing an exploit.py. The
+# scaffold's only job is to land SOMETHING runnable so the sandbox +
+# postjudge path activates, which means the next auto-retry hand-off
+# carries an actionable artifact instead of an empty failed job.
+# Loads libc_profile.json if present so re-entries inherit the staged
+# glibc symbols + how2heap recommendation.
+_FALLBACK_EXPLOIT_TEMPLATE = '''\
+#!/usr/bin/env python3
+"""Auto-generated fallback exploit — main session exhausted its budget /
+hit OOM before drafting a real exploit. This skeleton exists ONLY so
+the sandbox + postjudge cycle can fire and feed a real retry hint
+into the next attempt. Replace with proper chain on /retry.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+from pwn import ELF, context, log, p64, process, remote, u64  # noqa: F401
+
+context.log_level = "info"
+context.timeout = 10
+
+BIN = "./prob"
+
+
+def make_tube():
+    if len(sys.argv) >= 2 and ":" in sys.argv[1]:
+        host, port = sys.argv[1].rsplit(":", 1)
+        return remote(host, int(port))
+    return process(BIN)
+
+
+# Profile-driven branch (filled by chal-libc-fix autoboot).
+PROFILE_PATH = Path("./.chal-libs/libc_profile.json")
+profile = None
+if PROFILE_PATH.is_file():
+    try:
+        profile = json.loads(PROFILE_PATH.read_text())
+        log.info(f"libc: {profile.get('version')} | "
+                 f"recommended: {(profile.get('recommended_techniques') or [None])[0]}")
+    except Exception as e:
+        log.warn(f"profile read failed: {e}")
+
+p = make_tube()
+
+# TODO(auto-fallback): the analysis phase never landed a real exploit;
+# this script connects, probes, and exits. Replace the body below with
+# a real chain on /retry — the postjudge feedback for THIS run will
+# carry actionable hints.
+try:
+    banner = p.recv(timeout=2)
+    log.info(f"banner: {banner[:200]!r}")
+    p.sendline(b"help")
+    follow = p.recv(timeout=2)
+    log.info(f"after help: {follow[:200]!r}")
+except Exception as e:
+    log.warn(f"probe error: {e}")
+finally:
+    p.close()
+'''
+
+_FALLBACK_REPORT_TEMPLATE = '''\
+# Fallback report (auto-generated)
+
+**Status**: `exploit_status: aborted` — main session exhausted its tool-call
+budget / hit OOM / hit compaction ceiling without producing a working
+exploit. The orchestrator dropped a probe-only skeleton at `./exploit.py`
+so the sandbox + postjudge cycle still fires.
+
+## What the auto-fallback knows
+
+- libc version: see `./.chal-libs/libc_profile.json` (`version` field)
+- recommended chain: same JSON, `recommended_techniques`
+- how2heap PoC for this glibc: `how2heap.dir`
+
+## What the auto-fallback does NOT know
+
+- the chal's input protocol (menu structure, prompt strings)
+- the specific vulnerable function
+- the offsets / one_gadget choice
+
+## Next step
+
+Click **/retry** in the UI. The postjudge feedback for the probe run
+will feed into the next attempt's user-turn so analysis resumes from
+where the budget hit. The retry SDK session is forked so prior
+reasoning context carries over.
+'''
+
+
+def write_fallback_artifacts(work_dir: Path, log_fn) -> None:
+    """Drop a probe-only exploit.py + report.md when main's session
+    ends WITHOUT producing them. Best-effort: any write error is logged
+    and swallowed (the caller's downstream code handles "no artifact"
+    fine — this is purely an upgrade to "no_flag / partial" status
+    instead of "failed").
+    """
+    try:
+        ex = work_dir / "exploit.py"
+        if not ex.is_file():
+            ex.write_text(_FALLBACK_EXPLOIT_TEMPLATE)
+            log_fn(f"[orchestrator] wrote fallback ./exploit.py ({len(_FALLBACK_EXPLOIT_TEMPLATE)} B)")
+        rp = work_dir / "report.md"
+        if not rp.is_file():
+            rp.write_text(_FALLBACK_REPORT_TEMPLATE)
+            log_fn(f"[orchestrator] wrote fallback ./report.md ({len(_FALLBACK_REPORT_TEMPLATE)} B)")
+    except Exception as e:
+        log_fn(f"[orchestrator] fallback artifact write failed: {e}")
+
+
+# Schema for findings.json — checked AFTER main writes it; missing/wrong
+# fields produce a "findings.json invalid: ..." warning that gets folded
+# into the next auto-retry user-turn so main fixes it on the retry.
+# Keep tight enough to catch the obvious mistakes (wrong types, missing
+# required keys) without becoming a full JSON-schema implementation —
+# we don't ship a validator dep here.
+_FINDINGS_REQUIRED_TOP_KEYS = {
+    "schema_version", "chal_name", "glibc_version", "arch",
+    "mitigations", "vulns", "chain", "exploit_status", "caveats",
+}
+_FINDINGS_REQUIRED_VULN_KEYS = {
+    "id", "bug_class", "file", "line", "trigger",
+    "primitive_class", "primitive_quality",
+}
+_FINDINGS_REQUIRED_CHAIN_KEYS = {
+    "technique_name", "how2heap_file", "steps",
+    "one_gadget_offset", "expected_observable",
+}
+_FINDINGS_PRIM_QUALITY = {"HIGH", "MED", "LOW"}
+_FINDINGS_PRIM_CLASS = {
+    "AAW", "RCE", "UAF", "AAR",
+    "partial-write", "info-leak", "dos",
+}
+_FINDINGS_EXPLOIT_STATUS = {
+    "drafted", "tested-failed", "tested-partial",
+    "flag-captured", "aborted",
+}
+
+
+def validate_findings(work_dir: Path) -> list[str]:
+    """Return list of human-readable findings.json schema issues.
+    Empty list = either valid OR file missing (callers decide which).
+    Used by the auto-retry loop to surface schema drift back to main
+    on the next turn.
+    """
+    p = work_dir / "findings.json"
+    if not p.is_file():
+        return []
+    issues: list[str] = []
+    try:
+        data = json.loads(p.read_text())
+    except json.JSONDecodeError as e:
+        return [f"findings.json is not valid JSON: {e}"]
+    if not isinstance(data, dict):
+        return ["findings.json top-level is not an object"]
+    missing_top = _FINDINGS_REQUIRED_TOP_KEYS - set(data.keys())
+    if missing_top:
+        issues.append(f"findings.json missing top-level keys: {sorted(missing_top)}")
+    vulns = data.get("vulns")
+    if not isinstance(vulns, list) or not vulns:
+        issues.append("findings.json `vulns` must be a non-empty array")
+    else:
+        any_high = False
+        for i, v in enumerate(vulns):
+            if not isinstance(v, dict):
+                issues.append(f"findings.json vulns[{i}] is not an object")
+                continue
+            m = _FINDINGS_REQUIRED_VULN_KEYS - set(v.keys())
+            if m:
+                issues.append(f"findings.json vulns[{i}] missing keys: {sorted(m)}")
+            pc = v.get("primitive_class")
+            if pc is not None and pc not in _FINDINGS_PRIM_CLASS:
+                issues.append(
+                    f"findings.json vulns[{i}].primitive_class={pc!r} "
+                    f"not in {sorted(_FINDINGS_PRIM_CLASS)}"
+                )
+            pq = v.get("primitive_quality")
+            if pq is not None and pq not in _FINDINGS_PRIM_QUALITY:
+                issues.append(
+                    f"findings.json vulns[{i}].primitive_quality={pq!r} "
+                    f"not in {sorted(_FINDINGS_PRIM_QUALITY)}"
+                )
+            if pq == "HIGH":
+                any_high = True
+        if vulns and not any_high:
+            issues.append(
+                "findings.json has no HIGH-tier primitive — chain made "
+                "of MED/LOW stepping stones alone won't capture a flag. "
+                "See QUALITY TIERS in the heap cheat-sheet."
+            )
+    chain = data.get("chain")
+    if not isinstance(chain, dict):
+        issues.append("findings.json `chain` must be an object")
+    else:
+        m = _FINDINGS_REQUIRED_CHAIN_KEYS - set(chain.keys())
+        if m:
+            issues.append(f"findings.json chain missing keys: {sorted(m)}")
+        if (chain.get("technique_name")
+                and chain.get("how2heap_file") is None):
+            issues.append(
+                f"findings.json chain.technique_name="
+                f"{chain.get('technique_name')!r} set but how2heap_file "
+                "is null — point at /opt/how2heap/glibc_<VER>/<name>.c "
+                "if it exists in the corpus, else explain in caveats."
+            )
+    status = data.get("exploit_status")
+    if status is not None and status not in _FINDINGS_EXPLOIT_STATUS:
+        issues.append(
+            f"findings.json exploit_status={status!r} not in "
+            f"{sorted(_FINDINGS_EXPLOIT_STATUS)}"
+        )
+    glibc_in_profile = None
+    try:
+        profile_path = work_dir / ".chal-libs" / "libc_profile.json"
+        if profile_path.is_file():
+            pdata = json.loads(profile_path.read_text())
+            glibc_in_profile = pdata.get("version")
+    except Exception:
+        pass
+    if (glibc_in_profile and data.get("glibc_version")
+            and data["glibc_version"] != glibc_in_profile):
+        issues.append(
+            f"findings.json glibc_version={data['glibc_version']!r} "
+            f"disagrees with libc_profile.json ({glibc_in_profile!r}). "
+            "Trust the profile — it was extracted from the actual libc."
+        )
+    return issues
 
 
 async def run_main_agent_session(
@@ -2275,6 +3492,148 @@ async def run_main_agent_session(
 
     last_sandbox: dict | None = None
 
+    # Soft-eject machinery: at 80% of INVESTIGATION_BUDGET with no
+    # artifact yet, queue a user-turn injection so the agent SEES the
+    # warning in its own context (a log_line alone doesn't reach the
+    # model). Fires AT MOST ONCE per job — the inject_after_turn flag
+    # is consumed by the main loop after the current agent turn ends.
+    soft_eject_fired = {"value": False}
+    soft_eject_pending = {"value": False}
+
+    def _maybe_soft_eject(tool_calls: int) -> None:
+        if soft_eject_fired["value"]:
+            return
+        try:
+            cap = int(os.environ.get("INVESTIGATION_BUDGET", "0"))
+        except ValueError:
+            cap = 0
+        if cap <= 0:
+            return
+        threshold = int(cap * 0.8)
+        if tool_calls < threshold:
+            return
+        if any((work_dir / n).is_file() for n in artifact_names):
+            return
+        soft_eject_fired["value"] = True
+        soft_eject_pending["value"] = True
+        log_fn(
+            f"SOFT_EJECT_WARN: {tool_calls}/{cap} tool calls without "
+            f"{' / '.join(artifact_names)}. Hard abort fires at "
+            f"{cap}. Will inject finalize-now user-turn after current "
+            f"turn ends."
+        )
+
+    # Scaffold-missing nudge: heap chals where main is making tool calls
+    # but hasn't `cp`'d any /opt/scaffold/ template into the work dir by
+    # SCAFFOLD_NUDGE_THRESHOLD calls. One-shot per job. Gated by the
+    # heap_keywords_match flag the analyzer can pass through `summary`
+    # so non-heap modules don't see this nudge.
+    scaffold_nudge_fired = {"value": False}
+    scaffold_nudge_pending = {"value": False}
+
+    def _maybe_scaffold_nudge(tool_calls: int) -> None:
+        if scaffold_nudge_fired["value"]:
+            return
+        if not summary.get("heap_chal"):
+            return
+        try:
+            threshold = int(os.environ.get("SCAFFOLD_NUDGE_THRESHOLD", "30"))
+        except ValueError:
+            threshold = 30
+        if threshold <= 0 or tool_calls < threshold:
+            return
+        # Already cp'd a scaffold? Look for the canonical fingerprint
+        # (the heap_menu.py docstring's first line lives at the top).
+        ex = work_dir / "exploit.py"
+        scaffold_in_use = False
+        if ex.is_file():
+            try:
+                head = ex.read_text(errors="replace")[:512]
+                if "Heap-menu chal scaffold" in head or "scaffold.fsop_wfile" in head \
+                        or "scaffold.tcache_poison" in head or "scaffold.aslr_retry" in head:
+                    scaffold_in_use = True
+            except Exception:
+                pass
+        if scaffold_in_use:
+            scaffold_nudge_fired["value"] = True  # never nudge if already in use
+            return
+        scaffold_nudge_fired["value"] = True
+        scaffold_nudge_pending["value"] = True
+        log_fn(
+            f"SCAFFOLD_NUDGE: {tool_calls} tool calls into a heap chal "
+            f"without /opt/scaffold/ in exploit.py. Will inject nudge "
+            f"user-turn after current turn ends."
+        )
+
+    # Subagent-spawn hard cap. With the isolated MCP path each
+    # `spawn_subagent` invocation runs in its own claude CLI
+    # subprocess, but the subagent's final-text reply still grows
+    # main's conversation history (a few KB per spawn). With the
+    # legacy in-process `Agent` path the subagent's WHOLE context
+    # accumulates into main's Node.js heap. Either way, unbounded
+    # delegation eventually pushes the worker past its cgroup
+    # mem_limit. Jobs 011a/7c4a/ff82/5c53/c4f4 all OOMed at a
+    # spawn moment under the legacy path.
+    #
+    # Two-stage enforcement:
+    #
+    #  (a) WARN at cap — fires when summary["subagent_spawns"] == cap.
+    #      Sets `subagent_cap_pending` for post-turn injection of
+    #      SUBAGENT_CAP_USER_TURN. Works only if main yields its
+    #      turn before the next spawn (often it does NOT — see
+    #      job c4f49803edfe: 8 minutes of continuous tool calls
+    #      with no turn boundary).
+    #
+    #  (b) BREAK at cap+1 — when main emits another Agent spawn
+    #      AFTER the cap, we set `subagent_cap_break` and break the
+    #      receive loop on the next yield. Same recovery path as
+    #      compaction_ceiling: idempotent fallback artifact write,
+    #      pending flags cleared, fall through to sandbox dispatch.
+    #      Best-effort against the SDK's fork race; the fallback +
+    #      higher memswap_limit are the layered safety net.
+    subagent_cap_fired = {"value": False}
+    subagent_cap_pending = {"value": False}
+    subagent_cap_break = {"value": False}
+
+    def _maybe_subagent_cap() -> None:
+        try:
+            cap = int(os.environ.get("SUBAGENT_SPAWN_CAP", "4"))
+        except ValueError:
+            cap = 4
+        if cap <= 0:
+            return
+        count = int(summary.get("subagent_spawns", 0))
+        if count >= cap and not subagent_cap_fired["value"]:
+            subagent_cap_fired["value"] = True
+            subagent_cap_pending["value"] = True
+            log_fn(
+                f"SUBAGENT_CAP_REACHED: {count}/{cap} Agent spawns. "
+                f"Will inject 'no more spawns' user-turn after current "
+                f"turn ends."
+            )
+        if count > cap and not subagent_cap_break["value"]:
+            subagent_cap_break["value"] = True
+            log_fn(
+                f"SUBAGENT_CAP_EXCEEDED: {count}/{cap} Agent spawns "
+                f"— breaking receive loop NOW so the in-flight fork "
+                f"is killed before it OOMs the worker."
+            )
+
+    # State for the compaction guard. The SOFT warning is injected
+    # as a user-turn AT MOST ONCE per session. The HARD ceiling
+    # triggers a clean abort + retry-loop fork so the next attempt
+    # starts with a small context.
+    compaction_warn_pending = {"value": False}
+    compaction_ceiling_hit = {"value": False}
+
+    # Final-draft last-chance guard. When budget_exceeded fires WITHOUT
+    # an artifact, we inject FINAL_DRAFT_USER_TURN and give main ONE
+    # more turn to write the draft. Only after that turn also fails to
+    # produce an artifact do we actually abort. Used at most once per
+    # session — the second failure is hard.
+    final_draft_pending = {"value": False}
+    final_draft_used = {"value": False}
+
     async with ClaudeSDKClient(options=options) as client:
         await client.query(initial_prompt)
 
@@ -2292,19 +3651,119 @@ async def run_main_agent_session(
                         log_assistant_blocks(job_id, msg, summary)
                     elif isinstance(msg, UserMessage):
                         log_user_blocks(job_id, msg)
-                    if budget_exceeded(
+                    _maybe_soft_eject(summary.get("tool_calls", 0))
+                    _maybe_scaffold_nudge(summary.get("tool_calls", 0))
+                    _maybe_subagent_cap()
+                    # If main went past the cap (emitted Agent #cap+1
+                    # without yielding its turn), break the receive
+                    # loop NOW so the SDK kills the in-flight fork
+                    # before it OOMs the worker. Treat the same as
+                    # compaction_ceiling: write fallback + clear
+                    # pending flags + fall through to sandbox dispatch.
+                    if subagent_cap_break["value"]:
+                        count = int(summary.get("subagent_spawns", 0))
+                        try:
+                            cap = int(os.environ.get(
+                                "SUBAGENT_SPAWN_CAP", "4"))
+                        except ValueError:
+                            cap = 4
+                        exploit_missing = not (work_dir / "exploit.py").is_file()
+                        report_missing = not (work_dir / "report.md").is_file()
+                        write_fallback_artifacts(work_dir, log_fn)
+                        if exploit_missing or report_missing:
+                            summary["fallback_artifact_used"] = True
+                        summary["agent_error"] = (
+                            f"subagent spawn cap exceeded "
+                            f"({count}/{cap})"
+                        )
+                        summary["agent_error_kind"] = "subagent_cap"
+                        _snapshot_cost(summary, "SUBAGENT_CAP_EXCEEDED")
+                        final_draft_pending["value"] = False
+                        compaction_warn_pending["value"] = False
+                        soft_eject_pending["value"] = False
+                        scaffold_nudge_pending["value"] = False
+                        subagent_cap_pending["value"] = False
+                        break
+                    # Compaction state check — must come BEFORE
+                    # budget_exceeded so an OOM-imminent run can fork
+                    # rather than abort with "no artifact".
+                    cstate = get_compaction_state(job_id)
+                    if cstate == "ceiling" and not compaction_ceiling_hit["value"]:
+                        compaction_ceiling_hit["value"] = True
+                        cr = int((_token_state.get(job_id) or {}).get(
+                            "cache_read_input_tokens") or 0)
+                        log_fn(
+                            f"COMPACTION_CEILING: cache_read={cr:,} crossed "
+                            f"hard ceiling. Writing fallback artifact + "
+                            f"ending main session so the sandbox path "
+                            "still fires before OOM kills the SDK."
+                        )
+                        # write_fallback_artifacts is idempotent — calls
+                        # are no-ops on files that already exist, so we
+                        # always call it unconditionally to guarantee
+                        # report.md gets drafted even when main wrote
+                        # exploit.py but not the report companion.
+                        exploit_missing = not (work_dir / "exploit.py").is_file()
+                        report_missing = not (work_dir / "report.md").is_file()
+                        write_fallback_artifacts(work_dir, log_fn)
+                        if exploit_missing or report_missing:
+                            summary["fallback_artifact_used"] = True
+                        summary["agent_error"] = (
+                            f"context compaction ceiling reached "
+                            f"(cache_read={cr})"
+                        )
+                        summary["agent_error_kind"] = "compaction_ceiling"
+                        _snapshot_cost(summary, "COMPACTION_CEILING")
+                        # We're at the OOM doorstep — don't feed any
+                        # more user-turn injections into this session.
+                        # Clearing the pending flags lets us skip past
+                        # the post-loop client.query blocks straight to
+                        # sandbox dispatch.
+                        final_draft_pending["value"] = False
+                        compaction_warn_pending["value"] = False
+                        soft_eject_pending["value"] = False
+                        scaffold_nudge_pending["value"] = False
+                        subagent_cap_pending["value"] = False
+                        # Break so sandbox + postjudge still runs with
+                        # the fallback artifact; the job ends as
+                        # no_flag/partial instead of failed.
+                        break
+                    elif cstate == "warn" and mark_compaction_warned(job_id):
+                        compaction_warn_pending["value"] = True
+                        cr = int((_token_state.get(job_id) or {}).get(
+                            "cache_read_input_tokens") or 0)
+                        log_fn(
+                            f"COMPACTION_WARN: cache_read={cr:,} crossed "
+                            f"soft threshold. Will inject finalize-now "
+                            f"user-turn after main's current turn ends."
+                        )
+                    # Budget check is SUPPRESSED during the FINAL_DRAFT
+                    # turn — `tool_calls` and missing-artifact state
+                    # carry over from the previous turn, so re-running
+                    # the check immediately would fire on the very first
+                    # msg of main's response and abort before main can
+                    # write anything (job 13a3fc9993ee — BUDGET_ABORT
+                    # fired in the same wall-clock second as FINAL_DRAFT
+                    # was injected, no chance for the model to react).
+                    # Once main's ResultMessage arrives we check the
+                    # artifact instead.
+                    if not final_draft_used["value"] and budget_exceeded(
                         summary.get("tool_calls", 0),
                         work_dir, artifact_names,
                     ):
+                        final_draft_used["value"] = True
+                        final_draft_pending["value"] = True
                         log_fn(
-                            "BUDGET_ABORT: investigation budget exceeded "
-                            f"({summary.get('tool_calls', 0)} tool calls, "
-                            f"no {' / '.join(artifact_names)}). Stopping early."
+                            "BUDGET_LAST_CHANCE: "
+                            f"{summary.get('tool_calls', 0)} tool "
+                            f"calls, no {' / '.join(artifact_names)}. "
+                            f"Injecting FINAL_DRAFT user-turn — "
+                            "main gets one more turn to write the "
+                            "draft before hard abort."
                         )
-                        summary["agent_error"] = "investigation budget exceeded"
-                        summary["agent_error_kind"] = "budget"
-                        _snapshot_cost(summary, "BUDGET_ABORT")
-                        return last_sandbox
+                        # Break out of the receive loop so the
+                        # turn-boundary inject block runs.
+                        break
                     if isinstance(msg, ResultMessage):
                         summary["result"] = {
                             "duration_ms": msg.duration_ms,
@@ -2313,6 +3772,38 @@ async def run_main_agent_session(
                             "is_error": msg.is_error,
                         }
                         log_fn(f"DONE: {summary['result']}")
+                        # Post-FINAL_DRAFT artifact verdict: main has
+                        # had one full turn since the inject. If we're
+                        # still missing the artifact, drop a probe-only
+                        # fallback so the sandbox + postjudge cycle
+                        # still fires. The job ends as no_flag (or
+                        # finished/partial if the probe surfaces useful
+                        # output) instead of aborted/failed — which is
+                        # the contract the user asked for ("abort 자체
+                        # 가 없게").
+                        if (final_draft_used["value"]
+                                and not final_draft_pending["value"]
+                                and not _pick_present_artifact(
+                                    work_dir, artifact_names)):
+                            log_fn(
+                                "BUDGET_FALLBACK: main never produced "
+                                f"{' / '.join(artifact_names)} after "
+                                "FINAL_DRAFT push — dropping probe-only "
+                                "skeleton so sandbox still runs."
+                            )
+                            write_fallback_artifacts(
+                                work_dir, log_fn,
+                            )
+                            summary["agent_error"] = (
+                                "budget exhausted; fallback artifact used"
+                            )
+                            summary["agent_error_kind"] = "budget_fallback"
+                            summary["fallback_artifact_used"] = True
+                            _snapshot_cost(summary, "BUDGET_FALLBACK")
+                            # Break the receive loop and let the
+                            # sandbox / postjudge / auto-retry path
+                            # downstream pick up the fallback artifact.
+                            break
             except Exception as e:
                 msg_text = str(e)
                 kind = classify_agent_error(msg_text)
@@ -2327,7 +3818,110 @@ async def run_main_agent_session(
                     summary["agent_error_kind"] = "oom_or_killed"
                 log_fn(f"AGENT_ERROR ({summary['agent_error_kind']}): {msg_text[:400]}")
                 _snapshot_cost(summary, "AGENT_ERROR")
-                return last_sandbox
+                # OOM/SIGKILL/timeout: keep the run alive. Even if main
+                # already wrote exploit.py, the receive loop blew up
+                # before we could dispatch the sandbox — so we MUST fall
+                # through to the sandbox/postjudge block below instead of
+                # returning early (job ff8240803dc2: exploit.py present
+                # but sandbox=null because this branch short-circuited).
+                # write_fallback_artifacts is idempotent — it only writes
+                # files that are actually missing — so a partial drop
+                # (e.g. main wrote exploit.py but not report.md) still
+                # gets a companion report drafted.
+                # `.get()` (not direct indexing): when compaction-ceiling /
+                # OOM-guard env vars are set to 0 the agent can finish cleanly
+                # and the key is never set — KeyError'd job e36ae35755e0
+                # ($11.82 wasted) on the way through this branch on
+                # 2026-05-14.
+                if summary.get("agent_error_kind") in (
+                    "oom_or_killed", "compaction_ceiling", "timeout",
+                    "subagent_cap",
+                ):
+                    exploit_missing = not (work_dir / "exploit.py").is_file()
+                    report_missing = not (work_dir / "report.md").is_file()
+                    write_fallback_artifacts(work_dir, log_fn)
+                    if exploit_missing or report_missing:
+                        summary["fallback_artifact_used"] = True
+                        log_fn(
+                            f"[orchestrator] {summary.get('agent_error_kind')}"
+                            " fired — wrote fallback ("
+                            f"exploit.py {'missing' if exploit_missing else 'kept'}"
+                            f", report.md {'missing' if report_missing else 'kept'}"
+                            ") so sandbox still runs"
+                        )
+                    else:
+                        log_fn(
+                            f"[orchestrator] {summary['agent_error_kind']}"
+                            " fired but main already produced both "
+                            "artifacts — proceeding to sandbox"
+                        )
+                    # SDK client is dead after this exception (the
+                    # underlying `claude` CLI got SIGKILLed). Clear any
+                    # pending user-turn injections so the post-loop
+                    # blocks below don't try `client.query(...)` on a
+                    # broken transport and crash a second time. We want
+                    # to land in the sandbox/postjudge dispatch instead.
+                    final_draft_pending["value"] = False
+                    compaction_warn_pending["value"] = False
+                    soft_eject_pending["value"] = False
+                    scaffold_nudge_pending["value"] = False
+                    subagent_cap_pending["value"] = False
+                else:
+                    return last_sandbox
+
+            # ---- FINAL_DRAFT last-chance injection ----
+            # Highest priority — budget already overrun and the
+            # alternative is aborting the whole job. Always inject if
+            # pending, regardless of other guards.
+            if final_draft_pending["value"]:
+                final_draft_pending["value"] = False
+                log_fn("[orchestrator] injecting FINAL_DRAFT last-chance user-turn")
+                await client.query(FINAL_DRAFT_USER_TURN)
+                continue
+
+            # ---- Subagent-spawn cap injection ----
+            # Fires when summary["subagent_spawns"] crosses
+            # SUBAGENT_SPAWN_CAP. Higher priority than the other
+            # injections because the next concurrent SDK CLI fork is
+            # the documented OOM trigger (5c5334381583: 3.1M cache_read
+            # + 3rd Agent spawn → SIGKILL).
+            if subagent_cap_pending["value"]:
+                subagent_cap_pending["value"] = False
+                log_fn("[orchestrator] injecting subagent-cap user-turn")
+                await client.query(SUBAGENT_CAP_USER_TURN)
+                continue
+
+            # ---- Compaction soft warning injection ----
+            # If we crossed the SOFT threshold inside the just-ended
+            # turn, inject the COMPACTION_USER_TURN now and let main
+            # respond (finalize the artifact, no subagent spawns). The
+            # ceiling case was already handled inline above (clean abort).
+            if compaction_warn_pending["value"]:
+                compaction_warn_pending["value"] = False
+                log_fn("[orchestrator] injecting compaction warning user-turn")
+                await client.query(COMPACTION_USER_TURN)
+                continue
+
+            # ---- Soft-eject (budget 80%) user-turn injection ----
+            # Job d8decbd77ed9 hit SOFT_EJECT_WARN at 80/100 calls but
+            # the log_line alone didn't reach the model — it kept
+            # investigating until BUDGET_ABORT fired with no artifact.
+            # Inject the warning as a user-turn so main actually sees it.
+            if soft_eject_pending["value"]:
+                soft_eject_pending["value"] = False
+                log_fn("[orchestrator] injecting soft-eject user-turn")
+                await client.query(SOFT_EJECT_USER_TURN)
+                continue
+
+            # ---- Scaffold-missing nudge ----
+            # Heap chal + N tool calls + no /opt/scaffold/ template in
+            # exploit.py → nudge main to use the canonical templates
+            # instead of reinventing the wheel from scratch.
+            if scaffold_nudge_pending["value"]:
+                scaffold_nudge_pending["value"] = False
+                log_fn("[orchestrator] injecting scaffold-missing nudge")
+                await client.query(SCAFFOLD_MISSING_USER_TURN)
+                continue
 
             # ---- Decide whether to feed postjudge back to main ----
             if not auto_run or sandbox_runner is None:
@@ -2345,7 +3939,7 @@ async def run_main_agent_session(
             # "exploit.py missing, cannot auto-run" on every cycle and the
             # auto-retry loop short-circuits with verdict=None.
             jd = job_dir(job_id)
-            for nm in (picked, "report.md"):
+            for nm in (picked, "report.md", "findings.json", "THREAT_MODEL.md"):
                 src = work_dir / nm
                 if not src.is_file():
                     continue
@@ -2372,6 +3966,27 @@ async def run_main_agent_session(
                 log_fn(
                     f"[orchestrator] auto-run turn {attempt} succeeded "
                     f"(flags={len(flags_now)}, verdict={verdict}) — exiting loop"
+                )
+                return last_sandbox
+
+            # If the SDK client died on this attempt (OOM / SIGKILL /
+            # timeout / compaction-ceiling), the transport is dead and
+            # any `client.query(retry_hint)` below would crash again.
+            # The sandbox + judge we just ran is the rescue value of
+            # this job — surface it and stop instead of trying to feed
+            # postjudge back into a broken session.
+            # `.get()` (not direct indexing): the key is only set on
+            # abnormal SDK termination paths (3526/3562/3647/3658/3665);
+            # a clean DONE leaves it absent. Direct [] KeyError'd job
+            # e36ae35755e0 after the agent + sandbox both succeeded.
+            if summary.get("agent_error_kind") in (
+                "oom_or_killed", "compaction_ceiling", "timeout",
+                "subagent_cap",
+            ):
+                log_fn(
+                    f"[orchestrator] client died this attempt "
+                    f"({summary.get('agent_error_kind')}); surfacing sandbox "
+                    f"verdict={verdict} without further retries"
                 )
                 return last_sandbox
 
@@ -2402,11 +4017,18 @@ async def run_main_agent_session(
             # Inject postjudge feedback as next user turn and loop.
             attempt += 1
             write_meta(job_id, stage=f"auto-retry-{attempt}")
+            findings_issues = validate_findings(work_dir)
+            if findings_issues:
+                log_fn(
+                    "[orchestrator] findings.json schema issues: "
+                    f"{len(findings_issues)} — folding into retry feedback"
+                )
             feedback = _format_postjudge_user_turn(
                 attempt_idx=attempt,
                 max_attempts=max_retries,
                 script_filename=picked,
                 sandbox_result=last_sandbox or {},
+                findings_issues=findings_issues,
             )
             log_fn(
                 f"[orchestrator] injecting postjudge feedback as new user "
