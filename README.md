@@ -643,6 +643,7 @@ upload ──► /data/jobs/<id>/         ─► RQ enqueue
 | GET | `/api/jobs` | list all jobs |
 | GET | `/api/jobs/{id}` | job meta |
 | GET | `/api/jobs/{id}/log[?tail=N]` | run log (text). `?tail=N` returns only the trailing N bytes (newline-aligned, used by the polling UI). |
+| GET | `/api/jobs/{id}/stream` | Server-Sent Events: live multiplex of `log` (every run.log line), `meta` (status / flag / token+turn deltas), and `sdk` (raw assistant blocks: text / thinking / tool_use / tool_result). On connect: replays current meta + the last ~256 KB of run.log marked `backfill:true`, then streams new events. 15 s `: ping` heartbeats; auto-closes on terminal status. Cookie/token auth via the standard middleware. |
 | GET | `/api/jobs/{id}/result` | result JSON |
 | GET | `/api/jobs/{id}/file/{name}` | any artifact under the job dir |
 | DELETE | `/api/jobs/{id}` | delete one job (cancels queued/running) |
@@ -696,7 +697,18 @@ HexTech_CTF_TOOL/
 ├── misc/                # binwalk + foremost + steghide + zsteg + ...
 ├── runner/              # Python + crypto libs + pwntools (sandbox)
 ├── web-ui/              # static HTML/CSS/JS
+├── scripts/             # one-off operator tools (e.g. job-status.sh)
 └── data/                # job uploads + outputs (gitignored)
+    └── jobs/<id>/
+        ├── meta.json    # status + tokens + cost
+        ├── run.log      # timestamped agent transcript
+        ├── result.json  # final summary (post-judge)
+        ├── bin/ src/    # upload (per module — zips auto-extracted)
+        └── work/        # agent cwd — exploit.py, report.md, …
+            └── tmp/     # per-job TMPDIR — `TMPDIR`/`TMP`/`TEMP`
+                        #   are injected into every agent + sandbox
+                        #   subprocess so concurrent jobs never share
+                        #   `/tmp/*`. Auto-cleaned on `DELETE /api/jobs/<id>`.
 ```
 
 ## Module-specific notes
@@ -707,6 +719,12 @@ HexTech_CTF_TOOL/
 - Auto-run runs the produced `exploit.py <url>` in a sandboxed runner.
 
 ### Pwn
+- **Upload**: zip preferred (any zip / tar bundle containing the
+  challenge ELF — Dreamhack-style packaging works as-is) or a bare
+  single ELF/PE. Remote-only jobs (host:port without a binary) are
+  also accepted. The analyzer's `_find_elf_or_unzip` auto-unpacks
+  bundles into `./chal/` and stages the largest ELF as the canonical
+  target — the agent never sees a `.zip` it has to unpack manually.
 - Requires the `decompiler` image (Ghidra 12.0.4 by default; override
   `GHIDRA_VERSION`/`GHIDRA_BUILD_DATE` in `.env`).
 - Per-job timeline: ~2–3 min initial decompile + Claude analysis time.
@@ -719,6 +737,18 @@ HexTech_CTF_TOOL/
   disable), `strace`, `ltrace`, `patchelf`, `cpio`, `ROPgadget`
   (`capstone>=5` so ARM64 gadget search returns hits), `one_gadget`,
   `pwn checksec`.
+- **`gdb-clean`** — drop-in `gdb` wrapper that strips GEF's
+  per-invocation banner (`X commands loaded and Y functions added`,
+  `[!] To get gef-extras …`) and ANSI/readline escape codes from
+  stdout+stderr. The debugger subagent runs `gdb -batch -x probe.py`
+  dozens of times per session; without this the banner alone burns
+  ~52 log lines and ~1 KB of cache tokens per call. Anything you'd
+  pass to `gdb` works (`gdb-clean -nh -batch -x probe.py`); use
+  `/usr/bin/gdb` directly when you actually want the banner. Paired
+  with `/opt/scaffold/gdb-init.py`, which disables GEF's auto-context
+  panel (registers / stack / code / trace) so per-stop output stays
+  terse — source it first in every probe (`-ex 'source
+  /opt/scaffold/gdb-init.py'`).
 - **`ghiant xrefs <bin> <sym|addr>`** — cross-reference query against
   the cached Ghidra project. Returns JSON with every reference site
   (UNCONDITIONAL_CALL / DATA_READ / DATA_WRITE / etc.) — strictly
@@ -865,6 +895,10 @@ HexTech_CTF_TOOL/
   ecdsa, pwntools.
 
 ### Reversing
+- **Upload**: zip preferred (the API auto-extracts and picks the
+  largest ELF/PE inside as the canonical `binary_name`, flattening
+  it into `bin/` so the agent's `./bin/<name>` reference resolves
+  cleanly) or a bare single ELF/PE.
 - Reuses the `decompiler` image.
 - Solver auto-runs in the runner container if requested.
 
@@ -1043,6 +1077,30 @@ enqueued in that case.
   is suppressed while you have an inline retry/resume form open OR
   while you have a non-collapsed selection inside the run log — so
   a copy-paste mid-run isn't clobbered by an incoming line.
+- **Live SSE stream**. Selecting a job opens an `EventSource` against
+  `/api/jobs/<id>/stream` in addition to the 2-second poll. The worker
+  publishes every run-log line, meta delta, and raw SDK block to
+  Redis pub/sub (`job:<id>:{log,meta,sdk}`); the api multiplexes them
+  back out as SSE events. The frontend appends log lines in place
+  (preserves scroll + text selection) and updates the tokens-pill
+  delta the same tick the agent emits a message, so the "↓ X k
+  tokens" counter feels live the way Claude Code's status line does.
+  When the stream is connected the 2 s poller widens to 8 s; if
+  EventSource fails, the fast poller resumes automatically (graceful
+  degradation, no UI surgery required).
+- **Live agent activity panel**. A fixed-height (200 px) panel above
+  the run-log window shows each AssistantMessage block as a single
+  log-tail row: `[tag] AGENT|THINK|TOOL <name>|RESULT: <preview>`,
+  color-coded per kind (text=blue, think=gray italic, tool=yellow,
+  result=green, error=red). 60-line FIFO, auto-tails to bottom when
+  scrolled there, holds position when scrolled up. Click `hide` in
+  the header to collapse; preference persists in `localStorage`.
+- **CLI live status (`scripts/job-status.sh <job_id>`)**. Single
+  carriage-return-refreshed terminal line carrying status / stage /
+  turns / token deltas (`↓in ↑out ⟳cache`) / cost / worker / log
+  growth. Polls `/api/jobs/<id>` every 2 s — useful when you want a
+  glanceable status without opening the browser. `API=http://host:port
+  scripts/job-status.sh <id>` for a remote api.
 
 ## Out-of-band callbacks (XSS / SSRF / blind RCE)
 
