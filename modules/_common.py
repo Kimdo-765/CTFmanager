@@ -1810,7 +1810,6 @@ async def run_pre_recon(
     model: str | None,
     prompt: str,
     log_fn,
-    timeout_s: float | None = None,
     tag: str = "pre-recon",
 ) -> str:
     """Run a recon subagent BEFORE main's first turn so main starts with
@@ -1823,22 +1822,18 @@ async def run_pre_recon(
     sees recon's investigation context. Returns ONLY recon's final text
     (joined assistant TextBlocks), capped at 8 KB.
 
-    Timeout handling: on `asyncio.TimeoutError` the helper returns
-    whatever assistant text recon managed to emit before the deadline
-    — discarding partial output meant we lost ~4 minutes of investigation
-    on job fa6520405673 because the model wrote tool calls + thinking
-    but hadn't yet emitted its final summary block. The partial chunks
-    are still useful context for main even without the final summary.
+    No per-helper timeout: the job-level soft timeout (set via the
+    UI / `JOB_TIMEOUT` env) bounds total wall time, and recon's own
+    output budget keeps it bounded in practice. A separate pre-recon
+    cap was double-counting and (on job fa6520405673) discarded a
+    nearly-complete investigation when the final summary was about
+    to be emitted. If recon genuinely hangs, the watchdog + user
+    Stop button still apply.
 
-    Best-effort: SDK import / crash failures return an empty string so
-    the caller can fall back to the normal "main delegates as needed"
-    flow.
-
-    Timeout default: 480 s (heap-pwn chals with libsalloc-style wrappers
-    routinely take 3-4 minutes to ghidra + read libsalloc + libc_profile).
-    Override via PRE_RECON_TIMEOUT_S env var.
+    Best-effort: SDK import / unexpected crashes return whatever
+    assistant text was accumulated so far (possibly empty); the
+    caller falls back to the normal "main delegates as needed" flow.
     """
-    import asyncio as _asyncio
     try:
         from claude_agent_sdk import (
             AssistantMessage,
@@ -1849,18 +1844,13 @@ async def run_pre_recon(
         log_fn(f"[{tag}] SDK import failed ({e}); skipping pre-recon")
         return ""
 
-    if timeout_s is None:
-        try:
-            timeout_s = float(os.environ.get("PRE_RECON_TIMEOUT_S", "480"))
-        except ValueError:
-            timeout_s = 480.0
-
     options = make_standalone_options(
         "recon", model, work_dir, job_id,
     )
     chunks: list[str] = []
+    crashed = False
 
-    async def _drive() -> None:
+    try:
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
             async for msg in client.receive_response():
@@ -1870,8 +1860,6 @@ async def run_pre_recon(
                             txt = getattr(block, "text", "") or ""
                             if txt.strip():
                                 chunks.append(txt)
-                                # Mirror the MCP-spawned-subagent log
-                                # shape so the panel renders the same.
                                 log_line(
                                     job_id,
                                     f"[{tag}] AGENT: {txt[:500]}",
@@ -1891,31 +1879,18 @@ async def run_pre_recon(
                     cost = getattr(msg, "total_cost_usd", None)
                     if isinstance(cost, (int, float)) and cost:
                         log_fn(f"[{tag}] cost: ${cost:.4f}")
-
-    timed_out = False
-    try:
-        await _asyncio.wait_for(_drive(), timeout=timeout_s)
-    except _asyncio.TimeoutError:
-        timed_out = True
-        log_fn(
-            f"[{tag}] timed out after {timeout_s}s — returning partial "
-            f"output ({sum(len(c) for c in chunks)} chars from "
-            f"{len(chunks)} assistant blocks)"
-        )
     except Exception as e:
+        crashed = True
         log_fn(f"[{tag}] crashed: {e!r} — returning partial output")
 
     out = "".join(chunks).strip()
     if not out:
-        if timed_out:
-            log_fn(f"[{tag}] no assistant text yet at timeout — falling back")
         return ""
-    if timed_out:
+    if crashed:
         out = (
-            "[partial — pre-recon hit its timeout; the final summary "
-            "block was not emitted but the assistant text below is "
-            "what recon collected. Spawn a follow-up recon subagent "
-            "if you need the missing sections.]\n\n"
+            "[partial — pre-recon subprocess died before emitting its "
+            "final summary; the assistant text below is what was "
+            "collected. Spawn a follow-up recon if you need more.]\n\n"
         ) + out
     if len(out) > 8000:
         out = out[:8000] + "\n…(truncated)"
@@ -3135,6 +3110,7 @@ def _format_postjudge_user_turn(
     summary = (judge.get("summary") or "").strip()
     retry_hint = (judge.get("retry_hint") or "").strip()
     failure_code = (judge.get("failure_code") or "").strip().lower() or None
+    next_action = (judge.get("next_action") or "continue").lower()
     exit_code = sandbox_result.get("exit_code")
     stdout = (sandbox_result.get("stdout") or "")[-2000:]
     stderr = (sandbox_result.get("stderr") or "")[-2000:]
@@ -3174,6 +3150,8 @@ def _format_postjudge_user_turn(
         f"  · exit_code: {exit_code}\n"
         f"  · postjudge verdict: {verdict}\n"
         f"  · postjudge summary: {summary or '(empty)'}\n"
+        f"  · judge next_action: {next_action} "
+        f"(judge endorses this retry — keep iterating)\n"
         + (f"  · failure_code: {failure_code}\n" if failure_code else "")
         + f"{timeout_marker}"
         f"{fix_preamble}"
@@ -3803,7 +3781,8 @@ async def run_main_agent_session(
 
             # Did we capture a flag this turn?
             flags_now = scan_job_for_flags(job_id)
-            verdict = ((last_sandbox or {}).get("judge") or {}).get("verdict")
+            judge_out = ((last_sandbox or {}).get("judge") or {})
+            verdict = judge_out.get("verdict")
             if flags_now or verdict == "success":
                 log_fn(
                     f"[orchestrator] auto-run turn {attempt} succeeded "
@@ -3827,6 +3806,27 @@ async def run_main_agent_session(
                 )
                 return last_sandbox
 
+            # Judge's explicit stop decision — final authority. If the
+            # judge agent decided this run is unrecoverable (wrong vuln
+            # class picked, target unreachable, repeated mistakes…) we
+            # halt the auto-retry loop and surface for human /retry,
+            # even if max_retries would have allowed more attempts.
+            next_action = (judge_out.get("next_action") or "continue").lower()
+            stop_reason = (judge_out.get("stop_reason") or "").strip()
+            if next_action == "stop":
+                summary["judge_stop_reason"] = stop_reason or "judge requested stop"
+                write_meta(
+                    job_id,
+                    judge_next_action="stop",
+                    judge_stop_reason=summary["judge_stop_reason"],
+                )
+                log_fn(
+                    f"[orchestrator] judge requested STOP "
+                    f"(verdict={verdict}, reason={stop_reason or '(none)'}) — "
+                    f"halting auto-retry loop"
+                )
+                return last_sandbox
+
             # Out of retries? Stop. Negative max_retries means unlimited
             # — only natural exit conditions (flag / verdict==success /
             # empty retry_hint / agent_error / user Stop / timeout) end
@@ -3841,13 +3841,12 @@ async def run_main_agent_session(
                 return last_sandbox
 
             # No retry hint? Nothing actionable to feed back.
-            retry_hint = (
-                ((last_sandbox or {}).get("judge") or {}).get("retry_hint") or ""
-            ).strip()
+            retry_hint = (judge_out.get("retry_hint") or "").strip()
             if not retry_hint:
                 log_fn(
                     f"[orchestrator] postjudge produced no retry_hint "
-                    f"(verdict={verdict}) — stopping auto-retry"
+                    f"(verdict={verdict}, next_action={next_action}) — "
+                    f"stopping auto-retry"
                 )
                 return last_sandbox
 

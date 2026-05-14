@@ -126,8 +126,33 @@ Reply with EXACTLY ONE compact JSON object on the FIRST line, no
 markdown:
 {{"verdict": "success"|"partial"|"hung"|"parse_error"|"network_error"|"crash"|"timeout"|"unknown",
  "summary": "<=200 chars",
- "retry_hint": "<=600 chars; empty when verdict==success",
+ "retry_hint": "<=600 chars; empty when verdict==success or next_action==stop",
+ "next_action": "continue"|"stop",
+ "stop_reason": "<=200 chars; required when next_action==stop, else empty>",
  "failure_code": "<one of the heap codes below; OMIT or null when verdict==success or no heap code applies>"}}
+
+next_action — judge's call on whether to feed retry_hint back to
+main or halt the job:
+  continue — keep iterating. Use whenever you have a concrete fix
+             in retry_hint that main can act on AND the failure
+             mode is reachable from the current artifact (e.g. wrong
+             offset, missing alignment check, recv timeout missing,
+             swapped tube/process, glibc version mismatch).
+  stop     — finalize the job, no more auto-retries. Use ONLY when:
+             (a) verdict == success (flag captured — there's nothing
+                 to retry),
+             (b) the failure is structural and the current artifact
+                 can't be fixed by editing it (wrong vuln class
+                 selected, chal needs a totally different technique,
+                 binary doesn't match the published challenge,
+                 remote target unreachable not due to the script),
+             (c) you have already produced ≥3 similar retry_hints
+                 across this job and main keeps making the same
+                 mistake — escalate to the human operator instead of
+                 burning more dollars.
+  If unsure, default to continue (main learns from postjudge feedback).
+  stop_reason is REQUIRED on stop; it surfaces in run.log + meta.json
+  so the operator knows why the loop halted without a flag.
 
 Verdict guide:
   success       — a flag was clearly captured (FLAG{{}}/HTB{{}}/
@@ -542,6 +567,30 @@ def postjudge_run(
     if verdict == "success":
         retry_hint = ""
 
+    # next_action — judge's continue/stop decision. Defaults to
+    # continue when the model omitted it (legacy / parse failure)
+    # so existing behavior is preserved. success auto-implies stop.
+    raw_next = parsed.get("next_action")
+    if isinstance(raw_next, str):
+        candidate_next = raw_next.strip().lower()
+    else:
+        candidate_next = ""
+    if verdict == "success":
+        next_action = "stop"
+    elif candidate_next in ("continue", "stop"):
+        next_action = candidate_next
+    else:
+        next_action = "continue"
+
+    stop_reason = str(parsed.get("stop_reason") or "")[:400]
+    if next_action != "stop":
+        stop_reason = ""
+    elif verdict == "success" and not stop_reason:
+        stop_reason = "flag captured"
+    # On stop, the retry_hint is informational (operator-visible);
+    # the orchestrator won't feed it back to main but does surface
+    # it in run.log so a human /retry can read what judge thought.
+
     # Heap failure code is optional. Reject anything outside the known
     # set so a model-typoed code doesn't leak into the retry pipeline
     # and confuse the prescriptive-hint lookup.
@@ -554,7 +603,12 @@ def postjudge_run(
     if verdict == "success":
         failure_code = None
 
-    log_fn(f"[judge] postjudge verdict={verdict} summary={summary[:160]}")
+    log_fn(
+        f"[judge] postjudge verdict={verdict} next_action={next_action} "
+        f"summary={summary[:160]}"
+    )
+    if next_action == "stop" and stop_reason:
+        log_fn(f"[judge] postjudge stop_reason={stop_reason[:200]}")
     if failure_code:
         log_fn(f"[judge] postjudge failure_code={failure_code}")
     if retry_hint:
@@ -567,6 +621,8 @@ def postjudge_run(
         "verdict": verdict,
         "summary": summary,
         "retry_hint": retry_hint,
+        "next_action": next_action,
+        "stop_reason": stop_reason,
         "failure_code": failure_code,
         "raw": raw,
     }
