@@ -1510,11 +1510,29 @@ Hard rules
     AT MOST ONE inferior process alive at a time.
     BEFORE spawning a new `./prob` / `./bin/<n>` / `gdb -p PID` /
     `gdbserver` / driver script: clean up first.
-        pkill -9 -f "./prob" 2>/dev/null
-        pkill -9 -f gdbserver 2>/dev/null
-        pkill -9 -f run_driver 2>/dev/null
-        pkill -9 -f probe_driver 2>/dev/null
+
+    NEVER use `pkill -f` for cleanup — the Claude Agent SDK passes
+    your system_prompt as `--system-prompt <prompt>` to the `claude`
+    CLI, so this very paragraph (with the strings "./prob",
+    "gdbserver", "run_driver" inside it) is in EVERY claude
+    subprocess's `/proc/<pid>/cmdline`. A cmdline-anchored pattern
+    like `pkill -f "./prob"` matches your own claude CLI (and your
+    sister subagents'), SIGKILLs them, and the spawn returns exit
+    code -9 with NO useful artifact — a fratricide. Use COMM-anchored
+    (`-x`, executable basename only, max 15 chars) instead:
+
+        pkill -9 -x prob       2>/dev/null   # the inferior binary
+        pkill -9 -x gdbserver  2>/dev/null
         sleep 0.5
+
+    If your inferior basename isn't `prob`, substitute it
+    (`pkill -9 -x "$(basename ./bin/<name>)"`). For Python driver
+    scripts (`python3 run_driver.py`), DO NOT broadly `pkill python3`
+    — that would also kill the RQ worker processes. Instead, run
+    drivers under a tight `timeout 5 python3 …` and `wait` on
+    background pids in the same Bash call so no driver outlives the
+    call that spawned it.
+
     Each pwntools `process(...)` keeps ~30-80 MB resident; gdb adds
     another ~150 MB; concurrent inferiors stack quickly past the
     worker's mem_limit (default 8 GB) and trip the cgroup OOM-killer
@@ -1534,10 +1552,11 @@ Hard rules
          <cmd> | head -c 4194304 > /tmp/out.bin    # 4 MiB cap
          timeout 5 <cmd> > /tmp/out.bin            # time cap
        NEVER `<cmd> > /tmp/out.bin` without one of these.
-    3. After any subprocess run, `pkill -9 -f <cmd_pattern>` AND
-       `ps -ef | grep <prob>` to confirm no zombie/defunct procs
-       are accumulating. A `<defunct>` row is a leaked file handle
-       still consuming memory inside the cgroup.
+    3. After any subprocess run, `pkill -9 -x <comm>` (NOT `-f`; see
+       PROCESS HYGIENE above for why cmdline matching self-immolates)
+       AND `ps -eo pid,comm,args | grep <prob>` to confirm no
+       zombie/defunct procs are accumulating. A `<defunct>` row is
+       a leaked file handle still consuming memory inside the cgroup.
     4. `du -sh /tmp/probe_*` before each new spawn — if any file
        exceeds 100 MiB, `rm -f` it and re-run with a `head -c` cap.
 * heap-probe FIRST: when main's question is about heap state at N
