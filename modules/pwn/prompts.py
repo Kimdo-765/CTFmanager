@@ -619,6 +619,8 @@ def build_user_prompt(
     auto_run: bool,
     *,
     chal_unpacked: bool = False,
+    decomp_ready: bool = False,
+    decomp_files: list[str] | None = None,
 ) -> str:
     parts: list[str] = []
     base_desc, retry_hint = split_retry_hint(description)
@@ -652,6 +654,29 @@ def build_user_prompt(
             "  - Raw bundle tree is at `./chal/` (read-only; helpful for\n"
             "    reading Dockerfile / pwn.xinetd / etc. for deploy context)\n"
             "DO NOT re-unzip into `./bin/extracted/` — the work is done."
+        )
+    if decomp_ready:
+        preview = ""
+        if decomp_files:
+            shown = decomp_files[:30]
+            preview = "\n  ./decomp/ contents (truncated):\n" + "\n".join(
+                f"    {n}" for n in shown
+            )
+            if len(decomp_files) > len(shown):
+                preview += f"\n    …and {len(decomp_files) - len(shown)} more"
+        parts.append(
+            "GHIDRA DECOMPILE ALREADY DONE — `./decomp/*.c` is fully "
+            "populated (the orchestrator's pre-recon ran ghiant for you), "
+            "and `./.ghidra_proj/` holds the cached project so any further "
+            "`ghiant xrefs …` call is warm (~5s).\n"
+            "  → Read `./decomp/<func>_<addr>.c` directly — DO NOT run "
+            "`ghiant ./bin/<n>` again, and DO NOT use bare "
+            "`objdump -d ./bin/<n>` to look at functions when "
+            "`./decomp/<func>.c` already exists. Disasm only when you "
+            "need to verify a specific opcode (movsx/movzx, lea operand, "
+            "jXX predicate) on a single function with a `sed -n '/<func>:/,"
+            "/^$/p'` filter."
+            + preview
         )
     if target:
         parts.append(f"Remote target: {target}")

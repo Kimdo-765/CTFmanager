@@ -300,6 +300,13 @@ def _autobootstrap_libc(
     host_data_dir = os.environ.get("HOST_DATA_DIR") or ""
     if host_data_dir:
         env["HOST_DATA_DIR"] = host_data_dir
+    # Same terminfo silencing the agent SDK gets — chal-libc-fix shells
+    # out to pwntools' ELF helper which otherwise prints a
+    # `_curses.error: setupterm: could not find terminfo database`
+    # warning on every invocation (worker container has no terminfo).
+    env.setdefault("TERM", "xterm")
+    env.setdefault("PWNLIB_NOTERM", "1")
+    env.setdefault("PWNLIB_SILENT", "1")
     try:
         res = subprocess.run(
             cmd, cwd=str(work_dir), env=env,
@@ -391,16 +398,12 @@ async def _run_agent(
         summary=summary,
         resume_sid=resume_sid,
     )
-    user_prompt = build_user_prompt(
-        effective_binary_name, target, description, auto_run,
-        chal_unpacked=chal_unpacked,
-    )
-
     # Auto-pre-recon — let recon do the static triage BEFORE main's
     # first turn so main starts with the 2 KB summary in its prompt
     # instead of having to decide "should I delegate?". Skip for
     # remote-only jobs (no binary to map) and for retries where main
     # is resuming a prior session (has its own context to lean on).
+    recon_reply = ""
     if effective_binary_name and not resume_sid:
         recon_question = _build_pre_recon_prompt(
             binary_name=effective_binary_name,
@@ -417,20 +420,10 @@ async def _run_agent(
             log_fn=lambda s: log_line(job_id, s),
         )
         if recon_reply:
-            user_prompt = (
-                "PRE-RECON COMPLETED — the orchestrator already ran a "
-                "recon subagent on your behalf. Its 2 KB summary is "
-                "below. START from this; do not re-run the same triage "
-                "yourself. Spawn recon AGAIN for follow-up "
-                "questions if needed.\n\n"
-                "==== RECON REPLY ===="
-                f"\n{recon_reply}\n"
-                "==== END RECON ====\n\n"
-            ) + user_prompt
             log_line(
                 job_id,
                 f"[pre-recon] reply ready ({len(recon_reply)} chars) "
-                f"— prepended to main user_prompt",
+                f"— prepending to main user_prompt",
             )
         else:
             log_line(
@@ -438,6 +431,36 @@ async def _run_agent(
                 "[pre-recon] empty reply — main starts without "
                 "pre-recon context (will need to delegate itself)",
             )
+
+    # Build user_prompt AFTER pre-recon so we can tell main which
+    # artifacts already exist on disk (./decomp/ populated by recon's
+    # ghiant calls, ./.ghidra_proj/ cache, libc_profile.json) — main
+    # would otherwise re-run ghiant or walk .text from scratch.
+    decomp_dir = work_dir / "decomp"
+    decomp_ready = decomp_dir.is_dir() and any(decomp_dir.glob("*.c"))
+    decomp_files: list[str] = []
+    if decomp_ready:
+        try:
+            decomp_files = sorted(p.name for p in decomp_dir.glob("*.c"))[:40]
+        except OSError:
+            decomp_files = []
+    user_prompt = build_user_prompt(
+        effective_binary_name, target, description, auto_run,
+        chal_unpacked=chal_unpacked,
+        decomp_ready=decomp_ready,
+        decomp_files=decomp_files,
+    )
+
+    if recon_reply:
+        user_prompt = (
+            "PRE-RECON COMPLETED — the orchestrator already ran a "
+            "recon subagent on your behalf. Its summary is below. START "
+            "from this; do not re-run the same triage yourself. Spawn "
+            "recon AGAIN for follow-up questions if needed.\n\n"
+            "==== RECON REPLY ===="
+            f"\n{recon_reply}\n"
+            "==== END RECON ====\n\n"
+        ) + user_prompt
 
     log_line(job_id, f"Launching Claude agent (model={model})")
     if resume_sid:

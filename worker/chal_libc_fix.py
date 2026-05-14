@@ -85,12 +85,16 @@ def detect_libc_version(libc: Path) -> str | None:
 def find_pair(root: Path) -> tuple[Path, Path] | None:
     """Walk root looking for a directory that contains BOTH libc.so.6
     (or libc-*.so) AND a ld-linux-*.so.*. Return (libc, ld) on hit.
-    Skips well-known noisy dirs.
+    Skips well-known noisy dirs. ``.chal-libs`` is checked LAST so
+    that a freshly-bundled libc from the upload wins over a previously
+    cached staging dir, but the staging dir is still seen if it's all
+    we have — important when the pwn analyzer's _find_elf_or_unzip
+    pre-stages libs there (and only there) before chal-libc-fix runs.
     """
-    skip = {".git", "__pycache__", "node_modules", ".chal-libs"}
+    skip = {".git", "__pycache__", "node_modules"}
+    chal_libs_hit: tuple[Path, Path] | None = None
     for d, dirs, files in os.walk(root):
         dirs[:] = [x for x in dirs if x not in skip]
-        names = set(files)
         libc = None
         ld = None
         for n in files:
@@ -99,8 +103,13 @@ def find_pair(root: Path) -> tuple[Path, Path] | None:
             if re.match(r"ld-linux", n) or re.match(r"ld-[\d.]+\.so", n):
                 ld = Path(d) / n
         if libc and ld:
+            # Defer .chal-libs hits — let any bundled libs win first.
+            # The pre-stage path will pick it up after the walk.
+            if Path(d).name == ".chal-libs":
+                chal_libs_hit = (libc, ld)
+                continue
             return libc, ld
-    return None
+    return chal_libs_hit
 
 
 def parse_dockerfile_from(root: Path) -> str | None:
@@ -760,8 +769,25 @@ def main() -> int:
             return 1
         libc, ld = pair
     else:
+        # Priority 0: caller (e.g. the pwn analyzer's _find_elf_or_unzip)
+        # already pre-staged a libc + ld pair into ./.chal-libs/. Use it
+        # as-is and skip the bundle walk / docker-pull entirely — this
+        # is the fast path for the modern Dreamhack flow where the
+        # orchestrator handles unpacking before chal-libc-fix runs.
+        pair = None
+        if stage_target.is_dir():
+            staged_libc = stage_target / "libc.so.6"
+            staged_ld_candidates = sorted(stage_target.glob("ld-linux-*.so.*"))
+            if staged_libc.is_file() and staged_ld_candidates:
+                pair = (staged_libc, staged_ld_candidates[0])
+                print(
+                    f"[chal-libc-fix] using libs already staged at: "
+                    f"{stage_target}",
+                    flush=True,
+                )
         # Priority 1: Dockerfile COPY → physical libs in bundle.
-        pair = parse_dockerfile_libc(search_root)
+        if not pair:
+            pair = parse_dockerfile_libc(search_root)
         # Priority 2: any libc+ld pair anywhere under search root.
         if not pair:
             pair = find_pair(search_root)

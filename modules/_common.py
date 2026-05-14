@@ -744,6 +744,34 @@ Hard rules:
    __stdio_write, FILE struct, va_arg dispatchers) unless explicitly
    asked. The main agent's standard ret2libc / ret2syscall path
    uses symbol tables + ROPgadget, not libc internals.
+7. TIME BUDGET: aim to finish within 5-6 minutes. The orchestrator
+   times out pre-recon at 8 minutes (env-tunable PRE_RECON_TIMEOUT_S).
+   If you near that wall, EMIT WHAT YOU HAVE — the orchestrator now
+   returns partial output to main when you time out, but if you never
+   yielded an assistant text block, main gets nothing. Draft your
+   reply as you go, finalize early.
+8. CANONICAL COMMANDS — use these EXACT forms; don't probe for
+   variants. Each `?: …` lists the right way to ask the question
+   so you don't burn turns finding the magic incantation.
+   * Protections (checksec): `pwn checksec ./bin/<n> 2>&1`
+       — NOT `checksec`, NOT `checksec --file=…`. Only `pwn checksec
+       <path> 2>&1` is reliable inside this worker container; the
+       other forms either don't exist or write to stderr only.
+       For non-trivial flags use pwntools directly:
+         python3 -c "from pwn import ELF; e=ELF('./bin/<n>'); \\
+           print('PIE',e.pie,'NX',e.nx,'RELRO',e.relro,'Canary',e.canary)"
+   * Decomp triage: PREFER `./decomp/*.c` Read over `objdump`. If
+     `./decomp/` is empty, run `ghiant ./bin/<n>` ONCE (1-3 min cold,
+     5-10s warm — project caches under `./.ghidra_proj/`).
+   * Skip ghiant for small SOs (< 32 KB): `nm -D <so>` plus
+     `objdump -d <so> | head -200` is faster than spinning Ghidra.
+     libsalloc-style wrapper libs fall in this bucket.
+   * cross-refs: `ghiant xrefs ./bin/<n> <symbol_or_addr>` (JSON
+     output, faster than grepping decomp).
+   * libc symbol/offset: read `./.chal-libs/libc_profile.json` FIRST
+     (already pre-computed: version, safe_linking, tcache_key,
+     hooks_alive, recommended_techniques, symbols dict, one_gadget,
+     how2heap dir). Don't re-derive these.
 
 Tool catalogue & invocation patterns
 ------------------------------------
@@ -1782,7 +1810,7 @@ async def run_pre_recon(
     model: str | None,
     prompt: str,
     log_fn,
-    timeout_s: float = 240.0,
+    timeout_s: float | None = None,
     tag: str = "pre-recon",
 ) -> str:
     """Run a recon subagent BEFORE main's first turn so main starts with
@@ -1795,8 +1823,20 @@ async def run_pre_recon(
     sees recon's investigation context. Returns ONLY recon's final text
     (joined assistant TextBlocks), capped at 8 KB.
 
-    Best-effort: any failure returns an empty string so the caller can
-    fall back to the normal "main delegates as needed" flow.
+    Timeout handling: on `asyncio.TimeoutError` the helper returns
+    whatever assistant text recon managed to emit before the deadline
+    — discarding partial output meant we lost ~4 minutes of investigation
+    on job fa6520405673 because the model wrote tool calls + thinking
+    but hadn't yet emitted its final summary block. The partial chunks
+    are still useful context for main even without the final summary.
+
+    Best-effort: SDK import / crash failures return an empty string so
+    the caller can fall back to the normal "main delegates as needed"
+    flow.
+
+    Timeout default: 480 s (heap-pwn chals with libsalloc-style wrappers
+    routinely take 3-4 minutes to ghidra + read libsalloc + libc_profile).
+    Override via PRE_RECON_TIMEOUT_S env var.
     """
     import asyncio as _asyncio
     try:
@@ -1808,6 +1848,12 @@ async def run_pre_recon(
     except Exception as e:
         log_fn(f"[{tag}] SDK import failed ({e}); skipping pre-recon")
         return ""
+
+    if timeout_s is None:
+        try:
+            timeout_s = float(os.environ.get("PRE_RECON_TIMEOUT_S", "480"))
+        except ValueError:
+            timeout_s = 480.0
 
     options = make_standalone_options(
         "recon", model, work_dir, job_id,
@@ -1846,16 +1892,31 @@ async def run_pre_recon(
                     if isinstance(cost, (int, float)) and cost:
                         log_fn(f"[{tag}] cost: ${cost:.4f}")
 
+    timed_out = False
     try:
         await _asyncio.wait_for(_drive(), timeout=timeout_s)
     except _asyncio.TimeoutError:
-        log_fn(f"[{tag}] timed out after {timeout_s}s — falling back")
-        return ""
+        timed_out = True
+        log_fn(
+            f"[{tag}] timed out after {timeout_s}s — returning partial "
+            f"output ({sum(len(c) for c in chunks)} chars from "
+            f"{len(chunks)} assistant blocks)"
+        )
     except Exception as e:
-        log_fn(f"[{tag}] crashed: {e!r} — falling back")
-        return ""
+        log_fn(f"[{tag}] crashed: {e!r} — returning partial output")
 
     out = "".join(chunks).strip()
+    if not out:
+        if timed_out:
+            log_fn(f"[{tag}] no assistant text yet at timeout — falling back")
+        return ""
+    if timed_out:
+        out = (
+            "[partial — pre-recon hit its timeout; the final summary "
+            "block was not emitted but the assistant text below is "
+            "what recon collected. Spawn a follow-up recon subagent "
+            "if you need the missing sections.]\n\n"
+        ) + out
     if len(out) > 8000:
         out = out[:8000] + "\n…(truncated)"
     return out
