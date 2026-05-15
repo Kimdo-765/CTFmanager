@@ -1734,7 +1734,13 @@ _AGENT_PROMPT_BY_TYPE = {
 }
 
 _AGENT_TOOLS_BY_TYPE = {
-    "recon": ["Read", "Bash", "Glob", "Grep"],
+    # recon owns WebSearch + WebFetch so main can delegate writeup
+    # lookups (CTF technique research, libc release notes, …) without
+    # the result body landing in main's context. Observed: d809a5187990
+    # main used WebSearch 33× directly — ~200 KB of result bodies
+    # accumulated in cache_read at ~$0.5/M. Routing through recon
+    # keeps that in the subagent's transient context.
+    "recon": ["Read", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"],
     "debugger": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
     # judge has no Agent tool here — in isolated mode, subagents can't
     # cascade-spawn further subagents (preserves the "ONE level deep"
@@ -1984,7 +1990,15 @@ def make_main_session_options(
             model=model,
             cwd=str(work_dir),
             allowed_tools=[*base_tools, spawn_tool],
-            disallowed_tools=["Agent", "Task"],
+            # Block built-in Agent/Task (would dispatch to a general-
+            # purpose subagent that shares main's Node.js heap). Also
+            # block WebSearch + WebFetch — main is NOT allowed to do
+            # web research directly. The recon subagent has those
+            # tools instead, so the multi-KB result bodies stay in
+            # recon's transient context and only a 2 KB summary lands
+            # in main. Observed in d809a5187990: 33 direct WebSearch
+            # calls inflated main's cache_read by ~200 KB.
+            disallowed_tools=["Agent", "Task", "WebSearch", "WebFetch"],
             permission_mode="bypassPermissions",
             add_dirs=add_dirs or [],
             env=env,
@@ -1994,7 +2008,8 @@ def make_main_session_options(
         )
         log_fn_local(
             "[orchestrator] subagent isolation: ON "
-            f"(tool={spawn_tool}; Agent/Task blocked)"
+            f"(tool={spawn_tool}; Agent/Task/WebSearch/WebFetch blocked "
+            "on main — delegate web research to recon)"
         )
     else:
         env["USE_ISOLATED_SUBAGENTS"] = "0"
@@ -3494,6 +3509,11 @@ async def run_main_agent_session(
     max_retries = auto_retry_max() if auto_run else 0
 
     last_sandbox: dict | None = None
+    # Track retry hints across attempts so the next postjudge call can
+    # see "you already said this" — drives next_action=stop more
+    # aggressively. summary["judge_hints"] is what the sandbox_runner
+    # closure reads (analyzers wire it through attempt_sandbox_run).
+    summary.setdefault("judge_hints", [])
 
     # Soft-eject machinery: at 80% of INVESTIGATION_BUDGET with no
     # artifact yet, queue a user-turn injection so the agent SEES the
@@ -3783,6 +3803,12 @@ async def run_main_agent_session(
             flags_now = scan_job_for_flags(job_id)
             judge_out = ((last_sandbox or {}).get("judge") or {})
             verdict = judge_out.get("verdict")
+            # Accumulate the just-emitted retry_hint so the NEXT
+            # postjudge call sees prior history and can decide
+            # next_action=stop when its new hint would repeat.
+            _hint_just_now = (judge_out.get("retry_hint") or "").strip()
+            if _hint_just_now:
+                summary["judge_hints"].append(_hint_just_now)
             if flags_now or verdict == "success":
                 log_fn(
                     f"[orchestrator] auto-run turn {attempt} succeeded "

@@ -434,6 +434,24 @@ def _resubmit(
     model = prev_meta.get("model")  # honor prior choice; user can override
     use_sage = bool(prev_meta.get("use_sage"))
 
+    # If the prior job ended with judge explicitly saying "stop —
+    # this approach is structurally blocked", forking its 60M-token
+    # conversation poisons the new agent with the dead-end reasoning
+    # it was just told to abandon. Skip the session fork in that case
+    # — the retry_hint + carried work tree are the actionable signal;
+    # the prior conversation is noise. (Observed in 2d22aa9f338e
+    # forked d809a5187990: 23M cache_read on a 1-turn retry because
+    # the fork inherited d809's poisoned context.)
+    prior_stopped = (
+        (prev_meta.get("judge_next_action") or "").lower() == "stop"
+    )
+    if prior_stopped:
+        resume_sid = None
+    else:
+        resume_sid = (
+            prev_meta.get("claude_session_id") if carry_work else None
+        )
+
     meta = {
         "id": new_id,
         "module": module,
@@ -449,10 +467,10 @@ def _resubmit(
         # can resume + fork the conversation rather than start fresh.
         # Only meaningful when we're carrying the work/ tree too —
         # without that the forked thread would reference paths that
-        # don't exist any more in the new cwd.
-        "resume_session_id": (
-            prev_meta.get("claude_session_id") if carry_work else None
-        ),
+        # don't exist any more in the new cwd. Also cleared when the
+        # prior judge decided stop (see prior_stopped above).
+        "resume_session_id": resume_sid,
+        "resume_skipped_due_to_judge_stop": prior_stopped,
     }
 
     q = get_queue()

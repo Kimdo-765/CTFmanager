@@ -313,6 +313,7 @@ def attempt_sandbox_run(
     target: Optional[str],
     log_fn,
     use_sage: bool = False,
+    prior_hints: list[str] | None = None,
 ) -> dict | None:
     """Helper for orchestrators that always copy the produced script to the
     job root. Runs <jobdir>/<script_filename> with target as argv if given.
@@ -412,6 +413,20 @@ def attempt_sandbox_run(
                     "(supervise judge killed the container due to stalled "
                     "output)\n"
                 )
+            if prior_hints:
+                # Attach the retry-hint history so judge can detect
+                # "I'm about to repeat myself" — which is the strongest
+                # signal for next_action=stop. Each entry is one of the
+                # judge's prior postjudge_retry_hints (already capped at
+                # ~600 chars upstream).
+                extra += (
+                    "\nPRIOR RETRY HINTS (this job has already iterated "
+                    f"{len(prior_hints)} time(s); your new hint MUST NOT "
+                    "rhyme with these — if it does, next_action=stop):\n"
+                )
+                for i, h in enumerate(prior_hints, 1):
+                    if h:
+                        extra += f"  #{i}: {h[:300]}\n"
             try:
                 post = _judge.postjudge_run(
                     work_dir,

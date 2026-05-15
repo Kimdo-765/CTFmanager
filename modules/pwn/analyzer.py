@@ -473,8 +473,11 @@ async def _run_agent(
 
     def _sandbox_for(script_name: str) -> Optional[dict]:
         # attempt_sandbox_run is sync; the helper calls it via anyio.to_thread.
+        # Pass the accumulated retry-hint history so postjudge can
+        # detect "I'm about to repeat myself" and stop the loop.
         return attempt_sandbox_run(
             job_id, script_name, target, lambda s: log_line(job_id, s),
+            prior_hints=list(summary.get("judge_hints", [])),
         )
 
     try:

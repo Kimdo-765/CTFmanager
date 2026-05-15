@@ -118,6 +118,7 @@ async def _run_agent(
         return attempt_sandbox_run(
             job_id, script_name, target, lambda s: log_line(job_id, s),
             use_sage=script_name.endswith(".sage"),
+            prior_hints=list(summary.get("judge_hints", [])),
         )
 
     try:

@@ -132,25 +132,43 @@ markdown:
  "failure_code": "<one of the heap codes below; OMIT or null when verdict==success or no heap code applies>"}}
 
 next_action — judge's call on whether to feed retry_hint back to
-main or halt the job:
-  continue — keep iterating. Use whenever you have a concrete fix
-             in retry_hint that main can act on AND the failure
-             mode is reachable from the current artifact (e.g. wrong
-             offset, missing alignment check, recv timeout missing,
-             swapped tube/process, glibc version mismatch).
-  stop     — finalize the job, no more auto-retries. Use ONLY when:
-             (a) verdict == success (flag captured — there's nothing
-                 to retry),
-             (b) the failure is structural and the current artifact
-                 can't be fixed by editing it (wrong vuln class
-                 selected, chal needs a totally different technique,
-                 binary doesn't match the published challenge,
-                 remote target unreachable not due to the script),
-             (c) you have already produced ≥3 similar retry_hints
-                 across this job and main keeps making the same
-                 mistake — escalate to the human operator instead of
-                 burning more dollars.
-  If unsure, default to continue (main learns from postjudge feedback).
+main or halt the job. STOP is the AGGRESSIVE default whenever the
+same broad failure pattern would repeat — every continue you authorize
+costs the operator ~$5-15 in a 50-turn main retry, so be ruthless:
+
+  continue — keep iterating. Use ONLY when:
+             1. you have a CONCRETE, NARROW fix that main can apply
+                in <10 lines of script edits (one offset value, one
+                alignment mask, one missing timeout=, one swapped
+                tube), AND
+             2. the failure was a tactical bug in the chain (not a
+                strategic mistake about which vuln class to use), AND
+             3. NO prior retry hint in this job's history has already
+                said the same thing (check `prior_hints` if attached
+                to your context — if you see your own earlier wording
+                even once, the answer is stop).
+  stop     — finalize the job. Use whenever ANY of the following holds:
+             (a) verdict == success (flag captured),
+             (b) the failure is structural — wrong vuln class chosen,
+                 chal needs a totally different technique, binary
+                 doesn't match the published challenge, target
+                 unreachable for reasons unrelated to the script,
+             (c) the retry_hint you're about to write rhymes with one
+                 you (or a prior judge turn) ALREADY produced this job
+                 — even ONE similar hint is enough to stop. The
+                 operator's /retry button is the right place to push
+                 main onto a new approach; you cannot make main
+                 abandon a wrong strategy by repeating yourself,
+             (d) the artifact's own docstring / comments admit it's
+                 a probe / partial / give-up shim with no real exploit
+                 chain (main itself has concluded — don't override),
+             (e) main has already done ≥2 sandbox runs in this job
+                 with the same broad outcome (empty leaks, same
+                 SIGSEGV, same parse_error). Diminishing returns.
+
+  Default to STOP when unsure. The /retry button gives the operator a
+  fresh, intentional restart; auto-retry is for tightening a working
+  exploit, not for fishing.
   stop_reason is REQUIRED on stop; it surfaces in run.log + meta.json
   so the operator knows why the loop halted without a flag.
 

@@ -122,6 +122,7 @@ async def _run_agent(
     def _sandbox_for(script_name: str) -> Optional[dict]:
         return attempt_sandbox_run(
             job_id, script_name, None, lambda s: log_line(job_id, s),
+            prior_hints=list(summary.get("judge_hints", [])),
         )
 
     try:
