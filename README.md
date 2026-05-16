@@ -433,10 +433,35 @@ and ends the turn again. Cache prefix preserved across the loop.
 
 Loop terminates on the FIRST hit among:
 - flag captured / postjudge `verdict == "success"`
+- judge emitted `next_action: "stop"` (explicit "this approach is
+  unrecoverable" verdict — final authority, overrides remaining budget)
 - postjudge produced no actionable retry_hint
 - main's SDK session errored / hit `INVESTIGATION_BUDGET`
 - `AUTO_RETRY_MAX` cap reached (when configured to a non-negative N)
 - user pressed Stop / soft / hard timeout
+
+### WHY_STOPPED.md — stop-decision explainer
+
+Any time the auto-retry loop exits **without** a flag, the
+orchestrator writes a human-readable `WHY_STOPPED.md` into the work
+tree (carried to the job dir alongside `report.md` / `findings.json`
+/ `THREAT_MODEL.md`). One of four reason classes is recorded — each
+maps to a different operator playbook the file spells out:
+
+| `stop_kind` | Trigger | Operator playbook the doc suggests |
+|---|---|---|
+| `judge_stop` | Judge's explicit `next_action="stop"` (unsolvable as approached) | `/retry` with manual hint steering to one of judge's `alternative_paths`, or `/resume` to let main re-think |
+| `budget_exhausted` | `AUTO_RETRY_MAX` cap hit; judge was still cooperative | `/retry` for another budget, or raise `AUTO_RETRY_MAX` if convergence looks plausible |
+| `no_hint` | Postjudge couldn't propose a concrete fix | `/retry` with manual hint, or run exploit.py against the live target outside the sandbox |
+| `agent_error` | Main's SDK session died (SIGKILL / timeout / transport) | `/retry` — the carried work tree + fresh session usually clears transient SDK issues |
+
+Each `WHY_STOPPED.md` consolidates the judge's structured fields —
+`stop_reason`, `failure_code`, `specific_diagnosis`, `what_worked`,
+`what_failed`, `alternative_paths`, and the verbatim `retry_hint` —
+plus the last sandbox `stdout`/`stderr` tail, so a human operator
+doesn't have to reconstruct the picture from `run.log` + `meta.json`.
+The `/retry` flow copies the file along with the rest of `work/`, so
+the next attempt's reviewer sees the prior diagnosis as context.
 
 ### Fallback artifact safety net
 

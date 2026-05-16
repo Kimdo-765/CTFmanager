@@ -4464,6 +4464,245 @@ reasoning context carries over.
 '''
 
 
+WHY_STOPPED_FILENAME = "WHY_STOPPED.md"
+
+
+_STOP_KIND_HEADERS = {
+    "judge_stop": "Judge ruled the chain unrecoverable",
+    "budget_exhausted": "Auto-retry budget exhausted",
+    "no_hint": "Postjudge produced no actionable retry hint",
+    "agent_error": "Main agent session error",
+}
+
+
+def write_why_stopped(
+    work_dir: Path,
+    *,
+    stop_kind: str,
+    attempt_idx: int,
+    max_attempts: int,
+    judge_out: dict | None,
+    sandbox_result: dict | None,
+    summary: dict | None,
+    log_fn,
+) -> None:
+    """Drop a human-readable WHY_STOPPED.md when the auto-retry loop
+    exits without a flag. Consolidates everything an operator would
+    otherwise reconstruct from run.log + meta.json:
+
+      * which stop condition fired (judge stop / budget / no hint / error)
+      * judge's structured diagnosis (what worked, what failed, the
+        specific failing line, alternative paths) when present
+      * postjudge retry_hint verbatim (even on STOP — informational)
+      * stdout / stderr tails so the reader doesn't have to dig
+      * suggested next actions (manual /retry with a hint, /resume,
+        give up and read report.md, etc.)
+
+    Lives in the work tree so /retry + /resume carry it forward as
+    reference. Best-effort: any write error is logged and swallowed.
+    """
+    try:
+        judge_out = judge_out or {}
+        sandbox_result = sandbox_result or {}
+        summary = summary or {}
+
+        verdict = (judge_out.get("verdict") or "unknown").strip()
+        next_action = (judge_out.get("next_action") or "continue").lower()
+        stop_reason = (judge_out.get("stop_reason") or "").strip()
+        failure_code = (judge_out.get("failure_code") or "").strip().lower()
+        retry_hint = (judge_out.get("retry_hint") or "").strip()
+        diagnosis = (judge_out.get("specific_diagnosis") or "").strip()
+        what_worked = judge_out.get("what_worked") or []
+        what_failed = judge_out.get("what_failed") or []
+        alternatives = judge_out.get("alternative_paths") or []
+        if not isinstance(what_worked, list):
+            what_worked = []
+        if not isinstance(what_failed, list):
+            what_failed = []
+        if not isinstance(alternatives, list):
+            alternatives = []
+
+        exit_code = sandbox_result.get("exit_code")
+        timed_out = bool(sandbox_result.get("timeout"))
+        killed = bool(sandbox_result.get("killed_by_supervise"))
+        stdout_tail = (sandbox_result.get("stdout") or "")[-1500:]
+        stderr_tail = (sandbox_result.get("stderr") or "")[-1500:]
+
+        header = _STOP_KIND_HEADERS.get(stop_kind, "Job stopped")
+        cap_str = "∞" if max_attempts < 0 else str(max_attempts)
+        when = datetime.now().isoformat(timespec="seconds")
+
+        # Top: at-a-glance summary so the reader doesn't have to read
+        # the whole doc to make a /retry decision.
+        out: list[str] = [
+            f"# Why this run stopped",
+            "",
+            f"**Reason class**: `{stop_kind}` — {header}",
+            f"**Postjudge verdict**: `{verdict}`"
+            + (f" (failure_code: `{failure_code}`)" if failure_code else ""),
+            f"**Attempt**: {attempt_idx} / {cap_str}",
+            f"**When**: {when}",
+            "",
+        ]
+
+        if stop_reason:
+            out += [
+                "## Judge's stop reason (verbatim)",
+                "",
+                f"> {stop_reason}",
+                "",
+            ]
+
+        if diagnosis:
+            out += [
+                "## Specific diagnosis (the failing line + observed signal)",
+                "",
+                f"> {diagnosis}",
+                "",
+            ]
+
+        if what_worked or what_failed:
+            out += ["## What worked vs. what failed", ""]
+            if what_worked:
+                out += ["**Worked:**"] + [f"- {x}" for x in what_worked[:5]] + [""]
+            if what_failed:
+                out += ["**Failed:**"] + [f"- {x}" for x in what_failed[:5]] + [""]
+
+        if alternatives:
+            out += [
+                "## Alternative paths not yet tried (judge's suggestions)",
+                "",
+            ] + [f"- {x}" for x in alternatives[:5]] + [""]
+
+        if retry_hint:
+            out += [
+                "## Postjudge retry hint",
+                "",
+                "Judge emitted a retry hint even though it voted STOP — "
+                "this is the model's best guess at a recovery direction. "
+                "On a stop verdict it's INFORMATIONAL; treat it as a "
+                "starting prompt for `/retry` with a manual hint rather "
+                "than auto-truth.",
+                "",
+                "```",
+                retry_hint[:2000],
+                "```",
+                "",
+            ]
+
+        # Execution evidence so the reader can sanity-check judge's call
+        if exit_code is not None or timed_out or killed or stdout_tail or stderr_tail:
+            out += ["## Last sandbox run", ""]
+            if exit_code is not None:
+                out.append(f"- exit_code: `{exit_code}`")
+            if timed_out:
+                out.append("- runner timeout fired before container exit")
+            if killed:
+                out.append("- supervise judge killed the container on stalled output")
+            out.append("")
+            if stdout_tail:
+                out += ["**stdout tail** (last 1500 B):", "", "```",
+                         stdout_tail, "```", ""]
+            if stderr_tail:
+                out += ["**stderr tail** (last 1500 B):", "", "```",
+                         stderr_tail, "```", ""]
+
+        # Operator playbook — concrete next steps. Different per kind.
+        out += ["## Recommended next steps", ""]
+        if stop_kind == "judge_stop":
+            out += [
+                "Judge is sure THIS approach can't capture the flag — "
+                "auto-retry won't help. Options:",
+                "",
+                "1. **Read `report.md` + this file** and decide whether "
+                "judge's diagnosis matches reality. Judge is wrong "
+                "sometimes (esp. on novel chal-author tricks).",
+                "2. **`/retry` with a manual hint** that explicitly steers "
+                "to one of the *Alternative paths* above (or your own "
+                "new lead). The retry forks the prior SDK session so "
+                "main keeps its context, but starts with your hint as "
+                "the next user turn.",
+                "3. **`/resume`** if you want to keep the work tree + "
+                "session AND let main re-think from where it was, "
+                "without injecting a new direction.",
+                "4. **Manual review**: download artifacts, read decomp / "
+                "exploit.py / sandbox stdout yourself. The structured "
+                "primitives in `findings.json` may help.",
+            ]
+        elif stop_kind == "budget_exhausted":
+            out += [
+                "Hit the auto-retry cap (`AUTO_RETRY_MAX`); main was "
+                "still making progress on the last attempt. Options:",
+                "",
+                "1. **`/retry` to add another retry budget** (the new "
+                "job starts fresh with cap=AUTO_RETRY_MAX again).",
+                "2. **Raise `AUTO_RETRY_MAX`** in `.env` and `/retry` "
+                "if the chal genuinely needs more iterations.",
+                "3. **Stop and read report.md** if the diagnoses across "
+                "attempts converge on the same blocker (judge missed "
+                "the structural stop).",
+            ]
+        elif stop_kind == "no_hint":
+            out += [
+                "Postjudge couldn't propose a concrete next step. "
+                "Usually means the exploit is correct and the chal "
+                "isn't responding as expected, OR every reasonable "
+                "alternative has been tried. Options:",
+                "",
+                "1. **`/retry` with a manual hint** if you have domain "
+                "knowledge the agent lacks.",
+                "2. **Run exploit.py manually** against the target — "
+                "the runner sandbox sometimes differs from a local "
+                "shell (proxy, DNS, MTU).",
+                "3. **Check the target is alive**: `nc -vz <host> <port>`.",
+            ]
+        elif stop_kind == "agent_error":
+            out += [
+                "Main's SDK session died abnormally (SIGKILL / timeout / "
+                "transport error). The sandbox + judge results above "
+                "are the rescue value from the LAST clean attempt. "
+                "Options:",
+                "",
+                "1. **`/retry`** — fork a fresh SDK session against the "
+                "carried work tree. Usually clears transient SDK / API "
+                "issues.",
+                "2. **Check worker container health**: `docker logs "
+                "hextech_ctf_tool-worker-1 --tail 100`.",
+            ]
+        else:
+            out += [
+                "1. **`/retry`** with whatever hint your reading of the "
+                "evidence suggests.",
+                "2. **Read report.md** for main's own write-up.",
+            ]
+        out += [""]
+
+        # Pointers to the other documents the operator should read.
+        out += [
+            "## Related files in this job",
+            "",
+            "- `report.md` — main's own write-up of the analysis",
+            "- `findings.json` — structured vuln + chain (auto-generated by "
+            "the report phase)",
+            "- `exploit.py` / `solver.py` — the script that ran",
+            "- `exploit.py.stdout` / `exploit.py.stderr` — runner output",
+            "- `THREAT_MODEL.md` — main's threat model bootstrap (if written)",
+            "- `run.log` — full event timeline (look for `[main]`, "
+            "`[judge]`, `[runner]` tags)",
+            "",
+            "---",
+            "",
+            "_Generated by `write_why_stopped()` so `/retry` + `/resume` "
+            "carry the diagnosis forward in the work tree._",
+        ]
+
+        path = Path(work_dir) / WHY_STOPPED_FILENAME
+        path.write_text("\n".join(out))
+        log_fn(f"[orchestrator] wrote {WHY_STOPPED_FILENAME} ({path.stat().st_size} B)")
+    except Exception as e:
+        log_fn(f"[orchestrator] write_why_stopped failed: {type(e).__name__}: {e}")
+
+
 def write_fallback_artifacts(work_dir: Path, log_fn) -> None:
     """Drop a probe-only exploit.py + report.md when main's session
     ends WITHOUT producing them. Best-effort: any write error is logged
@@ -4943,7 +5182,8 @@ async def run_main_agent_session(
             # "exploit.py missing, cannot auto-run" on every cycle and the
             # auto-retry loop short-circuits with verdict=None.
             jd = job_dir(job_id)
-            for nm in (picked, "report.md", "findings.json", "THREAT_MODEL.md"):
+            for nm in (picked, "report.md", "findings.json",
+                        "THREAT_MODEL.md", "WHY_STOPPED.md"):
                 src = work_dir / nm
                 if not src.is_file():
                     continue
@@ -4994,6 +5234,16 @@ async def run_main_agent_session(
                     f"({summary.get('agent_error_kind')}); surfacing sandbox "
                     f"verdict={verdict} without further retries"
                 )
+                write_why_stopped(
+                    work_dir,
+                    stop_kind="agent_error",
+                    attempt_idx=attempt,
+                    max_attempts=max_retries,
+                    judge_out=judge_out,
+                    sandbox_result=last_sandbox,
+                    summary=summary,
+                    log_fn=log_fn,
+                )
                 return last_sandbox
 
             # Judge's explicit stop decision — final authority. If the
@@ -5015,6 +5265,16 @@ async def run_main_agent_session(
                     f"(verdict={verdict}, reason={stop_reason or '(none)'}) — "
                     f"halting auto-retry loop"
                 )
+                write_why_stopped(
+                    work_dir,
+                    stop_kind="judge_stop",
+                    attempt_idx=attempt,
+                    max_attempts=max_retries,
+                    judge_out=judge_out,
+                    sandbox_result=last_sandbox,
+                    summary=summary,
+                    log_fn=log_fn,
+                )
                 return last_sandbox
 
             # Out of retries? Stop. Negative max_retries means unlimited
@@ -5028,6 +5288,16 @@ async def run_main_agent_session(
                         f"(attempt {attempt}/{max_retries}) — postjudge "
                         f"verdict={verdict}; surfacing for user retry"
                     )
+                    write_why_stopped(
+                        work_dir,
+                        stop_kind="budget_exhausted",
+                        attempt_idx=attempt,
+                        max_attempts=max_retries,
+                        judge_out=judge_out,
+                        sandbox_result=last_sandbox,
+                        summary=summary,
+                        log_fn=log_fn,
+                    )
                 return last_sandbox
 
             # No retry hint? Nothing actionable to feed back.
@@ -5037,6 +5307,16 @@ async def run_main_agent_session(
                     f"[orchestrator] postjudge produced no retry_hint "
                     f"(verdict={verdict}, next_action={next_action}) — "
                     f"stopping auto-retry"
+                )
+                write_why_stopped(
+                    work_dir,
+                    stop_kind="no_hint",
+                    attempt_idx=attempt,
+                    max_attempts=max_retries,
+                    judge_out=judge_out,
+                    sandbox_result=last_sandbox,
+                    summary=summary,
+                    log_fn=log_fn,
                 )
                 return last_sandbox
 

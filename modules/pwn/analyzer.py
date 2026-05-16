@@ -695,7 +695,8 @@ async def _run_agent(
             fallback_dirs = prior_work_dirs(job_id)
             found = collect_outputs(
                 work_dir,
-                ["exploit.py", "report.md", "findings.json", "THREAT_MODEL.md"],
+                ["exploit.py", "report.md", "findings.json",
+                 "THREAT_MODEL.md", "WHY_STOPPED.md"],
                 fallback_dirs=fallback_dirs,
             )
             summary["exploit_present"] = "exploit.py" in found

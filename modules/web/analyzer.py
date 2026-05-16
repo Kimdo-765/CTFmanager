@@ -192,7 +192,9 @@ async def _run_agent(
             # history and silently writes into the OLD job dir).
             fallback_dirs = prior_work_dirs(job_id)
             found = collect_outputs(
-                work_dir, ["exploit.py", "report.md"], fallback_dirs=fallback_dirs,
+                work_dir,
+                ["exploit.py", "report.md", "findings.json", "WHY_STOPPED.md"],
+                fallback_dirs=fallback_dirs,
             )
             if "exploit.py" not in found and (jd / "exploit.py").is_file():
                 found["exploit.py"] = jd / "exploit.py"
