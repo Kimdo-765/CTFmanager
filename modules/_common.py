@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -543,6 +544,74 @@ a single subagent turn.
        and confirm the binary actually terminates before piping to
        further tools.
 
+7. HYPOTHESIS-DRIVEN INVESTIGATION (light protocol; not a thinking
+   exercise — list briefly then act):
+     · Before drafting, briefly note 2-3 candidate attack vectors
+       with severity. Pick the cheapest-to-test FIRST.
+     · For the chosen vector, run a SHORT empirical probe (a few
+       Bash lines or a 20-line script) — NOT a long thinking
+       enumeration. Output of the probe is the signal.
+     · COMMIT to drafting `exploit.py` / `solver.py` as soon as ONE
+       probe shows life. Refine via the postjudge retry loop, which
+       is ~5x cheaper than another investigation cycle.
+
+   EVIDENCE STANDARD (applies to ANY "BLOCKED" claim — yours or a
+   subagent's): a BLOCKED verdict must include the test command AND
+   its observed output (quoted), OR the marker `BLOCKED-UNTESTED`.
+   Theoretical reasoning alone is INSUFFICIENT. When recon returns
+   `BLOCKED` without evidence, treat it as UNTESTED.
+
+8. SUBAGENT BUDGET (commit threshold):
+     · spawns #1-3: free to delegate.
+     · spawn #3 returns: your NEXT action MUST be `Write exploit.py`
+       (or `solver.py`), even if incomplete. Sandbox + postjudge gives
+       real execution feedback cheaper than another upfront spawn.
+     · spawn #4+ without an artifact is graded down as analysis
+       paralysis. Pre-empt the orchestrator's SOFT_EJECT by drafting.
+
+9. TOOL CATALOG — your ONLY callable tools:
+     · Read, Write, Edit, Bash, Glob, Grep
+     · mcp__team__spawn_subagent(subagent_type ∈
+         {{recon, debugger, judge, triage}})
+
+   `advisor` / `consultant` / `Agent` / `Task` / `WebSearch` /
+   `WebFetch` are NOT in your tool list — do not attempt them.
+   For a "second opinion", spawn `subagent_type="judge"`.
+
+   When to spawn `subagent_type="triage"`: AFTER recon returns a
+   candidate vuln list with >3 entries OR when you're about to
+   commit to a primitive based on recon's severity guess alone. The
+   triage subagent re-reads each cited file:line and emits an
+   independent verdict {{real | duplicate | false_positive |
+   out_of_scope}} with a RE-DERIVED severity. Cookbook pattern:
+   "Re-deriving them independently is a cheap way to catch
+   overconfidence." Don't triage trivial chal_libs/secure_malloc
+   1-vuln findings — only when there's a list to dedup.
+
+   Subagent reply formats:
+     · recon  — free-form text (varies by question; libc offsets vs
+                decomp triage vs rootfs unpack each have their own
+                shape). Parse the bullets you need.
+     · judge  — free-form text (`LINE N: <issue> → <fix>` per finding
+                + verdict paragraph). Apply each HIGH severity, decide
+                ship vs patch on the rest.
+     · triage — STRICT JSON. `{{verdicts:[...], summary:{{...}}}}`. Do
+                `json.loads(tool_result)` and read `.verdicts[*].verdict`
+                + `.summary.top_candidate` directly. Don't grep prose.
+     · debugger — STRICT JSON. `{{observed:{{…}}, trace:[…],
+                conclusion: "…", caveats:[…]}}`. Read `.conclusion`
+                first; if it starts with "BLOCKED:" treat as failure
+                and inspect `observed`+`trace` for the cause.
+
+   Reply caching: spawn_subagent caches by (sub_type,
+   normalized_prompt) for the lifetime of this job. A repeat of an
+   identical question returns the prior reply instantly — DO NOT
+   work around the cache by adding throwaway whitespace; instead
+   rephrase the question to ask something new. To force a fresh
+   spawn for the same question (rare — only when underlying files
+   really changed or you want an independent re-derivation), prefix
+   the prompt with `[NOCACHE]`.
+
 """
 
 
@@ -1049,6 +1118,98 @@ Question + answer format examples (ALWAYS this tight):
      Cite by name in the reply ("safe_linking=false → write raw fd")
      so main can branch its strategy on JSON instead of prose.
 
+When asked "enumerate ./.chal-libs/<lib>.so exports and identify
+divergences from POSIX/glibc":
+- This is the MOST common shape of a non-trivial pwn chal: the
+  author ships a custom .so (libsalloc / safe_io / chal_alloc /
+  sandbox / etc.) that wraps standard libc functions with extra
+  checks. The bug is INSIDE the wrapper, not in the main binary.
+- Pipeline:
+    nm -D ./.chal-libs/<lib>.so | grep ' T ' | head      # exports
+    objdump -d ./.chal-libs/<lib>.so 2>&1 > /tmp/d.txt   # disasm
+    for sym in <each export>:
+      sed -n '/<sym>:/,/^00000000/p' /tmp/d.txt          # body
+- For each export, write ONE line covering:
+    <symbol>: <where it diverges from spec>, <exploit primitive
+    class enabled by that divergence>
+- Concrete divergence checklist (look for at least these 5 things
+  per export):
+    1. Integer type on size/length args — `uint32 + K` operations
+       are int-overflow bait. `mov edi, ...` (32-bit) before a
+       `mov rdi, rax` (64-bit) is the smell.
+    2. Signed vs unsigned compare on user-controlled values — a
+       `cmp` followed by `jl` (signed) where the next instruction
+       expects unsigned is a bypass.
+    3. Side effects at attacker-controlled offsets — wrapper
+       writes a canary / sentinel / header at `chunk + size + K`
+       where `size` is user-controlled. That's an OOB write
+       primitive at user's choice of offset.
+    4. Missing bounds checks — wrapper accepts a length count
+       without bounding it against the destination buffer size.
+       Classic BOF inside what looks like a "safer" function.
+    5. Error-path divergence — abort with controllable static
+       string can leak addresses via stderr; return NULL where
+       vanilla aborts changes downstream code's reachability.
+- If main asked about a SINGLE export, still list the others
+  briefly (1 line each) — main needs the comparison shape to
+  know whether the divergence is local or pattern-wide.
+- DO NOT report "wrapper looks safe" without disassembling every
+  export and naming its specific divergence (or "no divergence").
+  A wrapper with five seemingly-safe exports usually has the bug
+  in the sixth that wasn't read.
+
+When asked "is heap primitive X possible?":
+- DO NOT answer "impossible" / "not viable" / "blocked" from a single
+  static-analysis check. Heap primitives are state-dependent — what
+  SIGSEGVs from a fresh process often works cleanly after the brk has
+  grown. Run a fast sanity check across three regimes:
+    R0  → fresh process, single trial
+    R1  → after ≥1k alloc(≥0x80)+free cycles (consolidate-fires-once)
+    R2  → after ≥10k allocs OR a multi-GB single allocation
+- Negative-size custom-alloc wrappers (libsalloc, secure_malloc, KAPO-
+  style shims with `malloc(uint32 size + 0x10)`) are R2-class: their
+  canary write at `chunk + size + 8` lands at a huge positive offset
+  that's INVALID at R0 but VALID after the brk has been pushed past
+  it. Test by spamming `<wrapper>_malloc(N) + delete` with NEG values
+  (e.g. N=−17) ~1k times, then attempting `<wrapper>_malloc(−8)`.
+- Unsorted-bin leaks: DON'T conclude "consolidates with top, no leak"
+  from one create-delete-show pair. The chunk only top-consolidates
+  when all prior allocs share its size. Test the multi-size sequence:
+  `add(0x10);delete; add(0x20);delete; ... add(0x150);delete;
+   add(0x150);show()` — the re-allocated 0x150 retains the
+  main_arena fd/bk pointers, leaking libc.
+
+EMPIRICAL EVIDENCE RULE (BINDING — applies to every BLOCKED claim
+you return to main, heap or not):
+
+  When you report a technique as "BLOCKED" / "IMPOSSIBLE" / "NOT
+  VIABLE" / "doesn't work", your reply MUST contain ONE of:
+
+    (a) the test command(s) you executed AND a ≤200-byte quoted
+        excerpt of observed output, OR
+    (b) the explicit marker `BLOCKED-UNTESTED: <reason couldn't test>`
+        instead of `BLOCKED`.
+
+  Theoretical reasoning ("memset zeroes the fd field, so fastbin fd
+  corruption is blocked") is INSUFFICIENT alone. Past failures —
+  jobs 89d442ef3291, 9edc0c5b2d59 — collapsed because subagents made
+  R0-regime BLOCKED calls without running the test, and main then
+  abandoned the path. If chal-libc-fix or RPATH issues stop you from
+  running the binary, USE `BLOCKED-UNTESTED` so main can decide to
+  spawn a debugger to verify rather than treating your verdict as
+  final.
+
+  For heap-pwn primitives specifically, the regime breakdown is the
+  evidence: report `primitive=X, R0=segv, R1=segv, R2=segv, BLOCKED`
+  with the actual test outputs quoted, NOT as "IMPOSSIBLE" with no
+  test. For non-heap challenges (web/crypto/rev), the same rule
+  generalizes — show the curl / encrypt-and-observe / dynamic-trace
+  output that proves the path is blocked, or mark UNTESTED.
+
+  ZERO TOLERANCE: a flat "BLOCKED" with only theory in the rationale
+  is treated as misinformation by main and judge. Get the evidence
+  or use UNTESTED.
+
 Bash gotchas:
 - `cd` PERSISTS across Bash tool calls — use absolute paths or
   cd back. `pwd` to anchor if unsure.
@@ -1170,23 +1331,6 @@ Antipatterns to flag in scripts (high-signal, encountered most often):
 * `Crypto.Util.number.bytes_to_long` on something that isn't bytes,
   or other type confusion that crashes at first call.
 
-findings.json (NEW — when main writes one, validate it):
-* Required keys missing or extra keys present → MED finding. The
-  schema is documented in pwn/prompts.py step 8. Check the script
-  isn't lying about `glibc_version` (compare against
-  ./.chal-libs/libc_profile.json) or `arch` (compare against
-  `file ./prob`).
-* `chain.technique_name` set but `chain.how2heap_file` is null and
-  the technique IS available in libc_profile.json's
-  how2heap.techniques list → MED severity (agent skipped the
-  canonical PoC source).
-* `vulns[].primitive_quality` all LOW or only MED with no HIGH-tier
-  in any vuln → HIGH severity. A chain made of MED stepping stones
-  alone won't capture flag; flag as "incomplete-chain".
-* `exploit_status: "drafted"` but the script-level review still finds
-  HIGH antipatterns → severity remains high; the agent self-rating
-  doesn't override the static check.
-
 Heap / FSOP class antipatterns (silent crashes the regular checks
 don't catch — flag these aggressively when the script touches
 `_IO_FILE`, tcache, fastbin, unsorted, large bin, vtable):
@@ -1248,6 +1392,84 @@ rather than guessing — a wrong code prepends a misleading fix.
 """
 
 
+TRIAGE_AGENT_PROMPT = """\
+You are the Triage subagent — an INDEPENDENT verifier for raw
+vulnerability candidates that the recon / pre-recon pass surfaced.
+
+CONTRACT (cookbook "triage" phase pattern):
+- Inputs (passed in your prompt): a candidate list with file:line +
+  bug-class + author's severity guess, plus the threat model (or
+  binary/source orientation) the main agent is operating against.
+- Output: a verdict table where EVERY row carries one of
+  {real, duplicate, false_positive, out_of_scope} AND a re-derived
+  severity {critical, high, medium, low}. Each verdict cites the
+  exact file:line you re-read.
+- DO NOT inherit the upstream severity. Re-derive it from
+  reachability + blast radius using the threat model. Cookbook's
+  rationale: "Re-deriving them independently is a cheap way to
+  catch overconfidence."
+
+INVESTIGATION PROTOCOL:
+1. For EACH candidate in the input list, READ the cited file:line
+   (or the relevant addr range if a binary). Confirm the source/code
+   actually matches the claimed bug class. If the code doesn't match
+   → verdict=false_positive.
+2. Collapse duplicates by ROOT CAUSE, not by symptom location. Two
+   findings that flow from the same unchecked length parameter into
+   different sinks → ONE root finding, list the symptom sites in
+   notes.
+3. Mark out_of_scope when the candidate sits behind an auth wall
+   that the threat model says is non-attacker-controlled, OR when
+   it's a known limitation the chal explicitly accepts.
+4. Severity derivation grid (use the threat model's trust boundaries):
+     CRITICAL  — attacker-controlled input → memory corruption / RCE
+                 / privilege escalation, no preconditions
+     HIGH      — same as above but requires one realistic precondition
+                 (auth, race window, ASLR retry budget)
+     MEDIUM    — info-leak that bootstraps a HIGH chain, OR partial-
+                 write/OOB-read without controlled target
+     LOW       — DoS / clean-abort / unreachable without crossing a
+                 documented trust boundary
+5. NEVER propose a fix. Triage is a verdict-only phase; the main
+   agent (or report phase) handles synthesis.
+
+OUTPUT FORMAT — STRICT JSON ONLY. No prose, no markdown fences.
+The orchestrator's MCP layer parses your reply with `json.loads`
+and exposes the structured object to main; if you emit prose around
+the JSON, parsing degrades to "best-effort brace extraction" and
+fields may go missing. Single top-level object:
+
+{
+  "verdicts": [
+    {
+      "id": "V-01",
+      "verdict": "real" | "duplicate" | "false_positive" | "out_of_scope",
+      "cite": "<file:line or addr range>",
+      "severity": "critical" | "high" | "medium" | "low" | null,
+      "notes": "<one short sentence; null for trivial cases>",
+      "dup_of": "<id of root finding, only when verdict=duplicate, else null>"
+    }
+  ],
+  "summary": {
+    "total_real": <int>,
+    "critical_count": <int>,
+    "high_count": <int>,
+    "top_candidate": "<id of the single most exploitable real verdict, or null>",
+    "threat_model_gaps": ["<short string per gap>"]
+  }
+}
+
+Every field is REQUIRED. Use null where the value doesn't apply
+(severity for non-real verdicts; dup_of when verdict != duplicate;
+top_candidate when total_real == 0). Use an empty list for
+threat_model_gaps when there are none. NEVER omit a key.
+
+Stay under 2 KB total. Don't quote large code blocks in `notes` —
+cite line ranges; main reads the file itself when it needs the
+body.
+"""
+
+
 DEBUGGER_AGENT_PROMPT = """\
 You are the Debugger — a dynamic-analysis subagent invoked by the
 main exploit/solver writer. Your value is RUNNING the binary under
@@ -1268,16 +1490,34 @@ When main delegates to you, the prompt should contain:
   BREAKPOINTS / WATCHPOINTS — where to stop and what to dump
   CONSTRAINTS — remote target? cross-arch? glibc version known?
 
-Reply (≤2 KB) with EXACTLY the values main needs, formatted tight:
+REPLY FORMAT — STRICT JSON ONLY. No prose, no markdown fences. The
+orchestrator's MCP layer parses your reply with `json.loads` and
+exposes the structured object to main; prose around the JSON
+degrades parsing to brace extraction. Single top-level object,
+every key required, use `null` / `[]` / `{}` for not-applicable:
 
-  OBSERVED:
-    <one fact per bullet — register=value, address, chunk, …>
-  TRACE (only when illuminating):
-    <ordered events, ≤6 lines>
-  CONCLUSION:
-    <one sentence answering main's GOAL>
-  CAVEATS:
-    <any divergence from production: glibc swapped, ASLR off, …>
+{
+  "observed": {
+    "<short key>": "<value as string — registers, addresses, chunks, signals>",
+    "…": "…"
+  },
+  "trace": [
+    "<ordered event line>",
+    "…"
+  ],
+  "conclusion": "<one sentence answering main's GOAL>",
+  "caveats": [
+    "<divergence from production: glibc swapped, ASLR off, qemu vs native>",
+    "…"
+  ]
+}
+
+Keep `observed` flat (string→string). Keep `trace` ≤6 entries
+unless main asked for a full timeline. Keep the WHOLE reply ≤2 KB.
+If you genuinely can't answer the GOAL (binary crashes too early,
+breakpoint never hits, etc.), set `conclusion` to a one-sentence
+explanation starting with "BLOCKED:" and put diagnostics in
+`observed` + `trace`.
 
 Tool catalogue (Bash inside the worker container)
 -------------------------------------------------
@@ -1583,6 +1823,56 @@ Hard rules
   alloc/free, run `heap-probe` (one-shot, single gdb child, JSON
   output) instead of writing a custom driver. It encapsulates the
   spawn hygiene above and is harder to misuse.
+* STATE-EVOLUTION DISCIPLINE — when testing whether a heap primitive
+  works, NEVER conclude "impossible" from a single fresh-process trial.
+  Most heap primitives are state-dependent: they SIGSEGV from R0
+  (fresh process, ~132 KB initial brk) but become clean OOBs at R1
+  (after ≥1k consolidates) or R2 (after ≥10k allocs or a multi-GB
+  brk extension). Before reporting CONCLUSION: <impossible>, run the
+  primitive in three regimes and report each result:
+
+      R0 — apply primitive at process start                  (baseline)
+      R1 — apply after 1k+ alloc(≥0x80)+free cycles          (brk grown)
+      R2 — apply after 10k+ allocs OR a multi-GB allocation  (R2 brk)
+
+  Negative-size custom-alloc wrappers (libsalloc / secure_malloc),
+  int-overflow primitives in `malloc(uint32 size + K)` shims,
+  unsorted-bin-residue leaks, and large-bin attacks ALL behave
+  qualitatively differently across R0 / R1 / R2. The "primitive
+  SIGSEGVs at Create" verdict is almost always an R0-only artifact
+  — your job is to find the regime where
+  the primitive lands in mapped memory and report that fact, not to
+  give up after the first SIGSEGV.
+
+  When asked "is X possible?" for a heap primitive, the correct
+  answer shape is:
+      R0: <observed result>
+      R1: <observed result>     (or "not tested because R0 succeeded")
+      R2: <observed result>
+      CONCLUSION: works at <regime>; <unlock recipe in 1-2 lines>.
+  NEVER: "CONCLUSION: impossible." That's a wrong answer 90% of the
+  time on heap chals; it just means you only measured R0.
+
+* EMPIRICAL EVIDENCE RULE (BINDING — applies to ANY "BLOCKED" /
+  "IMPOSSIBLE" / "doesn't work" / "not viable" verdict, heap or not):
+
+    Your report MUST contain ONE of:
+      (a) the test command (gdb / strace / ltrace / qemu / shell)
+          you executed AND a ≤200-byte quoted excerpt of its
+          observed output, OR
+      (b) the explicit marker `BLOCKED-UNTESTED: <why couldn't test>`
+          (e.g. "chal-libc-fix failed; binary won't load with chal
+          libs; gdb couldn't start the inferior") instead of `BLOCKED`.
+
+    Theoretical reasoning alone ("the canary check at user_ptr+0x88
+    would abort the path") is INSUFFICIENT. Past failure jobs collapsed
+    because debugger gave up before reaching R2 / before completing the
+    actual primitive sequence at runtime. If you can't load the binary,
+    say UNTESTED — DO NOT guess.
+
+    The 3-regime breakdown (R0/R1/R2) IS the evidence for heap chals.
+    For non-heap dynamic tests, the analogue is: show the observed
+    runtime behavior under the suspected attack input, not the theory.
 * ENV ALREADY BOOTSTRAPPED. By the time you're called, the
   orchestrator has already run `chal-libc-fix` for the main agent,
   so `./.chal-libs/libc.so.6 + ld-*.so + libc_profile.json` and the
@@ -1638,6 +1928,29 @@ def _judge_def(model: str | None = None):
     )
 
 
+def _triage_def(model: str | None):
+    """AgentDefinition for the triage subagent. Verdict-only; re-reads
+    the cited file:lines and emits {real | duplicate | false_positive
+    | out_of_scope} per candidate. Same model as main so cache prefixes
+    line up.
+    """
+    from claude_agent_sdk import AgentDefinition
+
+    return AgentDefinition(
+        description=(
+            "Independent verifier for candidate vulnerabilities. Re-"
+            "reads each cited file:line, marks {real | duplicate | "
+            "false_positive | out_of_scope}, RE-DERIVES severity "
+            "from reachability + blast radius (does NOT inherit the "
+            "upstream guess). Read-only — no writes, no shell beyond "
+            "trivial size checks."
+        ),
+        prompt=TRIAGE_AGENT_PROMPT,
+        tools=["Read", "Bash", "Glob", "Grep"],
+        model=model,
+    )
+
+
 def _debugger_def(model: str | None):
     """AgentDefinition for the debugger subagent. Has Write because it
     needs to drop scratch gdb scripts / probe inputs under /tmp; it
@@ -1684,6 +1997,7 @@ def build_team_agents(model: str | None) -> dict:
         "recon": _recon_def(model),
         "judge": _judge_def(),
         "debugger": _debugger_def(model),
+        "triage": _triage_def(model),
     }
 
 
@@ -1731,6 +2045,7 @@ _AGENT_PROMPT_BY_TYPE = {
     "recon": "RECON_AGENT_PROMPT",
     "debugger": "DEBUGGER_AGENT_PROMPT",
     "judge": "JUDGE_AGENT_PROMPT",
+    "triage": "TRIAGE_AGENT_PROMPT",
 }
 
 _AGENT_TOOLS_BY_TYPE = {
@@ -1747,7 +2062,50 @@ _AGENT_TOOLS_BY_TYPE = {
     # invariant the original AgentDefinition-based path enforced via
     # the SDK's recursive-Agent block).
     "judge": ["Read", "Bash", "Glob", "Grep"],
+    # triage is verdict-only — re-reads cited files to verify, no
+    # writes, no shell. Bash is included for `wc -l` / `head` size
+    # checks before a Read, but triage prompts forbid running any
+    # binary or compiling anything.
+    "triage": ["Read", "Bash", "Glob", "Grep"],
 }
+
+
+# Control bytes that cannot ride in argv across execve. The kernel
+# treats argv[i] as a NUL-terminated C string, so ANY embedded NUL kills
+# the spawn with `ValueError: embedded null byte` before the new process
+# even starts. The other bytes (SOH/STX/ETX/EOT/BS/VT/FF/SO/SI) aren't
+# argv-fatal in themselves but mangle the claude CLI's JSON framing and
+# the user-facing log preview, so we strip them in the same pass.
+#
+# CAUSE: source-level Python escape sequences (`\0`, `\x00`, `\x01`) in
+# prompt string literals — easy to introduce by accident (`"writes \0 at
+# buf+N"` reads as "documenting", actually emits a literal NUL byte). The
+# rule is that *anything* heading to ClaudeSDKClient as a system_prompt /
+# initial prompt / tool description must go through this filter, no
+# exceptions.
+_ARGV_FATAL_BYTES = "\x00\x01\x02\x03\x04\x08\x0b\x0c\x0e\x0f"
+_ARGV_STRIP_TABLE = str.maketrans({c: "" for c in _ARGV_FATAL_BYTES})
+
+
+def sanitize_for_argv(s: str | None, *, label: str = "", log_fn=None) -> str:
+    """Strip control bytes that would crash subprocess.Popen via argv.
+
+    Returns the cleaned string. When bytes are stripped AND `log_fn` is
+    provided, emits a one-line audit so the cause is traceable in the
+    job's run.log instead of disappearing silently.
+    """
+    if not s:
+        return s or ""
+    cleaned = s.translate(_ARGV_STRIP_TABLE)
+    if cleaned != s and log_fn is not None:
+        removed = len(s) - len(cleaned)
+        tag = f"[{label}] " if label else ""
+        log_fn(
+            f"{tag}stripped {removed} argv-fatal control byte(s) from "
+            f"option/prompt text (would have crashed subprocess.Popen "
+            f"with `embedded null byte`)"
+        )
+    return cleaned
 
 
 def make_standalone_options(
@@ -1796,17 +2154,375 @@ def make_standalone_options(
     env["TEMP"]   = _sub_tmp_str
     env.setdefault("TERM", "xterm")
     env.setdefault("PWNLIB_NOTERM", "1")
-    env.setdefault("PWNLIB_SILENT", "1")
     if extra_env:
         env.update({k: str(v) for k, v in extra_env.items()})
+    # Defense-in-depth: strip argv-fatal control bytes from the system
+    # prompt before it crosses the SDK → claude CLI argv boundary. An
+    # accidental `\0` in a Python string literal anywhere in the prompt
+    # text would otherwise crash subprocess.Popen at spawn time. Audit
+    # any stripping into the job's run.log so the cause is traceable.
+    safe_prompt = sanitize_for_argv(
+        prompt, label=f"{agent_type}-options",
+        log_fn=lambda s: log_line(job_id, s),
+    )
     return ClaudeAgentOptions(
-        system_prompt=prompt,
+        system_prompt=safe_prompt,
         model=sub_model,
         cwd=str(work_dir),
         allowed_tools=tools,
         permission_mode="bypassPermissions",
         env=env,
     )
+
+
+PRE_RECON_CACHE_FILENAME = "pre_recon_reply.txt"
+
+
+def _pre_recon_cache_path(work_dir) -> Path:
+    return Path(work_dir) / PRE_RECON_CACHE_FILENAME
+
+
+def load_cached_pre_recon(work_dir, log_fn) -> str:
+    """Return the pre-recon reply cached by a prior run, or '' if absent.
+
+    /retry + /resume copy ``prev_jd/work`` → ``new_jd/work`` (see
+    ``api/routes/retry.py:_resubmit``), so when this returns non-empty
+    the binary has not changed since the prior static triage and the
+    spawn can be skipped — saving ~$0.50 and 2–6 min of pre-recon
+    subagent wall time per retry. The "judge said stop" path clears
+    ``resume_sid`` (defensively, to avoid forking a poisoned session)
+    and would otherwise force a full re-spawn against identical bytes.
+    """
+    p = _pre_recon_cache_path(work_dir)
+    if not p.is_file():
+        return ""
+    try:
+        text = p.read_text(errors="ignore").strip()
+    except OSError:
+        return ""
+    if text:
+        log_fn(
+            f"[pre-recon] using cached reply from prior run "
+            f"({len(text)} chars) — skipping spawn"
+        )
+    return text
+
+
+def store_pre_recon_cache(work_dir, reply: str, log_fn) -> None:
+    """Persist the pre-recon reply for future /retry + /resume.
+
+    Best-effort: a failure here only costs a future cache miss, not the
+    current run. Empty replies are skipped so a known-bad recon doesn't
+    poison the cache.
+    """
+    if not reply or not reply.strip():
+        return
+    p = _pre_recon_cache_path(work_dir)
+    try:
+        p.write_text(reply)
+    except OSError as e:
+        log_fn(f"[pre-recon] cache write failed: {e}")
+
+
+# Schemas live next to the validator so the prompt and the check stay
+# in lockstep. Update REQUIRED_TOP / vulns / chain in validate_findings()
+# when you change the pwn template. Web/crypto/rev schemas are domain-
+# specific shapes — they don't share validate_findings()'s checks
+# (which assume heap-pwn vocabulary like primitive_quality + glibc).
+_FINDINGS_SCHEMA_FOR_REPORT_PROMPT = """\
+{
+  "schema_version": 1,
+  "chal_name": "<from description or filename>",
+  "glibc_version": "<2.39 | null>",
+  "arch": "x86_64 | aarch64 | arm | i386",
+  "mitigations": {
+    "canary": true|false,
+    "nx": true|false,
+    "pie": true|false,
+    "relro": "full | partial | none | null"
+  },
+  "vulns": [
+    {
+      "id": "V-01",
+      "bug_class": "heap-overflow | uaf | double-free | fmt-string | bof | int-overflow | oob-read | oob-write | logic | …",
+      "file": "<decomp filename or binary symbol>",
+      "line": <int or null>,
+      "trigger": "<one paragraph: how attacker reaches it>",
+      "primitive_class": "AAW | RCE | UAF | AAR | partial-write | info-leak | dos",
+      "primitive_quality": "HIGH | MED | LOW"
+    }
+  ],
+  "chain": {
+    "technique_name": "tcache_poison | house_of_tangerine | house_of_water | ret2libc | rop | fsop_wfile | …",
+    "how2heap_file": "/opt/how2heap/glibc_<VER>/<name>.c | null",
+    "steps": ["<ordered one-line steps>"],
+    "one_gadget_offset": "0x… | null",
+    "expected_observable": "<what you expect on stdout if it works>"
+  },
+  "exploit_status": "drafted | tested-failed | tested-partial | flag-captured | aborted",
+  "caveats": ["<remote-untested | aslr-unstable | requires-N-attempts | …>"]
+}"""
+
+
+REPORT_SCHEMA_WEB = """\
+{
+  "schema_version": 1,
+  "chal_name": "<from description or filename>",
+  "stack": "<framework + language + DB — e.g. 'Flask + SQLAlchemy + SQLite'>",
+  "vulns": [
+    {
+      "id": "V-01",
+      "bug_class": "sqli | xss | ssrf | rce | lfi | rfi | deserialization | jwt-misuse | path-traversal | command-injection | auth-bypass | idor | xxe | csrf | logic | …",
+      "route": "<METHOD /path — e.g. 'POST /api/login'>",
+      "file": "<source file>",
+      "line": <int or null>,
+      "sink": "<unsafe call / pattern — e.g. 'subprocess.run(shell=True)'>",
+      "trigger": "<one paragraph: how attacker reaches it (auth required? prerequisites?)>",
+      "primitive_quality": "HIGH | MED | LOW"
+    }
+  ],
+  "chain": {
+    "technique_name": "blind-sqli-time | union-sqli | sstemplate-injection | pickle-rce | jwt-none | …",
+    "steps": ["<ordered one-line steps>"],
+    "expected_observable": "<flag location — e.g. '/flag.txt via LFI; cat through SQLi subquery'>"
+  },
+  "exploit_status": "drafted | tested-failed | tested-partial | flag-captured | aborted",
+  "caveats": ["<auth-required | remote-untested | rate-limited | …>"]
+}"""
+
+
+REPORT_SCHEMA_CRYPTO = """\
+{
+  "schema_version": 1,
+  "chal_name": "<from description or filename>",
+  "cipher": "<primitive — e.g. 'RSA-OAEP', 'AES-CBC', 'ECDSA-secp256k1', 'custom-LFSR'>",
+  "parameters": {
+    "key_bits": <int or null>,
+    "iv_reuse": true|false|null,
+    "padding": "<pkcs1v15 | oaep | pkcs7 | none | null>",
+    "extra": "<any other public params — short string or null>"
+  },
+  "vulns": [
+    {
+      "id": "V-01",
+      "attack_class": "small-e | common-modulus | partial-key | padding-oracle | lattice-LLL | coppersmith | NTRU | LWE | nonce-reuse | weak-PRNG | malleability | side-channel | …",
+      "file": "<source/notes file>",
+      "line": <int or null>,
+      "trigger": "<what condition makes this exploitable>",
+      "primitive_quality": "HIGH | MED | LOW"
+    }
+  ],
+  "chain": {
+    "technique_name": "<canonical attack name — e.g. 'Coppersmith partial-p', 'CCA2 padding oracle'>",
+    "uses_sage": true|false,
+    "libs": ["<pycryptodome | gmpy2 | sympy | z3 | sagemath | …>"],
+    "steps": ["<ordered one-line steps>"],
+    "expected_observable": "<recovered plaintext / private key / decrypted flag>"
+  },
+  "exploit_status": "drafted | tested-failed | tested-partial | flag-captured | aborted",
+  "caveats": ["<requires-sage | LLL-runtime-unknown | offline-only | …>"]
+}"""
+
+
+REPORT_SCHEMA_REV = """\
+{
+  "schema_version": 1,
+  "chal_name": "<from description or filename>",
+  "arch": "x86_64 | aarch64 | arm | i386 | wasm | jvm | dotnet | go | …",
+  "language": "C | C++ | Go | Rust | .NET | Java | Python-packed | …",
+  "protections": {
+    "packed": true|false|null,
+    "stripped": true|false|null,
+    "anti_debug": true|false|null
+  },
+  "flag_path": "<one paragraph: where the flag is constructed/printed/checked — file:addr>",
+  "key_facts": [
+    {
+      "id": "K-01",
+      "fact_class": "constant | algorithm | check-routine | obfuscation | side-channel | …",
+      "file": "<decomp file or addr>",
+      "line": <int or null>,
+      "description": "<what this fact tells the solver — e.g. 'XOR key 0xC0FFEE at .rodata:0x4080'>"
+    }
+  ],
+  "solver_strategy": {
+    "approach": "static-emit | brute-force | constraint-solver | dynamic-trace | hash-reverse | symbolic-exec | unpack-first | …",
+    "libs": ["<pwntools | z3 | angr | unicorn | …>"],
+    "steps": ["<ordered one-line steps>"],
+    "expected_observable": "<printed flag / accepted serial / cracked password>"
+  },
+  "exploit_status": "drafted | tested-failed | tested-partial | flag-captured | aborted",
+  "caveats": ["<obfuscation-residual | timing-sensitive | …>"]
+}"""
+
+
+REPORT_PHASE_MODEL = "claude-sonnet-4-6"
+
+
+async def run_report_phase(
+    *,
+    job_id: str,
+    work_dir,
+    model: str | None = None,
+    log_fn,
+    chal_name_hint: str = "",
+    schema_text: str | None = None,
+    timeout_s: int = 90,
+) -> bool:
+    """Run the terminal REPORT phase: convert ./report.md + ./exploit.py +
+    ./THREAT_MODEL.md (whichever exist) into a strict-schema findings.json.
+
+    Mirrors the cookbook's "report" phase pattern (stateless ``query()``,
+    no tools, no MCP server, pure JSON transformation). The whole point
+    is to keep the schema OUT of main's system_prompt — main focuses on
+    exploitation, this phase converts artifacts to structured data.
+
+    Hook order: after main finishes writing ./report.md + ./exploit.py,
+    BEFORE sandbox / postjudge / artifact carry. Idempotent: re-runs
+    overwrite the prior findings.json (so a retry that re-runs main also
+    re-runs this).
+
+    ``model`` defaults to ``REPORT_PHASE_MODEL`` (sonnet) — the
+    transformation is rote pattern-matching, not chain reasoning, so
+    paying for opus here is waste. Callers can override when their
+    schema needs heavier reasoning (e.g. multi-vuln deduplication).
+
+    ``schema_text`` lets each module supply its own JSON shape. None
+    falls back to the pwn schema (the most-used path historically).
+
+    Best-effort: any failure (SDK import, timeout, malformed JSON) is
+    logged and swallowed. Downstream ``validate_findings`` already
+    tolerates missing/empty files; UI has no readers.
+    """
+    try:
+        from claude_agent_sdk import ClaudeAgentOptions, query
+    except Exception as e:
+        log_fn(f"[report] SDK import failed ({e}); skipping report phase")
+        return False
+
+    report_md = work_dir / "report.md"
+    exploit_py = work_dir / "exploit.py"
+    solver_py = work_dir / "solver.py"
+    threat_md = work_dir / "THREAT_MODEL.md"
+
+    sources: list[tuple[str, Path]] = []
+    if report_md.is_file():
+        sources.append(("report.md", report_md))
+    if exploit_py.is_file():
+        sources.append(("exploit.py", exploit_py))
+    elif solver_py.is_file():
+        sources.append(("solver.py", solver_py))
+    if threat_md.is_file():
+        sources.append(("THREAT_MODEL.md", threat_md))
+
+    if not sources:
+        log_fn("[report] no source artifacts (report.md / exploit.py) — skipping")
+        return False
+
+    parts: list[str] = []
+    # Cap each source at 16 KB to keep the report prompt cheap. Most
+    # report.md files are 2-8 KB; exploit.py 4-12 KB. The schema only
+    # needs facts (mitigations, primitive class, technique name) that
+    # live in the first ~half.
+    for name, p in sources:
+        try:
+            text = p.read_text(errors="ignore")
+        except OSError:
+            continue
+        if len(text) > 16_384:
+            text = text[:16_384] + "\n# ... (truncated)\n"
+        parts.append(f"==== {name} ====\n{text}\n")
+
+    sources_blob = "\n".join(parts)
+    chal_hint = f"\nChal name hint: {chal_name_hint}\n" if chal_name_hint else ""
+    effective_schema = schema_text or _FINDINGS_SCHEMA_FOR_REPORT_PROMPT
+
+    report_prompt = (
+        "Convert the artifacts below into strict JSON conforming to the "
+        "schema. Every field is REQUIRED — use null for not-applicable, "
+        "never omit a key. Respond with JSON ONLY: no surrounding prose, "
+        "no markdown fences, no commentary.\n\n"
+        f"{chal_hint}"
+        "## Schema\n\n"
+        f"{effective_schema}\n\n"
+        "## Source artifacts (main agent's output)\n\n"
+        f"{sources_blob}"
+    )
+
+    # Keep the system_prompt minimal — cookbook's report phase ships
+    # only the engagement_context and the schema itself. NO mission_block,
+    # NO per-module SYSTEM_PROMPT, NO tool catalog.
+    sys_prompt = sanitize_for_argv(
+        CTF_PREAMBLE + "\nROLE: post-run REPORT phase. Pure JSON transformation. "
+        "You have no tools — write JSON as your final text only.",
+        label="report-options", log_fn=log_fn,
+    )
+
+    options = ClaudeAgentOptions(
+        system_prompt=sys_prompt,
+        model=model or REPORT_PHASE_MODEL,
+        cwd=str(work_dir),
+        allowed_tools=[],
+        disallowed_tools=["Agent", "Task", "WebSearch", "WebFetch", "Bash",
+                          "Read", "Write", "Edit", "Glob", "Grep"],
+        permission_mode="bypassPermissions",
+    )
+
+    log_fn(f"[report] launching report phase (model={options.model}, "
+           f"sources={[n for n, _ in sources]})")
+
+    accumulated = ""
+    try:
+        import anyio
+        with anyio.fail_after(timeout_s):
+            async for msg in query(prompt=report_prompt, options=options):
+                cls = type(msg).__name__
+                if cls == "AssistantMessage":
+                    for block in getattr(msg, "content", []) or []:
+                        if type(block).__name__ == "TextBlock":
+                            accumulated += getattr(block, "text", "") or ""
+                elif cls == "ResultMessage":
+                    if getattr(msg, "is_error", False):
+                        log_fn(f"[report] SDK ResultMessage error: "
+                               f"{getattr(msg, 'result', '')[:200]}")
+                        return False
+    except TimeoutError:
+        log_fn(f"[report] timed out after {timeout_s}s — keeping any prior "
+               f"findings.json untouched")
+        return False
+    except Exception as e:
+        log_fn(f"[report] phase crashed: {type(e).__name__}: {e}")
+        return False
+
+    raw = accumulated.strip()
+    if not raw:
+        log_fn("[report] empty response from report phase")
+        return False
+
+    # Strip code fences if the model emitted them despite instructions
+    if raw.startswith("```"):
+        # ```json\n{...}\n```  or  ```\n{...}\n```
+        body = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+        if body.endswith("```"):
+            body = body[:-3]
+        raw = body.strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        log_fn(f"[report] response is not valid JSON ({e}); keeping any "
+               f"prior findings.json")
+        return False
+
+    out = work_dir / "findings.json"
+    try:
+        out.write_text(json.dumps(parsed, indent=2))
+    except OSError as e:
+        log_fn(f"[report] write failed: {e}")
+        return False
+
+    log_fn(f"[report] findings.json written ({out.stat().st_size} B)")
+    return True
 
 
 async def run_pre_recon(
@@ -1892,6 +2608,16 @@ async def run_pre_recon(
     out = "".join(chunks).strip()
     if not out:
         return ""
+    # Sanitize control bytes that would corrupt downstream consumers.
+    # The recon reply is embedded into main's user_prompt and shipped
+    # to the `claude` CLI subprocess via argv (execve). argv CANNOT
+    # contain NUL bytes — they trigger `ValueError: embedded null byte`
+    # at subprocess.Popen time, killing main's spawn before its first
+    # turn. The model occasionally emits literal \x00 when summarizing
+    # binary disasm output (objdump on stripped ELFs, decomp of obfu-
+    # scated funcs, etc.). Strip them defensively; also strip other
+    # control codes that can confuse the SDK's JSON framing.
+    out = sanitize_for_argv(out, label=f"{tag}-reply", log_fn=log_fn)
     if crashed:
         out = (
             "[partial — pre-recon subprocess died before emitting its "
@@ -1934,6 +2660,16 @@ def make_main_session_options(
     use_isolated = os.environ.get(
         "USE_ISOLATED_SUBAGENTS", "1") != "0"
     log_fn_local = lambda s: log_line(job_id, s)
+    # Strip argv-fatal control bytes before the prompt is shipped via
+    # `claude --system-prompt <text>` argv. A stray `\0` in any prompt
+    # constant (e.g. a Python source-literal escape like `\0` written
+    # without doubling the backslash) makes execve(2) reject the
+    # spawn with `ValueError: embedded null byte`, killing the
+    # session before turn 1. Job d30897ee5b30 (2026-05-15) failed
+    # that way after a `\0` landmine landed in pwn SYSTEM_PROMPT.
+    system_prompt = sanitize_for_argv(
+        system_prompt, label="main-options", log_fn=log_fn_local,
+    )
     env = {"JOB_ID": job_id}
     if extra_env:
         env.update({k: str(v) for k, v in extra_env.items()})
@@ -1960,11 +2696,15 @@ def make_main_session_options(
     #     (cursor positioning, color escapes, progress bars) so Bash
     #     tool_result captures stay clean. The agent doesn't see ANSI
     #     anyway; this just drops the carriage-return chatter.
-    #   PWNLIB_SILENT=1 — suppresses pwntools' "[*] '...'" / "[!] ..."
-    #     status lines so checksec output is just the structured table.
+    # We deliberately do NOT set PWNLIB_SILENT=1: the pwntools-based
+    # `checksec` command emits its findings via `log.info`, and silencing
+    # the logger silences checksec itself. Observed empirically in the
+    # debugger fidelity smoke — `checksec --file=` exited 0 with empty
+    # output under PWNLIB_SILENT=1, forcing the agent to derive RELRO/
+    # canary/PIE from readelf+nm fallbacks. Letting pwntools log adds
+    # one `[*] '<file>'` line per call; minor cost vs. losing checksec.
     env.setdefault("TERM", "xterm")
     env.setdefault("PWNLIB_NOTERM", "1")
-    env.setdefault("PWNLIB_SILENT", "1")
 
     if use_isolated:
         mcp_server, spawn_tool = make_spawn_subagent_mcp(
@@ -2031,6 +2771,163 @@ def make_main_session_options(
     return options
 
 
+_NOCACHE_TOKEN = "[NOCACHE]"
+_SUBAGENT_CACHE_DIRNAME = "subagent_cache"
+
+
+def _normalize_subagent_prompt_for_cache(prompt: str) -> str:
+    """Strip whitespace + collapse runs of whitespace so trivially-
+    different prompts (extra blank line, trailing spaces) hit the
+    same cache entry. We do NOT strip case or punctuation — those
+    are sometimes semantic in CTF prompts (e.g. `LIBC_` vs `libc_`).
+    The leading [NOCACHE] sentinel is removed by the caller before
+    this is invoked.
+    """
+    return " ".join((prompt or "").split())
+
+
+def _subagent_cache_key(sub_type: str, normalized_prompt: str) -> str:
+    """Per-job cache key. 16 hex chars is enough — collision odds at
+    O(10) spawns per job are negligible and the key only has to be
+    unique inside one job's .scratch dir.
+    """
+    h = hashlib.sha256(f"{sub_type}|{normalized_prompt}".encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _load_subagent_cache(
+    work_dir, sub_type: str, raw_prompt: str,
+) -> tuple[str, dict | None]:
+    """Look up a cached reply. Returns (cache_key, entry_or_None).
+    Returns (None_key, None) when caching is bypassed via [NOCACHE].
+    """
+    if (raw_prompt or "").lstrip().startswith(_NOCACHE_TOKEN):
+        return ("", None)
+    norm = _normalize_subagent_prompt_for_cache(raw_prompt)
+    key = _subagent_cache_key(sub_type, norm)
+    p = Path(work_dir) / ".scratch" / _SUBAGENT_CACHE_DIRNAME / f"{key}.json"
+    if not p.is_file():
+        return (key, None)
+    try:
+        return (key, json.loads(p.read_text(errors="ignore")))
+    except (OSError, json.JSONDecodeError):
+        return (key, None)
+
+
+def _store_subagent_cache(
+    work_dir, cache_key: str, sub_type: str, prompt: str,
+    reply: str, cost_usd: float, spawn_idx: int, log_fn,
+) -> None:
+    """Persist a fresh reply to the job-scoped cache. Best-effort:
+    a write failure only costs a future cache miss, not the current
+    run. Empty replies are skipped so a failed spawn doesn't poison
+    the cache.
+    """
+    if not cache_key or not (reply or "").strip():
+        return
+    cache_dir = Path(work_dir) / ".scratch" / _SUBAGENT_CACHE_DIRNAME
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log_fn(f"[cache] dir create failed: {e}")
+        return
+    entry = {
+        "sub_type": sub_type,
+        "prompt_preview": prompt[:400],
+        "reply": reply,
+        "cost_usd": float(cost_usd or 0.0),
+        "spawn_idx": int(spawn_idx),
+        "ts": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        (cache_dir / f"{cache_key}.json").write_text(json.dumps(entry))
+    except OSError as e:
+        log_fn(f"[cache] write failed: {e}")
+
+
+# Subagent reply schema validators — Phase 2. recon stays free-form
+# because its questions vary widely (libc offsets / decomp triage /
+# rootfs unpack); enforcing one schema would either be too loose to
+# help or too strict to fit. Triage and debugger have FIXED shapes
+# (verdict table / observed-trace-conclusion-caveats) so JSON is a
+# clean win — main can `json.loads(tool_result)` once and access
+# fields directly instead of parsing markdown.
+_JSON_REPLY_SUBAGENTS = {"triage", "debugger"}
+
+
+def _extract_json_from_reply(text: str) -> dict | None:
+    """Permissively pull a JSON object out of a subagent reply.
+
+    Accepts:
+      * pure JSON (best case — what the prompt asks for)
+      * JSON inside a ```json ... ``` fence
+      * JSON inside a ``` ... ``` fence
+      * JSON object embedded in prose (outermost brace-balanced span)
+
+    Returns the parsed dict, or None when no JSON object is recoverable.
+
+    String-aware: braces inside JSON string literals don't shift
+    depth (e.g. `{"note":"some {prose} here"}` is one balanced span).
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    # Strip code fences
+    if s.startswith("```"):
+        body = s.split("\n", 1)[1] if "\n" in s else s[3:]
+        if body.endswith("```"):
+            body = body[:-3]
+        try:
+            return json.loads(body.strip())
+        except json.JSONDecodeError:
+            pass
+    # Scan forward from each `{`; return the first balanced span
+    # that parses as a dict. Forward (not rfind) so nested objects
+    # don't shadow the outer one. String-aware so brace chars in
+    # JSON string literals don't disturb depth tracking.
+    n = len(s)
+    i = 0
+    while i < n:
+        if s[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        j = i
+        in_str = False
+        escape = False
+        while j < n:
+            c = s[j]
+            if in_str:
+                if escape:
+                    escape = False
+                elif c == "\\":
+                    escape = True
+                elif c == '"':
+                    in_str = False
+            else:
+                if c == '"':
+                    in_str = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            parsed = json.loads(s[i:j+1])
+                            if isinstance(parsed, dict):
+                                return parsed
+                        except json.JSONDecodeError:
+                            pass
+                        break
+            j += 1
+        i += 1
+    return None
+
+
 def make_spawn_subagent_mcp(
     model: str | None,
     work_dir,
@@ -2064,17 +2961,23 @@ def make_spawn_subagent_mcp(
     @tool(
         "spawn_subagent",
         (
-            "Spawn an INDEPENDENT subagent (recon / debugger / judge) "
-            "in its own SDK session (= its own claude CLI subprocess). "
-            "The subagent runs to completion, then returns its FINAL "
-            "text response as the tool result. Use this in place of "
-            "the built-in `Agent` tool whenever you want process-"
-            "isolated memory — main's heap will not grow with the "
-            "subagent's investigation context. Parameters: "
-            "subagent_type ∈ {recon, debugger, judge}; "
+            "Spawn an INDEPENDENT subagent (recon / debugger / judge "
+            "/ triage) in its own SDK session (= its own claude CLI "
+            "subprocess). The subagent runs to completion, then "
+            "returns its FINAL text response as the tool result. Use "
+            "this in place of the built-in `Agent` tool whenever you "
+            "want process-isolated memory — main's heap will not grow "
+            "with the subagent's investigation context. Parameters: "
+            "subagent_type ∈ {recon, debugger, judge, triage}; "
             "prompt is the question/task you want the subagent to "
             "answer (keep it specific and bounded — the subagent's "
-            "session ends when it finishes the response)."
+            "session ends when it finishes the response). "
+            "Replies are CACHED by (subagent_type, normalized_prompt) "
+            "for the lifetime of this job — identical re-spawns return "
+            "the prior reply instantly. Prefix your prompt with "
+            "[NOCACHE] to force a fresh spawn (rare; use when you "
+            "explicitly want a second independent opinion or when "
+            "underlying files have changed since the cached run)."
         ),
         {"subagent_type": str, "prompt": str},
     )
@@ -2087,7 +2990,7 @@ def make_spawn_subagent_mcp(
                     "type": "text",
                     "text": (
                         f"ERROR: unknown subagent_type {sub_type!r}. "
-                        f"Valid: recon, debugger, judge."
+                        f"Valid: {', '.join(sorted(_AGENT_PROMPT_BY_TYPE))}."
                     ),
                 }],
                 "isError": True,
@@ -2101,6 +3004,13 @@ def make_spawn_subagent_mcp(
                 "isError": True,
             }
 
+        # Strip the optional [NOCACHE] sentinel from the prompt main
+        # sees the subagent execute; the sentinel only signals the
+        # caching layer (above) and shouldn't reach the subagent.
+        raw_prompt_for_lookup = sub_prompt
+        if sub_prompt.lstrip().startswith(_NOCACHE_TOKEN):
+            sub_prompt = sub_prompt.lstrip()[len(_NOCACHE_TOKEN):].lstrip()
+
         # NOTE: the spawn counter is incremented in log_assistant_blocks
         # the moment main's ToolUseBlock(mcp__team__spawn_subagent)
         # is yielded — that lets _maybe_subagent_cap() set the break
@@ -2109,10 +3019,69 @@ def make_spawn_subagent_mcp(
         # function, summary["subagent_spawns"] already reflects this
         # spawn.
         spawn_idx = int(summary.get("subagent_spawns", 0))
+
+        # Phase 1: reply cache. Identical (sub_type, prompt) pairs
+        # return the prior reply instantly — saves the ~$0.5-2 + 2-5
+        # min that re-running a spawn for the same question costs.
+        # The "recon#3 + recon#4 both re-derived libc symbol VMA→file
+        # mapping" pattern from job 89d442ef3291 is exactly what this
+        # short-circuits. Cache scope is per-job (work_dir is per-job).
+        cache_key, cached = _load_subagent_cache(
+            work_dir, sub_type, raw_prompt_for_lookup,
+        )
+        if cached and isinstance(cached.get("reply"), str):
+            saved_cost = float(cached.get("cost_usd") or 0.0)
+            log_fn(
+                f"[orchestrator] subagent #{spawn_idx} ({sub_type}) "
+                f"cache HIT — returning prior reply "
+                f"({len(cached['reply'])} B, saved ~${saved_cost:.4f})"
+            )
+            return {"content": [{"type": "text", "text": cached["reply"]}]}
+
         log_fn(
             f"[orchestrator] isolated subagent #{spawn_idx} spawning "
             f"({sub_type})"
         )
+
+        # CONTEXT-SHARING (kills re-derivation across isolated subagents).
+        # Each prior subagent's final summary lives at
+        # ./.scratch/subagent_log.md ; we prepend the last ~8 KB to this
+        # spawn's prompt so it doesn't repeat work the previous one
+        # already finished. Subagent isolation keeps the heavy
+        # investigation context out of MAIN, but two consecutive recons
+        # rediscovering the same symbol offsets / RPATH workaround is
+        # waste — past jobs (89d442ef3291: recon#3 + recon#4 both
+        # re-derived libc symbol VMA→file mapping; debugger#2 + recon#4
+        # both re-solved the chal-libc-fix RPATH issue independently).
+        scratch_dir = Path(work_dir) / ".scratch"
+        try:
+            scratch_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as _e:
+            log_fn(f"[orchestrator] scratch dir create failed: {_e}")
+        sub_log = scratch_dir / "subagent_log.md"
+        prior_block = ""
+        if sub_log.is_file():
+            try:
+                raw = sub_log.read_text(errors="replace")
+            except OSError:
+                raw = ""
+            if raw:
+                # Take the last 8 KB so we don't unbound-grow the
+                # prompt as the job spawns more subagents. The most
+                # recent summaries are the ones likeliest to inform
+                # the new spawn anyway; earlier ones already shaped
+                # main's user-prompt for THIS spawn.
+                tail = raw[-8000:]
+                prior_block = (
+                    "PRIOR SUBAGENT FINDINGS (read-only context — extend "
+                    "or contradict with evidence; do NOT silently repeat "
+                    "work already done):\n\n"
+                    f"{tail}\n\n"
+                    "=== END PRIOR FINDINGS ===\n\n"
+                    "=== YOUR NEW TASK BELOW ===\n\n"
+                )
+
+        sub_prompt_effective = prior_block + sub_prompt
 
         sub_options = make_standalone_options(
             sub_type, model, work_dir, job_id,
@@ -2124,7 +3093,7 @@ def make_spawn_subagent_mcp(
         sub_summary: dict = {}
         try:
             async with ClaudeSDKClient(options=sub_options) as sub_client:
-                await sub_client.query(sub_prompt)
+                await sub_client.query(sub_prompt_effective)
                 async for msg in sub_client.receive_response():
                     # Logging mirrors log_assistant_blocks but tagged
                     # by the isolated subagent's identity. We don't
@@ -2205,6 +3174,15 @@ def make_spawn_subagent_mcp(
             }
 
         final = "\n".join(chunks).strip()
+        # Same control-byte sanitization as run_pre_recon — the subagent
+        # may emit \x00 while summarizing disasm/binary content, and the
+        # tool_result text rides back into main's conversation. If main
+        # later forks via /retry the same prompt argv would carry the
+        # NUL and crash subprocess.Popen. Strip defensively at the
+        # source (this MCP wrapper) so it can never reach main.
+        final = sanitize_for_argv(
+            final, label=f"orchestrator {tag} reply", log_fn=log_fn,
+        )
         if not final:
             final = (
                 f"(subagent {sub_type} returned no text — likely hit "
@@ -2220,6 +3198,55 @@ def make_spawn_subagent_mcp(
             f"[orchestrator] isolated {tag} done — "
             f"{len(final)} B response{cost_note}"
         )
+
+        # Phase 2: JSON-typed reply validation for triage / debugger.
+        # The prompts ask for strict JSON; main programmatically
+        # consumes the fields. If we can't recover a JSON object,
+        # log a warning + pass the raw text through (so a malformed
+        # reply doesn't crash main — degrades to free-form parsing).
+        if sub_type in _JSON_REPLY_SUBAGENTS:
+            parsed = _extract_json_from_reply(final)
+            if parsed is None:
+                log_fn(
+                    f"[orchestrator] {tag} reply was not valid JSON "
+                    f"(expected per prompt) — main will see raw text"
+                )
+            else:
+                # Re-serialize so main always sees compact JSON, even
+                # if the subagent emitted fenced or trailing prose.
+                try:
+                    final = json.dumps(parsed, ensure_ascii=False)
+                except (TypeError, ValueError) as _e:
+                    log_fn(
+                        f"[orchestrator] {tag} JSON re-serialize failed: "
+                        f"{_e} — keeping original text"
+                    )
+
+        # Persist this subagent's final response to the shared scratch
+        # so the NEXT spawn picks it up via the prior_block prepend
+        # above. Cap each entry's body at ~4 KB to bound the file
+        # growth across many spawns.
+        try:
+            entry = (
+                f"\n\n## {tag} ({datetime.now().isoformat(timespec='seconds')})"
+                f"{cost_note}\n"
+                f"PROMPT_HEAD: {sub_prompt[:400]}\n\n"
+                f"FINAL:\n{final[:4000]}\n"
+                f"=== /{tag} ===\n"
+            )
+            with sub_log.open("a") as f:
+                f.write(entry)
+        except OSError as _e:
+            log_fn(f"[orchestrator] scratch log append failed: {_e}")
+
+        # Phase 1: persist to per-job cache so a future identical
+        # (sub_type, prompt) spawn hits instantly. Skipped on empty
+        # replies (handled inside _store_subagent_cache).
+        _store_subagent_cache(
+            work_dir, cache_key, sub_type, sub_prompt, final,
+            float(sub_summary.get("cost_usd", 0.0)), spawn_idx, log_fn,
+        )
+
         return {"content": [{"type": "text", "text": final}]}
 
     server = create_sdk_mcp_server(
@@ -2543,6 +3570,111 @@ def capture_session_id(msg, job_id: str) -> None:
 
 
 _RETRY_HINT_MARKER = "[retry-hint]"
+
+
+def module_autoboot(
+    module: str,
+    work_dir: Path,
+    log_fn,
+    *,
+    extras: dict | None = None,
+) -> dict:
+    """Generic per-module autoboot hook (Item 5).
+
+    Centralizes the "before main's first turn, pre-bake environment +
+    write a breadcrumb file" pattern that pwn's _autobootstrap_libc
+    already does in a heavy way. For non-pwn modules this is light:
+    we record what the worker container can do for that module and
+    drop an `AUTOBOOT.md` into work_dir so every subagent (recon /
+    debugger) can read the same orientation breadcrumbs instead of
+    re-discovering them per spawn (Item 3 — subagent isolation cost).
+
+    The pwn module continues to call its own `_autobootstrap_libc` for
+    the heavy chal-libc-fix / libc_profile.json / decomp pre-bake; this
+    function is the LIGHT companion that records the module's flavor.
+
+    Returns a small summary dict the caller can merge into its
+    `summary` so postjudge / judge can see what autoboot did.
+    """
+    extras = extras or {}
+    autoboot_md = work_dir / "AUTOBOOT.md"
+    parts: list[str] = [
+        f"# Autoboot summary ({module})",
+        "",
+        "This file is generated BEFORE main's first turn. It captures the",
+        "environment + module-specific orientation tips so every subagent",
+        "starts from the same baseline (see Item 3 — context-sharing).",
+        "",
+        "## What's in the worker container",
+    ]
+    # Module-specific orientation. These mirror the per-module TOOLS_*
+    # blocks in the SYSTEM_PROMPT, but as on-disk breadcrumbs so a
+    # subagent that reads ./AUTOBOOT.md gets the highlights without
+    # having to absorb the full TOOLS_* in its prompt.
+    if module == "pwn":
+        parts.append("- chal-libc-fix already ran; check ./.chal-libs/")
+        parts.append("- libc_profile.json present iff chal-libc-fix found a libc + ld pair")
+        parts.append("- /opt/scaffold/ contains pwn templates (heap_menu / fsop_wfile / aslr_retry / tcache_poison)")
+        parts.append("- /opt/how2heap/ has shellphish PoCs keyed by glibc version")
+        parts.append("- decomp pre-staged into ./decomp/ when ghiant ran during autoboot")
+        parts.append("")
+        parts.append("## Running the binary with chal libs")
+        parts.append("```")
+        parts.append("# Preferred (RPATH'd by chal-libc-fix):")
+        parts.append("./prob")
+        parts.append("# If RPATH not set, fall back to:")
+        parts.append("LD_LIBRARY_PATH=./.chal-libs ./bin/<binary_name>")
+        parts.append("# If ld.so version mismatch: try patchelf manually:")
+        parts.append("patchelf --set-interpreter $(realpath ./.chal-libs/ld-*.so 2>/dev/null || echo /lib64/ld-linux-x86-64.so.2) \\")
+        parts.append("         --set-rpath './.chal-libs' ./bin/<binary_name>")
+        parts.append("```")
+    elif module == "web":
+        parts.append("- curl/httpx/requests available; pwntools for raw-socket")
+        parts.append("- sqlmap for URL-driven SQLi probes")
+        parts.append("- prefer fuzzing common params (id, page, search, cmd, url, file) before deep source review")
+        parts.append("")
+        parts.append("## Reflexive checks (don't skip)")
+        parts.append("- robots.txt / sitemap.xml / .git/ / .env / backup files")
+        parts.append("- header injection (Host:, X-Forwarded-For:, X-Original-URL:)")
+        parts.append("- common bypass classes: SSRF (gopher://, file://), IDOR (parameter sequence walk), race (concurrent submit)")
+    elif module == "crypto":
+        parts.append("- pycryptodome / gmpy2 / sympy / z3-solver / ecdsa available")
+        parts.append("- sage NOT in this container — write solver.sage for sage runner if needed")
+        parts.append("- before deep math: encrypt a known plaintext through the oracle and OBSERVE patterns")
+    elif module == "rev":
+        parts.append("- ghiant pre-bake (cached project under ./.ghidra_proj/)")
+        parts.append("- gdb / strace / ltrace / qemu-{arm,aarch64}-static")
+        parts.append("- BEFORE deep disasm: run with 5 varied inputs (empty, random, structured, expected, edge)")
+    elif module in ("forensic", "misc"):
+        parts.append("- exiftool / yara / binwalk results already in findings.json")
+        parts.append("- carved artifacts in extracted/")
+        parts.append("- check entropy histogram before assuming encryption")
+    else:
+        parts.append(f"- (module={module}) no module-specific notes")
+
+    # Sandbox / scratch dir hint — applies to ALL modules.
+    parts.append("")
+    parts.append("## Scratch / temp")
+    parts.append("- $TMPDIR is pre-set to ./tmp/ (per-job, isolated)")
+    parts.append("- Prior subagent summaries: ./.scratch/subagent_log.md (auto-prepended to each new spawn)")
+
+    if extras:
+        parts.append("")
+        parts.append("## Module-specific autoboot output")
+        for k, v in extras.items():
+            parts.append(f"- {k}: {v}")
+
+    try:
+        autoboot_md.write_text("\n".join(parts) + "\n")
+        log_fn(f"[autoboot] wrote AUTOBOOT.md ({autoboot_md.stat().st_size} B)")
+    except OSError as e:
+        log_fn(f"[autoboot] AUTOBOOT.md write failed: {e}")
+
+    return {
+        "module": module,
+        "autoboot_md": str(autoboot_md.name),
+        "extras": dict(extras),
+    }
 
 
 def split_retry_hint(description: str | None) -> tuple[str, str]:
@@ -3108,17 +4240,18 @@ def _format_postjudge_user_turn(
     max_attempts: int,
     script_filename: str,
     sandbox_result: dict,
-    findings_issues: list[str] | None = None,
 ) -> str:
     """Compose the user-turn body that gets injected back into main's
     SDK session after a failed sandbox run. Tells main what verdict
     came back, gives it the postjudge retry_hint verbatim, and asks
     for a corrected script. Tail of stdout/stderr is included so main
     can cross-check rather than trusting judge's summary blindly.
-    `findings_issues` is the validator output from validate_findings()
-    on the just-finished attempt's findings.json — included verbatim
-    so main fixes schema drift on the retry instead of letting it
-    accumulate.
+
+    findings.json schema validation is intentionally NOT plumbed in:
+    cookbook fidelity puts the structured-output transformation in a
+    terminal REPORT phase (run_report_phase) that fires once at job
+    end. Main is responsible only for report.md prose; nothing it
+    writes mid-retry would feed back here anyway.
     """
     judge = (sandbox_result or {}).get("judge") or {}
     verdict = judge.get("verdict") or "unknown"
@@ -3126,6 +4259,19 @@ def _format_postjudge_user_turn(
     retry_hint = (judge.get("retry_hint") or "").strip()
     failure_code = (judge.get("failure_code") or "").strip().lower() or None
     next_action = (judge.get("next_action") or "continue").lower()
+    # New structured fields (Item 6 — backwards-compatible: empty
+    # defaults if judge didn't emit them).
+    what_worked = judge.get("what_worked") or []
+    what_failed = judge.get("what_failed") or []
+    specific_diagnosis = (judge.get("specific_diagnosis") or "").strip()
+    alternative_paths = judge.get("alternative_paths") or []
+    if not isinstance(what_worked, list):
+        what_worked = []
+    if not isinstance(what_failed, list):
+        what_failed = []
+    if not isinstance(alternative_paths, list):
+        alternative_paths = []
+
     exit_code = sandbox_result.get("exit_code")
     stdout = (sandbox_result.get("stdout") or "")[-2000:]
     stderr = (sandbox_result.get("stderr") or "")[-2000:]
@@ -3149,13 +4295,31 @@ def _format_postjudge_user_turn(
             f"\n=== prescriptive fix (failure_code={failure_code}) ===\n"
             f"{HEAP_FIX_HINTS[failure_code]}\n"
         )
-    findings_block = ""
-    if findings_issues:
-        findings_block = (
-            "\n=== findings.json schema issues (fix these on this retry) ===\n"
-            + "\n".join(f"  - {x}" for x in findings_issues[:8])
-            + "\n"
-        )
+    # Structured diagnosis block — included only when judge emitted
+    # at least one of the new fields. Keeps the retry feedback shape
+    # backwards-compatible for older runs whose meta doesn't carry it.
+    diagnosis_block = ""
+    if (
+        what_worked or what_failed or specific_diagnosis or alternative_paths
+    ):
+        diagnosis_parts: list[str] = ["\n=== structured diagnosis ==="]
+        if what_worked:
+            diagnosis_parts.append("WHAT WORKED (preserve these on the patch):")
+            diagnosis_parts.extend(f"  ✓ {s}" for s in what_worked[:3])
+        if what_failed:
+            diagnosis_parts.append("WHAT FAILED (these are the bugs to fix):")
+            diagnosis_parts.extend(f"  ✗ {s}" for s in what_failed[:3])
+        if specific_diagnosis:
+            diagnosis_parts.append(
+                f"PINPOINT: {specific_diagnosis}"
+            )
+        if alternative_paths:
+            diagnosis_parts.append(
+                "ALTERNATIVE PATHS (try if the patch keeps failing — "
+                "these were NOT exhausted by this run):"
+            )
+            diagnosis_parts.extend(f"  → {s}" for s in alternative_paths[:3])
+        diagnosis_block = "\n".join(diagnosis_parts) + "\n"
 
     return (
         f"🔁 AUTO-RETRY {attempt_idx}/{cap_str} — postjudge feedback\n"
@@ -3170,7 +4334,7 @@ def _format_postjudge_user_turn(
         + (f"  · failure_code: {failure_code}\n" if failure_code else "")
         + f"{timeout_marker}"
         f"{fix_preamble}"
-        f"{findings_block}"
+        f"{diagnosis_block}"
         f"\n"
         f"=== retry hint (from postjudge — apply this) ===\n"
         f"{retry_hint or '(judge produced no actionable hint; debug from the tails below)'}\n"
@@ -3879,18 +5043,11 @@ async def run_main_agent_session(
             # Inject postjudge feedback as next user turn and loop.
             attempt += 1
             write_meta(job_id, stage=f"auto-retry-{attempt}")
-            findings_issues = validate_findings(work_dir)
-            if findings_issues:
-                log_fn(
-                    "[orchestrator] findings.json schema issues: "
-                    f"{len(findings_issues)} — folding into retry feedback"
-                )
             feedback = _format_postjudge_user_turn(
                 attempt_idx=attempt,
                 max_attempts=max_retries,
                 script_filename=picked,
                 sandbox_result=last_sandbox or {},
-                findings_issues=findings_issues,
             )
             log_fn(
                 f"[orchestrator] injecting postjudge feedback as new user "

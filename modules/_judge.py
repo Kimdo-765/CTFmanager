@@ -129,7 +129,11 @@ markdown:
  "retry_hint": "<=600 chars; empty when verdict==success or next_action==stop",
  "next_action": "continue"|"stop",
  "stop_reason": "<=200 chars; required when next_action==stop, else empty>",
- "failure_code": "<one of the heap codes below; OMIT or null when verdict==success or no heap code applies>"}}
+ "failure_code": "<one of the heap codes below; OMIT or null when verdict==success or no heap code applies>",
+ "what_worked": ["<=80 chars each, up to 3 items: parts of the chain that demonstrably succeeded — libc leak got a non-zero address, fastbin alloc returned, etc.>"],
+ "what_failed": ["<=80 chars each, up to 3 items: the specific step that failed, with the observed signal (SIGSEGV at addr X, recvuntil timeout on 'Size:', abort msg, etc.)>"],
+ "specific_diagnosis": "<=300 chars; one sentence pinpointing the failed line + the observed signal (e.g. 'exploit.py:42 sendlineafter waited for b\"> \" but service emits b\"> \\x1b[0m\" with ANSI; recv blocks then SDK timeout')",
+ "alternative_paths": ["<=120 chars each, up to 3: techniques NOT yet tried that the observed state evidences could work (e.g. 'unsorted-bin attack on _IO_list_all', 'House of Orange via FILE struct overflow'). Empty list if exhaustively tried."]}}
 
 next_action — judge's call on whether to feed retry_hint back to
 main or halt the job. STOP is the AGGRESSIVE default whenever the
@@ -621,6 +625,34 @@ def postjudge_run(
     if verdict == "success":
         failure_code = None
 
+    # Structured fields (new — backwards compatible). Coerce to list of
+    # short strings; drop anything that doesn't fit so a malformed
+    # value can't leak into the retry-feedback formatter and crash it.
+    def _coerce_list(key: str, max_items: int, item_cap: int) -> list[str]:
+        raw_v = parsed.get(key)
+        if not isinstance(raw_v, list):
+            return []
+        out: list[str] = []
+        for item in raw_v[:max_items]:
+            if isinstance(item, str):
+                trimmed = item.strip()
+                if trimmed:
+                    out.append(trimmed[:item_cap])
+        return out
+
+    what_worked: list[str] = _coerce_list("what_worked", max_items=3, item_cap=120)
+    what_failed: list[str] = _coerce_list("what_failed", max_items=3, item_cap=120)
+    alternative_paths: list[str] = _coerce_list("alternative_paths", max_items=3, item_cap=200)
+    raw_diag = parsed.get("specific_diagnosis")
+    specific_diagnosis = (
+        str(raw_diag).strip()[:400] if isinstance(raw_diag, str) else ""
+    )
+    if verdict == "success":
+        # Success collapses these — nothing failed, nothing alternative.
+        what_failed = []
+        alternative_paths = []
+        specific_diagnosis = ""
+
     log_fn(
         f"[judge] postjudge verdict={verdict} next_action={next_action} "
         f"summary={summary[:160]}"
@@ -629,6 +661,8 @@ def postjudge_run(
         log_fn(f"[judge] postjudge stop_reason={stop_reason[:200]}")
     if failure_code:
         log_fn(f"[judge] postjudge failure_code={failure_code}")
+    if specific_diagnosis:
+        log_fn(f"[judge] postjudge diagnosis={specific_diagnosis[:200]}")
     if retry_hint:
         log_fn(f"[judge] postjudge retry_hint={retry_hint[:200]}")
 
@@ -642,5 +676,9 @@ def postjudge_run(
         "next_action": next_action,
         "stop_reason": stop_reason,
         "failure_code": failure_code,
+        "what_worked": what_worked,
+        "what_failed": what_failed,
+        "specific_diagnosis": specific_diagnosis,
+        "alternative_paths": alternative_paths,
         "raw": raw,
     }

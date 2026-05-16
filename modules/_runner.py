@@ -194,14 +194,28 @@ def run_in_sandbox(
     timeout_s: int = DEFAULT_TIMEOUT_S,
     mem_limit: str = DEFAULT_MEM,
     network: str = "bridge",
-    workdir: str = "/work",
     use_sage: bool = False,
     *,
     log_fn=None,
     enable_judge: bool = False,
 ) -> dict:
-    """Execute /work/<script_rel> inside the runner container with the job
-    directory bind-mounted at /work.
+    """Execute the agent's script inside the runner container against the
+    SAME absolute paths the worker used.
+
+    Layout (load-bearing for patched-libc binaries):
+
+      host  ${HOST_DATA_DIR}/jobs/<id>            ←──┐
+                                                     │ bind-mount,
+                                                     │ same path
+      runner /data/jobs/<id>                       ←──┘ both sides
+
+    cwd inside the runner is `/data/jobs/<id>/work` — same dir the agent
+    was working in. That makes `./bin/<name>` resolve to the patched copy
+    in the work tree, and — critically — makes the binary's PT_INTERP
+    (baked by chal-libc-fix as `/data/jobs/<id>/work/.chal-libs/ld-…`)
+    resolve from the runner's filesystem too. Without matching paths the
+    kernel can't find the interpreter and spawning the patched binary
+    fails with the classic misleading `No such file or directory`.
 
     When `enable_judge` is True the wait loop calls
     `modules._judge.supervise_run_once` after SUPERVISE_STALL_S of
@@ -213,6 +227,12 @@ def run_in_sandbox(
               timeout?, killed_by_supervise?, supervise?}.
     """
     args = args or []
+    # Mount the host's jobroot at the SAME absolute path the worker uses,
+    # then chdir into the work-tree. Anywhere PT_INTERP / DT_RPATH was
+    # baked with `/data/jobs/<id>/work/…` now resolves identically in
+    # the runner.
+    mount_root = f"/data/jobs/{job_id}"
+    workdir = f"{mount_root}/work"
     if use_sage:
         image = SAGE_IMAGE
         cmd = ["sage", f"{workdir}/{script_rel}", *args]
@@ -233,12 +253,10 @@ def run_in_sandbox(
         env["CALLBACK_URL"] = cb
         env["COLLECTOR_URL"] = f"{cb.rstrip('/')}/api/collector/{job_id}"
 
-    # Per-job scratch dir inside the sandbox. Host path
-    # /data/jobs/<id>/tmp/ ↔ container path <workdir>/tmp/. The host
-    # dir is created in attempt_sandbox_run before this is reached;
-    # we set the env vars unconditionally so tempfile.* in the
-    # exploit lands inside the job's bind-mount (cleaned up by job
-    # DELETE rmtree) instead of the shared container /tmp.
+    # Per-job scratch dir inside the sandbox. Lives under the work tree
+    # at /data/jobs/<id>/work/tmp/ — same path the agent sees in the
+    # worker, so any tempfile path the agent generated during the run
+    # remains valid when the solver replays it in the sandbox.
     _sandbox_tmp = f"{workdir}/tmp"
     env["TMPDIR"] = _sandbox_tmp
     env["TMP"]    = _sandbox_tmp
@@ -248,7 +266,10 @@ def run_in_sandbox(
     container = client.containers.run(
         image=image,
         command=cmd,
-        volumes={_host_path(job_id): {"bind": workdir, "mode": "rw"}},
+        # Bind-mount the host's jobroot at the WORKER's absolute path so
+        # /data/jobs/<id>/work/.chal-libs/… (baked into patched ELFs) is
+        # the same path on both sides.
+        volumes={_host_path(job_id): {"bind": mount_root, "mode": "rw"}},
         working_dir=workdir,
         mem_limit=mem_limit,
         network_mode=network,
@@ -330,13 +351,37 @@ def attempt_sandbox_run(
              the `judge` key.
     """
     work_dir = Path(f"/data/jobs/{job_id}")
-    if not (work_dir / script_filename).exists():
+    # Script lives in the agent's work tree (jobroot/work/<script>) so
+    # ./bin/<name> resolves to the PATCHED copy in work/bin/. If a
+    # caller carried the script up to jobroot only (legacy layout),
+    # fall back to that — but the patched-libc path won't be valid
+    # for those, since chal-libc-fix only patches the work-tree copy.
+    work_tree = work_dir / "work"
+    if (work_tree / script_filename).exists():
+        pass
+    elif (work_dir / script_filename).exists():
+        log_fn(
+            f"[runner] {script_filename} only found at jobroot, not "
+            "in work/ — patched libc binaries in ./bin/ will not be "
+            "reachable; copying into work/ for the sandbox run"
+        )
+        try:
+            work_tree.mkdir(parents=True, exist_ok=True)
+            (work_tree / script_filename).write_bytes(
+                (work_dir / script_filename).read_bytes()
+            )
+        except OSError as e:
+            log_fn(f"[runner] copy-into-work failed: {e}")
+            return None
+    else:
         log_fn(f"[runner] {script_filename} missing, cannot auto-run")
         return None
 
-    # Per-job scratch dir for sandboxed exploit (sees it as /work/tmp).
-    # Cleanup is implicit via job DELETE rmtree on /data/jobs/<id>/.
-    (work_dir / "tmp").mkdir(parents=True, exist_ok=True)
+    # Per-job scratch dir for sandboxed exploit. Lives inside the work
+    # tree at /data/jobs/<id>/work/tmp/ so the runner's TMPDIR points at
+    # a path that's valid in both worker and runner. Cleanup is implicit
+    # via job DELETE rmtree on /data/jobs/<id>/.
+    (work_tree / "tmp").mkdir(parents=True, exist_ok=True)
 
     enable_judge = _judge_enabled()
 

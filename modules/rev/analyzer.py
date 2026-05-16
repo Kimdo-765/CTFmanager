@@ -12,13 +12,18 @@ from modules._common import (
     extract_cost,
     job_dir,
     log_line,
+    REPORT_SCHEMA_REV,
+    load_cached_pre_recon,
     make_main_session_options,
+    module_autoboot,
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
     run_pre_recon,
+    run_report_phase,
     scan_job_for_flags,
     soft_timeout_watchdog,
+    store_pre_recon_cache,
     write_meta,
 )
 from modules._runner import attempt_sandbox_run
@@ -47,6 +52,15 @@ async def _run_agent(
         except Exception:
             pass
 
+    # Item 5 — autoboot breadcrumb for subagent baseline.
+    module_autoboot(
+        "rev", work_dir, lambda s: log_line(job_id, s),
+        extras={
+            "binary": binary_name or "(none)",
+            "staged_count": str(len(list(staged_bin.iterdir()))),
+        },
+    )
+
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     resume_sid = read_meta(job_id).get("resume_session_id")
     summary: dict = {"messages": 0, "tool_calls": 0, "model": model}
@@ -66,35 +80,44 @@ async def _run_agent(
     # having to decide "should I delegate?". Skipped on retries (main
     # is resuming a prior session) and when no binary is staged.
     if binary_name and not resume_sid:
-        recon_question = (
-            "STATIC TRIAGE REQUEST (pre-flight for the main solver writer).\n\n"
-            f"BINARY: ./bin/{binary_name}   (cwd = work dir)\n\n"
-            f"If `./decomp/` is missing, run `ghiant ./bin/{binary_name}` "
-            "ONCE to populate it (project cached under ./.ghidra_proj/).\n\n"
-            "REPLY in ≤2 KB, as compact bullets, with these sections:\n"
-            "  ARCH         — `file` summary in one line\n"
-            "  PROTECTIONS  — checksec\n"
-            "  LANGUAGE     — C/C++ vs Go vs Rust vs .NET vs packed?\n"
-            "  FUNCTIONS    — names + sizes of the interesting funcs "
-            "(main, check_password / verify / decrypt / serial routines, "
-            "flag-derivation paths). Ignore stdlib stubs.\n"
-            "  FLAG PATH    — where is the flag string built / read / "
-            "printed? cite file:addr.\n"
-            "  CONSTANTS    — XOR keys, AES keys, hashes, magic bytes "
-            "embedded in .data/.rodata that the solver will need.\n"
-            "  CANDIDATES   — ranked HIGH/MED/LOW with technique name + "
-            "file:line (`HIGH brute-force serial via known constant @ 0x..`).\n\n"
-            "DO NOT propose solver code. Facts only. Cite file:line "
-            "for every claim."
+        # See modules/pwn/analyzer.py for the carry_work=True rationale —
+        # web/crypto/rev share the same retry plumbing.
+        recon_reply = load_cached_pre_recon(
+            work_dir, lambda s: log_line(job_id, s),
         )
-        log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
-        recon_reply = await run_pre_recon(
-            job_id=job_id,
-            work_dir=work_dir,
-            model=model,
-            prompt=recon_question,
-            log_fn=lambda s: log_line(job_id, s),
-        )
+        if not recon_reply:
+            recon_question = (
+                "STATIC TRIAGE REQUEST (pre-flight for the main solver writer).\n\n"
+                f"BINARY: ./bin/{binary_name}   (cwd = work dir)\n\n"
+                f"If `./decomp/` is missing, run `ghiant ./bin/{binary_name}` "
+                "ONCE to populate it (project cached under ./.ghidra_proj/).\n\n"
+                "REPLY in ≤2 KB, as compact bullets, with these sections:\n"
+                "  ARCH         — `file` summary in one line\n"
+                "  PROTECTIONS  — checksec\n"
+                "  LANGUAGE     — C/C++ vs Go vs Rust vs .NET vs packed?\n"
+                "  FUNCTIONS    — names + sizes of the interesting funcs "
+                "(main, check_password / verify / decrypt / serial routines, "
+                "flag-derivation paths). Ignore stdlib stubs.\n"
+                "  FLAG PATH    — where is the flag string built / read / "
+                "printed? cite file:addr.\n"
+                "  CONSTANTS    — XOR keys, AES keys, hashes, magic bytes "
+                "embedded in .data/.rodata that the solver will need.\n"
+                "  CANDIDATES   — ranked HIGH/MED/LOW with technique name + "
+                "file:line (`HIGH brute-force serial via known constant @ 0x..`).\n\n"
+                "DO NOT propose solver code. Facts only. Cite file:line "
+                "for every claim."
+            )
+            log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
+            recon_reply = await run_pre_recon(
+                job_id=job_id,
+                work_dir=work_dir,
+                model=model,
+                prompt=recon_question,
+                log_fn=lambda s: log_line(job_id, s),
+            )
+            store_pre_recon_cache(
+                work_dir, recon_reply, lambda s: log_line(job_id, s),
+            )
         if recon_reply:
             user_prompt = (
                 "PRE-RECON COMPLETED — the orchestrator already ran a "
@@ -137,6 +160,21 @@ async def _run_agent(
             sandbox_runner=_sandbox_for,
             log_fn=lambda s: log_line(job_id, s),
         )
+        # Terminal REPORT phase — see pwn analyzer for the rationale.
+        try:
+            await run_report_phase(
+                job_id=job_id,
+                work_dir=work_dir,
+                log_fn=lambda s: log_line(job_id, s),
+                chal_name_hint=(binary_name or ""),
+                schema_text=REPORT_SCHEMA_REV,
+            )
+        except Exception as e:
+            log_line(
+                job_id,
+                f"[report] phase raised {type(e).__name__}: {e} — "
+                f"continuing without findings.json",
+            )
     finally:
         watchdog.cancel()
         if read_meta(job_id).get("awaiting_decision"):

@@ -15,11 +15,15 @@ from modules._common import (
     job_dir,
     log_line,
     make_main_session_options,
+    load_cached_pre_recon,
+    module_autoboot,
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
     run_pre_recon,
+    run_report_phase,
     scan_job_for_flags,
+    store_pre_recon_cache,
     soft_timeout_watchdog,
     write_meta,
 )
@@ -28,12 +32,80 @@ from modules.pwn.prompts import SYSTEM_PROMPT, build_user_prompt, looks_heap_adv
 from modules.settings_io import apply_to_env, get_setting
 
 
+# Filename patterns that ARE standard shipped libraries — anything NOT
+# matching these is treated as a chal-author-supplied custom .so and
+# becomes a primary attack surface. The list is conservative on purpose:
+# we'd rather flag a real glibc helper as "custom" once than miss a
+# chal-shipped wrapper whose exported functions hide the primitive.
+_STANDARD_LIB_PREFIXES = (
+    "libc.so", "libc-",            # glibc
+    "ld-linux", "ld-musl",         # dynamic loaders
+    "libm.so", "libm-",            # libm
+    "libdl.so", "libdl-",          # libdl
+    "libpthread.so", "libpthread-",
+    "librt.so", "librt-",
+    "libresolv.so", "libresolv-",
+    "libnsl.so", "libnsl-",
+    "libutil.so", "libutil-",
+    "libcrypt.so", "libcrypt-",
+    "libnss_",                     # NSS plugins
+    "libgcc_s.so",
+    "libstdc++.so",
+)
+
+
+def _is_standard_libname(name: str) -> bool:
+    n = name.lower()
+    return any(n.startswith(p) for p in _STANDARD_LIB_PREFIXES)
+
+
+def _detect_custom_libs(work_dir: Path) -> list[str]:
+    """Scan ./.chal-libs/ for chal-author-supplied .so files.
+
+    Returns the bare filenames of any .so whose name doesn't match a
+    standard glibc / ld / libgcc / libstdc++ pattern. These are the
+    files whose EXPORTS are the most likely place to find the
+    challenge's primitive — chal authors who ship a custom .so almost
+    always do so because they've wrapped a standard libc function with
+    additional checks, side effects, or alternate semantics, and ONE
+    of those wrappers has a bug.
+
+    Examples observed in the wild:
+      libsalloc.so          (wraps malloc/free with canary checks)
+      safe_io.so            (wraps read/write with bounds checks)
+      chal_alloc.so         (custom slab allocator with header bug)
+      sandbox.so            (LD_PRELOAD wrapper around open/execve)
+
+    Returns sorted list of bare filenames. Empty list when only
+    standard libs are staged (most jobs).
+    """
+    out: list[str] = []
+    libs_dir = work_dir / ".chal-libs"
+    if not libs_dir.is_dir():
+        return out
+    try:
+        for p in libs_dir.iterdir():
+            if not p.is_file():
+                continue
+            n = p.name
+            # Skip non-.so files (libc_profile.json, ld scripts, etc.)
+            if ".so" not in n.lower():
+                continue
+            if _is_standard_libname(n):
+                continue
+            out.append(n)
+    except OSError:
+        pass
+    return sorted(out)
+
+
 def _build_pre_recon_prompt(
     *,
     binary_name: str,
     target: str | None,
     heap_advanced: bool,
     chal_unpacked: bool,
+    custom_libs: list[str] | None = None,
 ) -> str:
     """Build the prompt for the orchestrator-driven recon subagent that
     runs BEFORE main's first turn. Recon's job: static-map the binary
@@ -78,6 +150,43 @@ def _build_pre_recon_prompt(
             "matches the actual libc (cross-check on __free_hook offset).\n"
             "  RECOMMENDED CHAIN — pick ONE from libc_profile.json's "
             "recommended_techniques given the primitives above."
+        )
+    if custom_libs:
+        # Chal author shipped non-standard .so files. THIS IS THE FIRST
+        # PLACE TO LOOK for primitives — wrapper functions almost always
+        # encode the bug (int-overflow on size, signed-vs-unsigned compare,
+        # off-by-one, missing length cap, side-effect at unexpected offset).
+        # Treating them as "just wrappers" is a known way to miss the chal.
+        lib_list = ", ".join(custom_libs)
+        parts.append(
+            f"CUSTOM CHAL LIBRARY DETECTED: ./.chal-libs/{{{lib_list}}}\n"
+            "These are NOT standard glibc/ld/libgcc/libstdc++ — the chal "
+            "author shipped them deliberately and they almost certainly "
+            "contain the primary attack surface (wrapped malloc/free, "
+            "wrapped read/write, custom integrity checks, sandbox shims, "
+            "etc.). ALSO report:\n"
+            "  CUSTOM_EXPORTS — for each custom .so, list every exported "
+            "function (`nm -D ./.chal-libs/<n>.so | grep ' T '`).\n"
+            "  DIVERGENCES   — for each export that shadows a standard "
+            "libc symbol (malloc, free, read, write, printf, strcpy, "
+            "memcpy, snprintf, alloca, …), name the precise divergence "
+            "from POSIX/glibc semantics. Look for:\n"
+            "    · integer type mismatches (size is uint32 + 0x10 → "
+            "int-overflow primitive)\n"
+            "    · signed-vs-unsigned compares on user-controlled values\n"
+            "    · side effects vanilla doesn't do (canary writes at "
+            "chunk+size+N, page-mapping at fixed addresses, …)\n"
+            "    · missing bounds checks (no length cap on read-like "
+            "wrappers → BOF)\n"
+            "    · error-path divergence (abort vs return NULL vs "
+            "silent continue — each enables a different primitive)\n"
+            "  PRIMITIVES_IN_LIB — for each divergence, the smallest "
+            "input that triggers a useful primitive (`wrapper(-8)` → "
+            "OOB canary write, `wrapper(0xfffffff0)` → 0-byte memset, "
+            "etc.). cite <lib>:<addr>.\n"
+            "DO NOT skip this section. Even when the binary's own "
+            "code looks straightforward, the bug is usually inside one "
+            "of these wrappers."
         )
     parts.append(
         "DO NOT propose exploit code. DO NOT speculate. Facts only. "
@@ -279,7 +388,20 @@ def _autobootstrap_libc(
     elf = bin_elfs[0]
     elf_basename = elf.name if elf.parent.resolve() == staged_bin.resolve() else None
 
+    # /retry + /resume copy prev_jd/work → new_jd/work, which brings the
+    # patchelf'd prob and the chal-libs profile with it. chal-libc-fix
+    # is deterministic for a given binary, so re-running it just to
+    # produce identical bytes is ~5-15 s of wasted subprocess time.
+    # Skip when both artifacts are present from the prior run.
+    profile = work_dir / ".chal-libs" / "libc_profile.json"
     prob = work_dir / "prob"
+    if profile.is_file() and prob.is_file():
+        log_fn(
+            f"[autoboot] libc_profile.json + prob cached from prior "
+            f"run ({profile.stat().st_size} B) — skip chal-libc-fix"
+        )
+        return (profile, elf_basename)
+
     try:
         if not prob.exists() or prob.stat().st_size != elf.stat().st_size:
             shutil.copy2(elf, prob)
@@ -304,9 +426,11 @@ def _autobootstrap_libc(
     # out to pwntools' ELF helper which otherwise prints a
     # `_curses.error: setupterm: could not find terminfo database`
     # warning on every invocation (worker container has no terminfo).
+    # PWNLIB_SILENT is intentionally NOT set here: it would also gag
+    # any pwntools diagnostic emitted by chal-libc-fix's ELF analysis,
+    # which is the most useful breadcrumb when autoboot misbehaves.
     env.setdefault("TERM", "xterm")
     env.setdefault("PWNLIB_NOTERM", "1")
-    env.setdefault("PWNLIB_SILENT", "1")
     try:
         res = subprocess.run(
             cmd, cwd=str(work_dir), env=env,
@@ -377,6 +501,34 @@ async def _run_agent(
     # path (observed live on 5963af004fdc).
     effective_binary_name = autoboot_elf_name or binary_name
     chal_unpacked = (work_dir / "chal").is_dir()
+    # Detect chal-author-supplied .so files in .chal-libs/. When present
+    # they almost always contain the primitive — surface to pre-recon
+    # so the static-triage prompt explicitly asks recon to enumerate
+    # each export and identify divergences from standard libc semantics.
+    custom_libs = _detect_custom_libs(work_dir)
+    if custom_libs:
+        log_line(
+            job_id,
+            f"[autoboot] custom chal libraries detected: "
+            f"{', '.join(custom_libs)} — pre-recon will require "
+            f"export-by-export divergence analysis"
+        )
+
+    # Item 5 — light autoboot summary breadcrumb. Captures heavy
+    # autoboot outputs (effective binary name, custom libs, libc
+    # profile presence) into ./AUTOBOOT.md so subagents read the same
+    # baseline orientation regardless of which spawn they are.
+    libc_profile = work_dir / ".chal-libs" / "libc_profile.json"
+    module_autoboot(
+        "pwn", work_dir, lambda s: log_line(job_id, s),
+        extras={
+            "effective_binary": effective_binary_name or "(none)",
+            "chal_unpacked": str(chal_unpacked),
+            "custom_libs": ", ".join(custom_libs) if custom_libs else "(none)",
+            "libc_profile_present": libc_profile.is_file(),
+            "decomp_pre_baked": (work_dir / "decomp").is_dir(),
+        },
+    )
 
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     resume_sid = read_meta(job_id).get("resume_session_id")
@@ -405,20 +557,33 @@ async def _run_agent(
     # is resuming a prior session (has its own context to lean on).
     recon_reply = ""
     if effective_binary_name and not resume_sid:
-        recon_question = _build_pre_recon_prompt(
-            binary_name=effective_binary_name,
-            target=target,
-            heap_advanced=heap_kw,
-            chal_unpacked=chal_unpacked,
+        # /retry + /resume copy prev_jd/work → new_jd/work
+        # (api/routes/retry.py:_resubmit, carry_work=True). When the
+        # binary hasn't changed the static-triage facts haven't either,
+        # so a spawn (~$0.50, 2–6 min) is pure waste. The cache only
+        # short-circuits the spawn inside the case we'd already run.
+        recon_reply = load_cached_pre_recon(
+            work_dir, lambda s: log_line(job_id, s),
         )
-        log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
-        recon_reply = await run_pre_recon(
-            job_id=job_id,
-            work_dir=work_dir,
-            model=model,
-            prompt=recon_question,
-            log_fn=lambda s: log_line(job_id, s),
-        )
+        if not recon_reply:
+            recon_question = _build_pre_recon_prompt(
+                binary_name=effective_binary_name,
+                target=target,
+                heap_advanced=heap_kw,
+                chal_unpacked=chal_unpacked,
+                custom_libs=custom_libs,
+            )
+            log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
+            recon_reply = await run_pre_recon(
+                job_id=job_id,
+                work_dir=work_dir,
+                model=model,
+                prompt=recon_question,
+                log_fn=lambda s: log_line(job_id, s),
+            )
+            store_pre_recon_cache(
+                work_dir, recon_reply, lambda s: log_line(job_id, s),
+            )
         if recon_reply:
             log_line(
                 job_id,
@@ -449,6 +614,7 @@ async def _run_agent(
         chal_unpacked=chal_unpacked,
         decomp_ready=decomp_ready,
         decomp_files=decomp_files,
+        custom_libs=custom_libs,
     )
 
     if recon_reply:
@@ -492,6 +658,29 @@ async def _run_agent(
             sandbox_runner=_sandbox_for,
             log_fn=lambda s: log_line(job_id, s),
         )
+        # Terminal REPORT phase (cookbook-pattern): stateless query()
+        # with NO tools and a minimal system_prompt converts the
+        # main agent's prose (report.md + exploit.py) into a strict-
+        # schema findings.json. Keeping the schema OUT of main's
+        # SYSTEM_PROMPT is the whole point — it's structured-output
+        # post-processing, not part of the investigation loop.
+        # Best-effort: any failure is logged + swallowed; downstream
+        # validate_findings tolerates missing/empty files.
+        try:
+            # Don't pass main's model — report phase defaults to sonnet
+            # (REPORT_PHASE_MODEL). Pure transformation doesn't need opus.
+            await run_report_phase(
+                job_id=job_id,
+                work_dir=work_dir,
+                log_fn=lambda s: log_line(job_id, s),
+                chal_name_hint=(effective_binary_name or binary_name or ""),
+            )
+        except Exception as e:
+            log_line(
+                job_id,
+                f"[report] phase raised {type(e).__name__}: {e} — "
+                f"continuing without findings.json",
+            )
     finally:
         watchdog.cancel()
         if read_meta(job_id).get("awaiting_decision"):

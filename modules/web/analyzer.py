@@ -12,12 +12,17 @@ from modules._common import (
     job_dir,
     log_line,
     make_main_session_options,
+    REPORT_SCHEMA_WEB,
+    load_cached_pre_recon,
+    module_autoboot,
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
     run_pre_recon,
+    run_report_phase,
     scan_job_for_flags,
     soft_timeout_watchdog,
+    store_pre_recon_cache,
     write_meta,
 )
 from modules._runner import attempt_sandbox_run
@@ -35,6 +40,15 @@ async def _run_agent(
 ) -> dict:
     work_dir = job_dir(job_id) / "work"
     work_dir.mkdir(exist_ok=True)
+
+    # Item 5 — autoboot breadcrumb for subagent baseline.
+    module_autoboot(
+        "web", work_dir, lambda s: log_line(job_id, s),
+        extras={
+            "src_root": src_root or "(remote-only)",
+            "target_url": target_url or "(none)",
+        },
+    )
 
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     add_dirs = [src_root] if src_root else []
@@ -60,39 +74,48 @@ async def _run_agent(
     # instead of `find . -type f` walking the codebase itself. Skipped
     # for remote-only jobs (no source to grep) and on retries.
     if src_root and not resume_sid:
-        recon_question = (
-            "STATIC TRIAGE REQUEST (pre-flight for the main exploit writer).\n\n"
-            f"SOURCE ROOT: {src_root}   (read-only)\n"
-            + (f"REMOTE TARGET: {target_url}\n" if target_url else "")
-            + "\n"
-            "REPLY in ≤2 KB, as compact bullets, with these sections:\n"
-            "  STACK        — language + framework + DB (Flask, Express, "
-            "Spring, …). Cite the entry-point file.\n"
-            "  ROUTES       — list every HTTP route the app exposes. "
-            "format: `METHOD /path  →  file:line  (handler_name)`. "
-            "Group by file when tight.\n"
-            "  AUTH         — login / session / token plumbing in one "
-            "paragraph. Where are creds stored, what crypto is used, "
-            "what's the session cookie name?\n"
-            "  USER INPUT   — every reachable parameter sink (request "
-            "args / JSON body / headers / file upload paths). file:line.\n"
-            "  CANDIDATES   — ranked HIGH/MED/LOW with bug class + "
-            "file:line. Bug classes: SQLi, XSS, SSRF, RCE, LFI, "
-            "deserialization, JWT-misuse, path traversal, command "
-            "injection. Quote the unsafe line.\n"
-            "  FLAG PATH    — where does the flag get read / served? "
-            "(env var? /flag.txt? hardcoded string?)\n\n"
-            "DO NOT propose exploit code. Facts only. Cite file:line for "
-            "every claim."
+        # See modules/pwn/analyzer.py for the carry_work=True rationale —
+        # web/crypto/rev share the same retry plumbing.
+        recon_reply = load_cached_pre_recon(
+            work_dir, lambda s: log_line(job_id, s),
         )
-        log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
-        recon_reply = await run_pre_recon(
-            job_id=job_id,
-            work_dir=work_dir,
-            model=model,
-            prompt=recon_question,
-            log_fn=lambda s: log_line(job_id, s),
-        )
+        if not recon_reply:
+            recon_question = (
+                "STATIC TRIAGE REQUEST (pre-flight for the main exploit writer).\n\n"
+                f"SOURCE ROOT: {src_root}   (read-only)\n"
+                + (f"REMOTE TARGET: {target_url}\n" if target_url else "")
+                + "\n"
+                "REPLY in ≤2 KB, as compact bullets, with these sections:\n"
+                "  STACK        — language + framework + DB (Flask, Express, "
+                "Spring, …). Cite the entry-point file.\n"
+                "  ROUTES       — list every HTTP route the app exposes. "
+                "format: `METHOD /path  →  file:line  (handler_name)`. "
+                "Group by file when tight.\n"
+                "  AUTH         — login / session / token plumbing in one "
+                "paragraph. Where are creds stored, what crypto is used, "
+                "what's the session cookie name?\n"
+                "  USER INPUT   — every reachable parameter sink (request "
+                "args / JSON body / headers / file upload paths). file:line.\n"
+                "  CANDIDATES   — ranked HIGH/MED/LOW with bug class + "
+                "file:line. Bug classes: SQLi, XSS, SSRF, RCE, LFI, "
+                "deserialization, JWT-misuse, path traversal, command "
+                "injection. Quote the unsafe line.\n"
+                "  FLAG PATH    — where does the flag get read / served? "
+                "(env var? /flag.txt? hardcoded string?)\n\n"
+                "DO NOT propose exploit code. Facts only. Cite file:line for "
+                "every claim."
+            )
+            log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
+            recon_reply = await run_pre_recon(
+                job_id=job_id,
+                work_dir=work_dir,
+                model=model,
+                prompt=recon_question,
+                log_fn=lambda s: log_line(job_id, s),
+            )
+            store_pre_recon_cache(
+                work_dir, recon_reply, lambda s: log_line(job_id, s),
+            )
         if recon_reply:
             user_prompt = (
                 "PRE-RECON COMPLETED — the orchestrator already ran a "
@@ -134,6 +157,22 @@ async def _run_agent(
             sandbox_runner=_sandbox_for,
             log_fn=lambda s: log_line(job_id, s),
         )
+        # Terminal REPORT phase — same cookbook pattern as pwn module.
+        # Stateless query() converts report.md + exploit.py prose into
+        # the web-specific findings.json schema. Best-effort.
+        try:
+            await run_report_phase(
+                job_id=job_id,
+                work_dir=work_dir,
+                log_fn=lambda s: log_line(job_id, s),
+                schema_text=REPORT_SCHEMA_WEB,
+            )
+        except Exception as e:
+            log_line(
+                job_id,
+                f"[report] phase raised {type(e).__name__}: {e} — "
+                f"continuing without findings.json",
+            )
     finally:
         watchdog.cancel()
         # Clear the awaiting_decision flag if the watchdog already fired —
