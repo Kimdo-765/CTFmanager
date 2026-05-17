@@ -344,6 +344,42 @@ def _carry_session_jsonl(sid: str, prev_work: Path, new_work: Path) -> None:
         pass
 
 
+# Entries inside work/ that copytree should skip during /retry +
+# /resume. The first generation is the load-bearing one:
+#
+#   tmp/        — per-job scratch (sandboxed claude tempdir, extracted
+#                 rootfs cpios, gdb probe scripts, etc.). Contents are
+#                 transient AND frequently contain character/block
+#                 devices (rootfs dev/console, dev/log) or named pipes
+#                 that copytree(dirs_exist_ok=False) would try to open
+#                 with open(..., 'rb') and hang on indefinitely. The
+#                 fresh job recreates ./tmp lazily — no semantic loss.
+#                 (Concrete incident 2026-05-17 on job 9f93bc8dcd0d:
+#                 every retry attempt left a half-copied work tree
+#                 behind because copytree blocked on tmp/rootfs/dev/
+#                 console; the SSE stream timed out and the user saw
+#                 "UI새로고침이 안됨".)
+#
+# __pycache__ — Python bytecode caches; the worker container has a
+#               different Python minor version path-binding than the
+#               api container, so carried .pyc files just get
+#               regenerated. Saves a few MB on every retry.
+_CARRY_WORK_IGNORE_NAMES = frozenset({"tmp", "__pycache__"})
+
+
+def _carry_work_ignore(_src: str, names: list[str]) -> list[str]:
+    """`shutil.copytree(..., ignore=...)` callback. We only skip these
+    names at the TOP LEVEL of work/ — deeper occurrences (e.g. a
+    library named tmp/ inside the agent's own decomp output) stay.
+    The simplest way to do "top-level only" is to only return matches
+    when `_src` itself is the work_dir, which the caller doesn't pass
+    directly — so instead we skip wherever the names appear. This is
+    safe in practice: agents never produce their own ./tmp or
+    __pycache__ that they care about preserving across a retry.
+    """
+    return [n for n in names if n in _CARRY_WORK_IGNORE_NAMES]
+
+
 def _resubmit(
     prev_meta: dict,
     hint: str,
@@ -381,7 +417,18 @@ def _resubmit(
     if carry_work:
         prev_work = prev_jd / "work"
         if prev_work.is_dir():
-            shutil.copytree(prev_work, new_jd / "work", dirs_exist_ok=False)
+            shutil.copytree(
+                prev_work, new_jd / "work",
+                dirs_exist_ok=False,
+                ignore=_carry_work_ignore,
+                # Don't follow symlinks: pwn chals routinely extract a
+                # Linux rootfs (cpio) into ./tmp/rootfs whose dev/stdin,
+                # dev/stdout, dev/log, etc. are symlinks back to host
+                # devices. Following them would either dereference into
+                # /dev or attempt to read the device. Preserving them as
+                # symlinks is safe — they're irrelevant for the retry.
+                symlinks=True,
+            )
             # Plant a stale-marker into the OLD work tree so a forked
             # session that `cd`s back into its baked-in absolute path
             # sees an unmistakable file in `ls` output.
