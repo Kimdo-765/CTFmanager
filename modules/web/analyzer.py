@@ -7,16 +7,23 @@ from typing import Optional
 import anyio
 
 from modules._common import (
+    cleanup_job_processes,
     collect_outputs,
     extract_cost,
     job_dir,
     log_line,
     make_main_session_options,
+    REPORT_SCHEMA_WEB,
+    load_cached_pre_recon,
+    module_autoboot,
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
+    run_pre_recon,
+    run_report_phase,
     scan_job_for_flags,
     soft_timeout_watchdog,
+    store_pre_recon_cache,
     write_meta,
 )
 from modules._runner import attempt_sandbox_run
@@ -34,6 +41,15 @@ async def _run_agent(
 ) -> dict:
     work_dir = job_dir(job_id) / "work"
     work_dir.mkdir(exist_ok=True)
+
+    # Item 5 — autoboot breadcrumb for subagent baseline.
+    module_autoboot(
+        "web", work_dir, lambda s: log_line(job_id, s),
+        extras={
+            "src_root": src_root or "(remote-only)",
+            "target_url": target_url or "(none)",
+        },
+    )
 
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     add_dirs = [src_root] if src_root else []
@@ -53,6 +69,69 @@ async def _run_agent(
         log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")
 
     user_prompt = build_user_prompt(src_root, target_url, description, auto_run)
+
+    # Auto-pre-recon — recon maps the source tree (routes, sinks, auth)
+    # before main's first turn so main starts with a route inventory
+    # instead of `find . -type f` walking the codebase itself. Skipped
+    # for remote-only jobs (no source to grep) and on retries.
+    if src_root and not resume_sid:
+        # See modules/pwn/analyzer.py for the carry_work=True rationale —
+        # web/crypto/rev share the same retry plumbing.
+        recon_reply = load_cached_pre_recon(
+            work_dir, lambda s: log_line(job_id, s),
+        )
+        if not recon_reply:
+            recon_question = (
+                "STATIC TRIAGE REQUEST (pre-flight for the main exploit writer).\n\n"
+                f"SOURCE ROOT: {src_root}   (read-only)\n"
+                + (f"REMOTE TARGET: {target_url}\n" if target_url else "")
+                + "\n"
+                "REPLY in ≤2 KB, as compact bullets, with these sections:\n"
+                "  STACK        — language + framework + DB (Flask, Express, "
+                "Spring, …). Cite the entry-point file.\n"
+                "  ROUTES       — list every HTTP route the app exposes. "
+                "format: `METHOD /path  →  file:line  (handler_name)`. "
+                "Group by file when tight.\n"
+                "  AUTH         — login / session / token plumbing in one "
+                "paragraph. Where are creds stored, what crypto is used, "
+                "what's the session cookie name?\n"
+                "  USER INPUT   — every reachable parameter sink (request "
+                "args / JSON body / headers / file upload paths). file:line.\n"
+                "  CANDIDATES   — ranked HIGH/MED/LOW with bug class + "
+                "file:line. Bug classes: SQLi, XSS, SSRF, RCE, LFI, "
+                "deserialization, JWT-misuse, path traversal, command "
+                "injection. Quote the unsafe line.\n"
+                "  FLAG PATH    — where does the flag get read / served? "
+                "(env var? /flag.txt? hardcoded string?)\n\n"
+                "DO NOT propose exploit code. Facts only. Cite file:line for "
+                "every claim."
+            )
+            log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
+            recon_reply = await run_pre_recon(
+                job_id=job_id,
+                work_dir=work_dir,
+                model=model,
+                prompt=recon_question,
+                log_fn=lambda s: log_line(job_id, s),
+            )
+            store_pre_recon_cache(
+                work_dir, recon_reply, lambda s: log_line(job_id, s),
+            )
+        if recon_reply:
+            user_prompt = (
+                "PRE-RECON COMPLETED — the orchestrator already ran a "
+                "recon subagent on your behalf. Its 2 KB summary is "
+                "below. START from this; do not re-grep the tree "
+                "yourself.\n\n"
+                "==== RECON REPLY ===="
+                f"\n{recon_reply}\n"
+                "==== END RECON ====\n\n"
+            ) + user_prompt
+            log_line(
+                job_id,
+                f"[pre-recon] reply ready ({len(recon_reply)} chars)",
+            )
+
     log_line(job_id, f"Launching Claude agent (model={model})")
     log_line(job_id, f"Source root: {src_root or '(remote-only)'}")
 
@@ -64,6 +143,7 @@ async def _run_agent(
     def _sandbox_for(script_name: str) -> Optional[dict]:
         return attempt_sandbox_run(
             job_id, script_name, target_url, lambda s: log_line(job_id, s),
+            prior_hints=list(summary.get("judge_hints", [])),
         )
 
     try:
@@ -78,8 +158,27 @@ async def _run_agent(
             sandbox_runner=_sandbox_for,
             log_fn=lambda s: log_line(job_id, s),
         )
+        # Terminal REPORT phase — same cookbook pattern as pwn module.
+        # Stateless query() converts report.md + exploit.py prose into
+        # the web-specific findings.json schema. Best-effort.
+        try:
+            await run_report_phase(
+                job_id=job_id,
+                work_dir=work_dir,
+                log_fn=lambda s: log_line(job_id, s),
+                schema_text=REPORT_SCHEMA_WEB,
+            )
+        except Exception as e:
+            log_line(
+                job_id,
+                f"[report] phase raised {type(e).__name__}: {e} — "
+                f"continuing without findings.json",
+            )
     finally:
         watchdog.cancel()
+        # Kill leftover background processes (qemu/gdbserver) from this job
+        # so they don't leak into the next. See modules/_common.py.
+        cleanup_job_processes(lambda s: log_line(job_id, s))
         # Clear the awaiting_decision flag if the watchdog already fired —
         # the job has finished and the user no longer needs to decide.
         if read_meta(job_id).get("awaiting_decision"):
@@ -97,7 +196,9 @@ async def _run_agent(
             # history and silently writes into the OLD job dir).
             fallback_dirs = prior_work_dirs(job_id)
             found = collect_outputs(
-                work_dir, ["exploit.py", "report.md"], fallback_dirs=fallback_dirs,
+                work_dir,
+                ["exploit.py", "report.md", "findings.json", "WHY_STOPPED.md"],
+                fallback_dirs=fallback_dirs,
             )
             if "exploit.py" not in found and (jd / "exploit.py").is_file():
                 found["exploit.py"] = jd / "exploit.py"

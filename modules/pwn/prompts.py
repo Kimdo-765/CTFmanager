@@ -86,13 +86,24 @@ WORKFLOW
 
 1. Triage: `file`, `pwn checksec`, `strings | head -200`. If Go,
    `redress info`/`packages` first.
-2. Small binary? `objdump -d` is faster than ghiant. Read main + obvious
-   helpers directly. (For Go: filter `objdump -d -j .text | grep '<main\\.'`.)
-3. Non-trivial binary (custom VMs, large funcs, heavy crypto)?
-   `ghiant ./bin/<n>` to populate `./decomp/`, then DELEGATE TO RECON
-   for the decomp triage protocol — recon returns the FUNCTIONS
-   inventory + CANDIDATES (HIGH/MED/LOW + bug class + file:line). Read
-   only the .c files recon flags. NEVER walk the whole tree yourself.
+2. ALWAYS DECOMPILE FIRST: `ghiant ./bin/<n>` populates `./decomp/` and
+   the cached Ghidra project; per-function reads run ~5-10s warm.
+   **NEVER `objdump -d ./bin/<n>` without a function filter** — a full
+   `.text` dump on a 10K-function binary blows 100s of KB into your
+   cache_read budget for content recon already has. ACCEPTABLE objdump
+   patterns:
+       objdump -d -j .text ./bin/<n> | sed -n '/<func>:/,/^$/p' | head -80
+       objdump -d -j .text ./bin/<n> | grep '<main\\.'   # Go filter
+   Anything broader → use `ghiant ./decomp/<func>.c` instead.
+3. Non-trivial binary (custom VMs, large funcs, heavy crypto)? After
+   `ghiant`, **DELEGATE TO RECON** before diving in yourself —
+   `mcp__team__spawn_subagent(subagent_type="recon", prompt=…)`. Recon
+   reads decomp in its own isolated context and returns ONE short
+   message (FUNCTIONS inventory + CANDIDATES, HIGH/MED/LOW + bug
+   class + file:line). Read only the .c files recon flags. NEVER walk
+   the whole tree yourself — that fills MAIN's cache_read with bytes
+   that recon can summarize in 2 KB. For heap chals: recon FIRST is
+   not optional — main's cache budget is the dominant cost in the run.
 3.5. PRIMITIVE VALIDATION (MANDATORY for heap chals; recommended for
    any int-overflow / OOB / signedness bug). The decompile tells you
    WHERE to look; assembly tells you WHAT THE CPU ACTUALLY DOES.
@@ -168,49 +179,11 @@ WORKFLOW
    - Print the captured flag (or final response if pattern unknown).
 8. Write `./report.md`: mitigations / vuln (bug class + file:line) /
    strategy (offsets, gadgets) / glibc version used for offsets /
-   one-line run command.
-   ALSO write `./findings.json` (strict schema — judge will validate)
-   so downstream tooling (UI, retry reviewer, dashboard) has structured
-   data, not just prose. JSON shape (every field REQUIRED — use null
-   for not-applicable, never omit a key):
-   ```
-   {
-     "schema_version": 1,
-     "chal_name": "<from description or filename>",
-     "glibc_version": "<2.39 | null>",
-     "arch": "x86_64 | aarch64 | arm | i386",
-     "mitigations": {
-       "canary": true|false,
-       "nx": true|false,
-       "pie": true|false,
-       "relro": "full | partial | none | null"
-     },
-     "vulns": [
-       {
-         "id": "V-01",
-         "bug_class": "heap-overflow | uaf | double-free | fmt-string | bof | int-overflow | oob-read | oob-write | logic | …",
-         "file": "<decomp filename or binary symbol>",
-         "line": <int or null>,
-         "trigger": "<one paragraph: how attacker reaches it>",
-         "primitive_class": "AAW | RCE | UAF | AAR | partial-write | info-leak | dos",
-         "primitive_quality": "HIGH | MED | LOW"
-       }
-     ],
-     "chain": {
-       "technique_name": "tcache_poison | house_of_tangerine | house_of_water | ret2libc | rop | fsop_wfile | …",
-       "how2heap_file": "/opt/how2heap/glibc_<VER>/<name>.c | null",
-       "steps": [
-         "<ordered one-line steps — e.g. 'leak libc via unsorted bin'>"
-       ],
-       "one_gadget_offset": "0x… | null",
-       "expected_observable": "<what you expect on stdout if it works — e.g. /bin/sh prompt, cat /flag output>"
-     },
-     "exploit_status": "drafted | tested-failed | tested-partial | flag-captured | aborted",
-     "caveats": ["<remote-untested | aslr-unstable | requires-N-attempts | …>"]
-   }
-   ```
-   If you don't know a field's value yet, write `null` and add it
-   to `caveats`. Never invent a value to make the schema validate.
+   one-line run command. Be specific — every downstream stage
+   (postjudge, retry, the structured `findings.json` that a terminal
+   REPORT phase auto-generates from your report.md + exploit.py) reads
+   THIS document. DO NOT write findings.json yourself; it is produced
+   from your prose by a dedicated post-run transformation.
 9. Pre-finalize: invoke the JUDGE GATE (see mission_block above).
 
 DELEGATE TO DEBUGGER (dynamic facts you cannot derive from disasm)
@@ -228,9 +201,9 @@ launches the debugger in its OWN claude CLI subprocess. The subagent
 runs to completion and returns its FINAL response text as the tool
 result. main never sees the subagent's full conversation history —
 only the summary it chose to write. (Legacy `Agent(...)` is also
-available if `USE_ISOLATED_SUBAGENTS=0`, but you should prefer the
-isolated MCP tool: it's the only way the worker survives a
-multi-spawn heap-pwn run without OOMing.)
+available if `USE_ISOLATED_SUBAGENTS=0`, but prefer the isolated MCP
+tool: it keeps main's cache_read small by routing the heavy
+investigation through its own subprocess.)
 
   mcp__team__spawn_subagent(
     subagent_type="debugger",
@@ -442,6 +415,183 @@ Glibc version → which techniques still work
           → `__wide_data->_wide_vtable->__doallocate` = your gadget.
           Stop targeting `__finish`.
 
+CHAL-AUTHOR CUSTOM LIBRARY (read FIRST when ./.chal-libs/ contains
+non-standard .so files — these are the bug, not the binary)
+-----------------------------------------------------------------
+If the chal ships any `.so` whose name doesn't match a standard libc
+/ ld / libgcc / libstdc++ pattern (e.g. `libsalloc.so`, `safe_io.so`,
+`chal_alloc.so`, `sandbox.so`, `wrap_*.so`), the author wrapped one
+or more libc / POSIX functions ON PURPOSE. The primary attack surface
+is INSIDE that wrapper, not in the main binary's own code.
+
+Common shapes (the wrapper name is just flavor — the divergence is
+the primitive):
+
+  ALLOC WRAPPERS — `secure_malloc` / `safe_malloc` / `chk_malloc` /
+  custom slabs. Look for:
+    · int type on `size` (uint32 + 0x10 wraps → tiny chunk + huge
+      OOB canary write; this is the actual primitive the chal author
+      reaches for, regardless of what they nickname it)
+    · canary location (`*(chunk + size + 8) = canary` — side effect
+      vanilla malloc doesn't do; OOB write at attacker-controlled
+      offset when `size` is user-controlled and unchecked)
+    · header layout (in-band size, sentinel like `size+1`, freelist
+      pointer mangling). Mismatched check = bypass primitive.
+    · error path (`abort()` vs `return NULL` — abort with a
+      controllable static-string fprintf can leak via abort-msg).
+
+  IO WRAPPERS — `safe_read` / `bounded_write` / custom `fgets`.
+  Look for:
+    · missing length cap (read into a fixed-size buffer with
+      attacker-controlled count → classic BOF, even when main()
+      looks careful)
+    · trailing-NUL placement (writes `\\0` at `buf + read_return` —
+      off-by-one if return value includes the newline)
+    · EOF handling (does it write the terminator on EOF? early-
+      return without terminator → use-of-uninitialized cascade)
+
+  STRING / FORMAT WRAPPERS — `safe_strcpy` / `chk_sprintf`. Look
+  for:
+    · signed length argument (`int len` → negative passes the
+      `> SIZE` check, then memcpy treats as `size_t`)
+    · pre-check uses different length than the actual copy (TOCTOU
+      via concurrent thread / signal)
+
+  SANDBOX WRAPPERS — `seccomp_init` / `safe_open` / path filters.
+  Look for:
+    · prefix-only path checks (`startswith("/safe/")` → defeat with
+      `/safe/../etc/passwd`)
+    · double-decoded paths (URL-decode → strncmp → realpath …)
+    · check-then-use races (path checked, then re-opened)
+
+PROCESS for every chal-author custom .so:
+
+  1. `nm -D ./.chal-libs/<lib>.so | grep ' T '` — list exports
+  2. For each export whose name shadows a known libc symbol (malloc,
+     free, read, write, printf, strcpy, snprintf, alloca, open,
+     fopen, …), DISASSEMBLE it and write a 1-line note:
+       <export> @ <offset>: <divergence from POSIX/glibc spec>
+     in report.md or your scratch.
+  3. RANK the divergences by exploitability:
+       · int-overflow / signed cmp on user-input  → HIGH
+       · missing bound  / off-by-one              → HIGH
+       · side effect at attacker-controlled offset → HIGH
+       · canary / integrity-check that leaks      → MED
+       · error-path abort with static fprintf     → MED-LOW (can
+                                                    leak if libgcc
+                                                    is in the
+                                                    deploy image)
+  4. Build the exploit around the HIGHest divergence. The chain
+     itself (libc leak → __free_hook overwrite, FSOP, etc.) is
+     standard glibc territory — the chal's novelty is ONLY in the
+     wrapper's bug.
+  5. NEVER conclude "the wrapper is safe" without enumerating
+     every export and reading each one. A wrapper with five
+     exports where four look safe still hides the bug in the fifth.
+
+RED FLAG: if recon's first reply says "the binary uses
+secure_malloc / wrapper_X, but I focused on the main binary" —
+that's a wrong reply. Re-spawn recon with: "ignore main for now,
+disassemble ./.chal-libs/<lib>.so completely, list every export's
+divergence from the standard libc/POSIX semantics, identify the
+exploitable one."
+
+STATE-EVOLUTION HEAP PROBING (when a primitive "can't work" from a
+fresh process — read this BEFORE writing off any heap primitive)
+-----------------------------------------------------------------
+Most heap primitives don't fire on the first alloc. The heap LOOKS
+hopeless from a fresh process AND IS hopeless from a fresh process —
+but the same primitive becomes a clean OOB after the brk has grown.
+
+The cheap test mistake: spawn the binary, call the primitive ONCE,
+SIGSEGV, conclude "IMPOSSIBLE". You just measured the primitive
+under the ONLY heap state where it can't work — the one the kernel
+hands you with a 132 KB initial brk window.
+
+The correct test: BEFORE concluding "impossible" on ANY heap
+primitive, run it across these THREE state regimes and observe
+which one un-blocks it:
+
+  R0 (fresh)          — primitive applied at process start
+  R1 (brk-extended)   — primitive applied AFTER 1k+ alloc/free of a
+                        size that triggers `malloc_consolidate`
+                        (i.e. ≥0x80, freed into unsorted bin so
+                         consolidate fires on next alloc)
+  R2 (massive brk)    — primitive applied AFTER 10k+ alloc/free OR
+                        a single multi-GB allocation, so the brk
+                        has grown by 100s of MB and high-offset
+                        OOB writes land in valid memory
+
+For custom-alloc wrappers with `malloc(size + K)` where size is
+read as `uint32_t` (libsalloc, secure_malloc, similar shims) —
+NOTE: chal-author "house of <flavor>" nicknames are NOT real
+techniques; the underlying primitive is just int-overflow + fastbin
+dup / House of Spirit / FSOP. Don't search for "house of <X>" as a
+technique name; identify the primitive class instead.
+
+  NEGATIVE-SIZE PRIMITIVE (int-overflow in custom-alloc wrapper):
+    secure_malloc reads size as u32, computes real_size = size+0x10,
+    calls malloc(real_size). For size in [-16, -1]:
+      → 32-bit wrap → real_size = 0..0xF → malloc returns a TINY chunk
+      → wrapper writes its canary at chunk + size + 8 → that's a
+        HUGE positive offset → lands FAR above the chunk
+      → R0: SIGSEGV (no memory mapped at that offset)
+      → R2: VALID WRITE (brk grew past the offset) → arbitrary 8-byte
+        write WITHOUT crossing the wrapper's canary check on the
+        original chunk → bypass the integrity gate entirely
+    UNLOCK SEQUENCE:
+      1. spam `secure_malloc(N) + delete` ~12k times for some sane N
+         (the description hint `vm.overcommit_memory=1` exists because
+         each alloc claims fresh anon pages; without overcommit=1 the
+         kernel rejects). Use N=−17 / N=0x10000−0x20 / similar to
+         hit consolidate paths.
+      2. NOW `secure_malloc(-8)` lands its canary write into the
+         freshly-extended brk region → no SIGSEGV.
+      3. `show()` on the resulting chunk leaks the value AT that
+         high offset (often a libc pointer if the consolidate-into-
+         unsorted populated an arena address there). Or `edit()`
+         writes there for arbitrary write.
+      4. With libc leak in hand the chain is just a standard
+         FSOP via `_IO_2_1_stdout_` (glibc ≤2.23, no vtable check)
+         or fastbin dup → `__free_hook = system` → free("/bin/sh").
+         NO new technique, just the unlocked primitive feeding a
+         documented chain.
+
+  DESCRIPTION RED FLAG: `vm.overcommit_memory=1`, `MAP_POPULATE`,
+  `huge pages`, "multi-GB allocation", "stages of allocation" — ANY
+  of these means the chal expects you to operate in R2. Stop trying
+  R0 primitives.
+
+  When debugger reports "primitive X SIGSEGVs at Create / can't be
+  constructed" — re-spawn debugger with: "test primitive X at R1 and
+  R2, NOT just R0. Specifically: send ≥1000 iterations of
+  alloc(SIZE)+free with SIZE chosen to enter unsorted bin, THEN
+  trigger the primitive. Report the brk delta and whether the
+  primitive landed in valid memory."
+
+UNSORTED-BIN LIBC LEAK (a common single-shot-test mistake)
+-----------------------------------------------------------------
+Common debugger mistake: "single-slot chal, freed chunk consolidates
+with top, no unsorted-bin leak available." This is WRONG. Even with
+ONE user-controlled pointer, you can populate the unsorted bin by
+varying SIZES across multiple create→delete cycles:
+
+  add(0x10); delete();      # fastbin 0x20
+  add(0x20); delete();      # fastbin 0x30
+  ...
+  add(0x150); delete();     # → UNSORTED BIN (large enough to skip fastbin)
+  add(0x150);               # re-allocate the SAME chunk; fd/bk still
+                            # point at main_arena (libc leak)
+  show();                   # %s stops at NUL but high bytes can leak
+
+The chunk-allocates-to-top heuristic only holds when ALL prior
+allocs share the same size. Multi-size sequences create gaps that
+defeat consolidation.
+
+When testing "can we get an unsorted-bin leak?", ALWAYS run the
+multi-size delete sequence first, NEVER conclude from a single
+create-delete-show.
+
 Standard primitive recipes (memorize these — DON'T reinvent)
 - libc + heap leak from unsorted bin: free a >0x420 chunk into
   unsorted; its `fd` becomes `&main_arena.bins` (libc leak),
@@ -576,6 +726,19 @@ _HEAP_HINT_KEYWORDS = (
     "free_hook", "__free_hook", "malloc_hook", "__malloc_hook",
     "exit_funcs", "__exit_funcs", "rtld", "_rtld_global",
     "safe-linking", "safe linking",
+    # Custom-alloc-wrapper signals. Dreamhack-style chals ship a
+    # libsalloc.so / secure_malloc-style shim that adds canary + integrity
+    # checks but typically has int-overflow on size (uint32_t + 0x10).
+    # The unlock pattern is multi-iteration negative-size allocs — see
+    # "STATE-EVOLUTION HEAP PROBING" in the system prompt. The technique
+    # itself is just `fastbin dup` / `house of spirit` / `FSOP` once the
+    # primitive is unlocked — there is no special "house of <chal-name>".
+    "secure_malloc", "secure_free", "secure_init", "libsalloc",
+    "__heap_chk", "custom alloc", "alloc wrapper", "heap wrapper",
+    # Strong operator hint: the intended exploit needs MASSIVE allocations
+    # (typically to extend brk past a normal commit limit) before the
+    # primitive becomes reachable. Don't drop this signal on the floor.
+    "vm.overcommit_memory", "overcommit_memory", "overcommit memory",
 )
 
 
@@ -601,11 +764,56 @@ def looks_heap_advanced(description: str | None) -> bool:
     return _looks_heap_advanced(description)
 
 
+# Operator-supplied hints that change the heap-exploit regime. When any
+# of these appears in the user's description, the chal almost certainly
+# expects R1/R2 state-evolution (see STATE-EVOLUTION HEAP PROBING in the
+# system prompt) rather than R0 single-shot primitives. We surface the
+# hit explicitly in the user_prompt so main starts in the right regime
+# instead of having to re-derive the implication from the description.
+_OPERATOR_REGIME_HINTS = (
+    ("vm.overcommit_memory", "vm.overcommit_memory=1 ⇒ chal expects multi-GB allocations to extend brk before the primitive becomes reachable. Operate in R2 (massive brk), not R0."),
+    ("overcommit_memory",    "overcommit_memory ⇒ same as vm.overcommit_memory=1. R2 regime."),
+    ("map_populate",         "MAP_POPULATE hint ⇒ chal pre-faults large mmap regions; expect huge-page or anon-large allocations."),
+    ("huge page",            "huge-page hint ⇒ chal allocates multi-MB regions; primitive may only fire after brk grows."),
+    ("ld_preload",           "LD_PRELOAD hint ⇒ a wrapper .so (libsalloc / similar) intercepts malloc/free; check its int-overflow surface before assuming glibc behavior."),
+    ("ulimit",               "ulimit-related hint ⇒ chal sets a resource cap; verify with `cat /proc/<pid>/limits` and choose primitive that fits."),
+    ("seccomp",              "seccomp hint ⇒ syscall filter present; one_gadget may be blocked (no execve), pivot to open/read/write ROP."),
+    ("chroot",               "chroot hint ⇒ /flag may not be at /home/pwn/flag; probe with `ls -la /` after shell."),
+)
+
+
+def _operator_regime_hints(description: str | None) -> list[str]:
+    """Return labeled implications of operator hints found in the
+    description. Returns empty list if nothing matches.
+    """
+    if not description:
+        return []
+    low = description.lower()
+    hits: list[str] = []
+    for needle, implication in _OPERATOR_REGIME_HINTS:
+        if needle in low:
+            hits.append(implication)
+    # De-duplicate while preserving order (multiple overcommit variants
+    # would each match without this).
+    seen: set[str] = set()
+    out: list[str] = []
+    for h in hits:
+        if h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out
+
+
 def build_user_prompt(
     binary_name: str | None,
     target: str | None,
     description: str | None,
     auto_run: bool,
+    *,
+    chal_unpacked: bool = False,
+    decomp_ready: bool = False,
+    decomp_files: list[str] | None = None,
+    custom_libs: list[str] | None = None,
 ) -> str:
     parts: list[str] = []
     base_desc, retry_hint = split_retry_hint(description)
@@ -615,6 +823,7 @@ def build_user_prompt(
     desc_for_keywords = (base_desc or "") + "\n" + (retry_hint or "")
     aeg = _looks_like_aeg(desc_for_keywords)
     heap_advanced = _looks_heap_advanced(desc_for_keywords)
+    regime_hints = _operator_regime_hints(desc_for_keywords)
     if retry_hint:
         parts.append(
             "⚠ PRIORITY GUIDANCE (from prior-attempt review — read first):\n"
@@ -629,6 +838,39 @@ def build_user_prompt(
             "pwntools `remote()` to fingerprint the protocol, look for "
             "format-string leaks / command-injection / observable behavior, "
             "craft the exploit blindly from response patterns."
+        )
+    if chal_unpacked:
+        parts.append(
+            "Upload bundle has ALREADY been unpacked by the orchestrator:\n"
+            "  - Challenge binaries are flattened into `./bin/` directly\n"
+            "  - Bundled libc / ld-* / lib*.so files are pre-staged into\n"
+            "    `./.chal-libs/` (chal-libc-fix already ran against them)\n"
+            "  - Raw bundle tree is at `./chal/` (read-only; helpful for\n"
+            "    reading Dockerfile / pwn.xinetd / etc. for deploy context)\n"
+            "DO NOT re-unzip into `./bin/extracted/` — the work is done."
+        )
+    if decomp_ready:
+        preview = ""
+        if decomp_files:
+            shown = decomp_files[:30]
+            preview = "\n  ./decomp/ contents (truncated):\n" + "\n".join(
+                f"    {n}" for n in shown
+            )
+            if len(decomp_files) > len(shown):
+                preview += f"\n    …and {len(decomp_files) - len(shown)} more"
+        parts.append(
+            "GHIDRA DECOMPILE ALREADY DONE — `./decomp/*.c` is fully "
+            "populated (the orchestrator's pre-recon ran ghiant for you), "
+            "and `./.ghidra_proj/` holds the cached project so any further "
+            "`ghiant xrefs …` call is warm (~5s).\n"
+            "  → Read `./decomp/<func>_<addr>.c` directly — DO NOT run "
+            "`ghiant ./bin/<n>` again, and DO NOT use bare "
+            "`objdump -d ./bin/<n>` to look at functions when "
+            "`./decomp/<func>.c` already exists. Disasm only when you "
+            "need to verify a specific opcode (movsx/movzx, lea operand, "
+            "jXX predicate) on a single function with a `sed -n '/<func>:/,"
+            "/^$/p'` filter."
+            + preview
         )
     if target:
         parts.append(f"Remote target: {target}")
@@ -647,12 +889,77 @@ def build_user_prompt(
             "at runtime; do NOT analyze each stage with separate Claude "
             "turns."
         )
+    if regime_hints:
+        # Surface operator hints from the description as a labeled block,
+        # so main starts in the right exploit regime instead of treating
+        # the description as flavor text. These map to specific sections
+        # of the system prompt (STATE-EVOLUTION HEAP PROBING etc.).
+        parts.append(
+            "⚠ OPERATOR HINTS detected in the description — these change "
+            "your exploit regime. Re-read the matching section of your "
+            "system prompt BEFORE writing a primitive:\n  - "
+            + "\n  - ".join(regime_hints)
+        )
+    if custom_libs:
+        # The orchestrator's autoboot stage detected chal-author-supplied
+        # .so files in ./.chal-libs/. These are NOT standard glibc/ld —
+        # they are wrappers the chal author wrote on purpose, and the bug
+        # is almost always inside one of their exported functions. Tell
+        # main to treat them as the primary attack surface, not as
+        # opaque dependencies.
+        parts.append(
+            "⚠ CUSTOM CHAL LIBRARY detected: ./.chal-libs/{"
+            + ", ".join(custom_libs) + "}\n"
+            "These are NOT standard libc/ld/libgcc/libstdc++ — they are "
+            "chal-author wrappers. The bug is almost always inside one "
+            "of their exports. See 'CHAL-AUTHOR CUSTOM LIBRARY' in your "
+            "system prompt. BEFORE you analyze the main binary, ask "
+            "recon: 'enumerate exports of ./.chal-libs/<lib>.so and for "
+            "each export that shadows a libc symbol, identify the precise "
+            "divergence from POSIX/glibc semantics (int-type, signed cmp, "
+            "side effects, missing bounds, error-path)'. Wrappers commonly "
+            "hide:\n"
+            "  - int-overflow on size (uint32 + 0x10 wrap → tiny chunk + "
+            "huge OOB)\n"
+            "  - missing length cap on read-like wrappers (BOF)\n"
+            "  - signed comparison on user-controlled indexes\n"
+            "  - canary/integrity-check side effects with side-channel "
+            "leak (abort-msg, partial write)\n"
+            "  - sandbox enforcement gaps (path-prefix-only checks, "
+            "double-decode, race in check-then-use)\n"
+            "Once you've identified the divergence INSIDE the wrapper, "
+            "the rest of the chain is usually standard (fastbin dup, "
+            "FSOP, ret2libc, etc.)."
+        )
     if heap_advanced:
         parts.append(
             "HEAP / FSOP CHALLENGE DETECTED.\n"
-            "READ the 'HEAP / FSOP CHEAT-SHEET' section of your system\n"
-            "prompt before writing a single byte of exploit. Then, in\n"
-            "this exact order:\n"
+            "READ the 'HEAP / FSOP CHEAT-SHEET' and the 'STATE-EVOLUTION\n"
+            "HEAP PROBING' sections of your system prompt before writing\n"
+            "a single byte of exploit.\n"
+            "\n"
+            "⚠ STATE-EVOLUTION GATE: when ANY subagent (recon or debugger)\n"
+            "reports that a heap primitive 'SIGSEGVs', 'can't be\n"
+            "constructed', 'consolidates with top', or is 'IMPOSSIBLE',\n"
+            "your default reaction is NOT to believe it.\n"
+            "  - Single-shot tests measure the primitive at R0 (fresh\n"
+            "    process, 132 KB initial brk). Most real heap primitives\n"
+            "    only fire at R1 (after ≥1k consolidates) or R2 (after\n"
+            "    ≥10k allocs / multi-GB brk).\n"
+            "  - Before writing off ANY 'impossible' heap primitive, spawn\n"
+            "    debugger again with: 'test primitive X at R1 AND R2.\n"
+            "    Send ≥1000 alloc(SIZE)+free iterations with SIZE chosen\n"
+            "    to enter the unsorted bin, then trigger the primitive.\n"
+            "    Report whether the OOB write lands in valid memory.'\n"
+            "  - The class of mistake here: the chal LOOKS unsolvable\n"
+            "    from a fresh process because the primitive's high-offset\n"
+            "    write doesn't have valid memory yet. After 12k+ filler\n"
+            "    allocs the brk grows past the offset and the same\n"
+            "    primitive becomes a clean OOB. Once unlocked the chain\n"
+            "    is just standard fastbin dup / FSOP / hook overwrite —\n"
+            "    no exotic technique, just int-overflow + state setup.\n"
+            "\n"
+            "Then, in this exact order:\n"
             "  0. STAGE THE CHAL LIBC FIRST: `chal-libc-fix ./bin/<n>`\n"
             "     populates ./.chal-libs/{libc.so.6, ld-*.so} AND\n"
             "     ./.chal-libs/libc_profile.json — a structured\n"
@@ -701,10 +1008,28 @@ def build_user_prompt(
         )
     if not retry_hint:
         if binary_name:
-            parts.append(
-                "Begin with file/checksec/strings on the binary. Decompile with "
-                f"`ghiant ./bin/{binary_name}` ONLY if disasm is too dense."
-            )
+            if heap_advanced:
+                parts.append(
+                    f"START: `file ./bin/{binary_name}` + `pwn checksec` "
+                    f"+ `strings | head -50` for the 30-sec triage. THEN\n"
+                    f"  1. `ghiant ./bin/{binary_name}`  (populates ./decomp/)\n"
+                    f"  2. `mcp__team__spawn_subagent(subagent_type=\"recon\","
+                    f" prompt=\"Heap chal — triage ./decomp/. Return "
+                    f"CANDIDATES (HIGH/MED/LOW + bug class + file:line) "
+                    f"and the alloc/free signature.\")`\n"
+                    "Heap chals are recon-first per WORKFLOW step 3 — main's "
+                    "cache budget is the run's dominant cost; do not walk "
+                    "./decomp/ in this context. Wait for recon's reply, then "
+                    "open ONLY the .c files it flags."
+                )
+            else:
+                parts.append(
+                    f"Begin with `file`/`pwn checksec`/`strings | head -50` "
+                    f"then `ghiant ./bin/{binary_name}`. For non-trivial "
+                    f"binaries (custom VM, many funcs) delegate the decomp "
+                    f"triage to recon (WORKFLOW step 3). For small / linear "
+                    f"binaries you can read ./decomp/main.c yourself."
+                )
         else:
             parts.append(
                 "Begin by connecting to the target; probe with long strings, "

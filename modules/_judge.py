@@ -126,8 +126,55 @@ Reply with EXACTLY ONE compact JSON object on the FIRST line, no
 markdown:
 {{"verdict": "success"|"partial"|"hung"|"parse_error"|"network_error"|"crash"|"timeout"|"unknown",
  "summary": "<=200 chars",
- "retry_hint": "<=600 chars; empty when verdict==success",
- "failure_code": "<one of the heap codes below; OMIT or null when verdict==success or no heap code applies>"}}
+ "retry_hint": "<=600 chars; empty when verdict==success or next_action==stop",
+ "next_action": "continue"|"stop",
+ "stop_reason": "<=200 chars; required when next_action==stop, else empty>",
+ "failure_code": "<one of the heap codes below; OMIT or null when verdict==success or no heap code applies>",
+ "what_worked": ["<=80 chars each, up to 3 items: parts of the chain that demonstrably succeeded — libc leak got a non-zero address, fastbin alloc returned, etc.>"],
+ "what_failed": ["<=80 chars each, up to 3 items: the specific step that failed, with the observed signal (SIGSEGV at addr X, recvuntil timeout on 'Size:', abort msg, etc.)>"],
+ "specific_diagnosis": "<=300 chars; one sentence pinpointing the failed line + the observed signal (e.g. 'exploit.py:42 sendlineafter waited for b\"> \" but service emits b\"> \\x1b[0m\" with ANSI; recv blocks then SDK timeout')",
+ "alternative_paths": ["<=120 chars each, up to 3: techniques NOT yet tried that the observed state evidences could work (e.g. 'unsorted-bin attack on _IO_list_all', 'House of Orange via FILE struct overflow'). Empty list if exhaustively tried."]}}
+
+next_action — judge's call on whether to feed retry_hint back to
+main or halt the job. STOP is the AGGRESSIVE default whenever the
+same broad failure pattern would repeat — every continue you authorize
+costs the operator ~$5-15 in a 50-turn main retry, so be ruthless:
+
+  continue — keep iterating. Use ONLY when:
+             1. you have a CONCRETE, NARROW fix that main can apply
+                in <10 lines of script edits (one offset value, one
+                alignment mask, one missing timeout=, one swapped
+                tube), AND
+             2. the failure was a tactical bug in the chain (not a
+                strategic mistake about which vuln class to use), AND
+             3. NO prior retry hint in this job's history has already
+                said the same thing (check `prior_hints` if attached
+                to your context — if you see your own earlier wording
+                even once, the answer is stop).
+  stop     — finalize the job. Use whenever ANY of the following holds:
+             (a) verdict == success (flag captured),
+             (b) the failure is structural — wrong vuln class chosen,
+                 chal needs a totally different technique, binary
+                 doesn't match the published challenge, target
+                 unreachable for reasons unrelated to the script,
+             (c) the retry_hint you're about to write rhymes with one
+                 you (or a prior judge turn) ALREADY produced this job
+                 — even ONE similar hint is enough to stop. The
+                 operator's /retry button is the right place to push
+                 main onto a new approach; you cannot make main
+                 abandon a wrong strategy by repeating yourself,
+             (d) the artifact's own docstring / comments admit it's
+                 a probe / partial / give-up shim with no real exploit
+                 chain (main itself has concluded — don't override),
+             (e) main has already done ≥2 sandbox runs in this job
+                 with the same broad outcome (empty leaks, same
+                 SIGSEGV, same parse_error). Diminishing returns.
+
+  Default to STOP when unsure. The /retry button gives the operator a
+  fresh, intentional restart; auto-retry is for tightening a working
+  exploit, not for fishing.
+  stop_reason is REQUIRED on stop; it surfaces in run.log + meta.json
+  so the operator knows why the loop halted without a flag.
 
 Verdict guide:
   success       — a flag was clearly captured (FLAG{{}}/HTB{{}}/
@@ -542,6 +589,30 @@ def postjudge_run(
     if verdict == "success":
         retry_hint = ""
 
+    # next_action — judge's continue/stop decision. Defaults to
+    # continue when the model omitted it (legacy / parse failure)
+    # so existing behavior is preserved. success auto-implies stop.
+    raw_next = parsed.get("next_action")
+    if isinstance(raw_next, str):
+        candidate_next = raw_next.strip().lower()
+    else:
+        candidate_next = ""
+    if verdict == "success":
+        next_action = "stop"
+    elif candidate_next in ("continue", "stop"):
+        next_action = candidate_next
+    else:
+        next_action = "continue"
+
+    stop_reason = str(parsed.get("stop_reason") or "")[:400]
+    if next_action != "stop":
+        stop_reason = ""
+    elif verdict == "success" and not stop_reason:
+        stop_reason = "flag captured"
+    # On stop, the retry_hint is informational (operator-visible);
+    # the orchestrator won't feed it back to main but does surface
+    # it in run.log so a human /retry can read what judge thought.
+
     # Heap failure code is optional. Reject anything outside the known
     # set so a model-typoed code doesn't leak into the retry pipeline
     # and confuse the prescriptive-hint lookup.
@@ -554,9 +625,44 @@ def postjudge_run(
     if verdict == "success":
         failure_code = None
 
-    log_fn(f"[judge] postjudge verdict={verdict} summary={summary[:160]}")
+    # Structured fields (new — backwards compatible). Coerce to list of
+    # short strings; drop anything that doesn't fit so a malformed
+    # value can't leak into the retry-feedback formatter and crash it.
+    def _coerce_list(key: str, max_items: int, item_cap: int) -> list[str]:
+        raw_v = parsed.get(key)
+        if not isinstance(raw_v, list):
+            return []
+        out: list[str] = []
+        for item in raw_v[:max_items]:
+            if isinstance(item, str):
+                trimmed = item.strip()
+                if trimmed:
+                    out.append(trimmed[:item_cap])
+        return out
+
+    what_worked: list[str] = _coerce_list("what_worked", max_items=3, item_cap=120)
+    what_failed: list[str] = _coerce_list("what_failed", max_items=3, item_cap=120)
+    alternative_paths: list[str] = _coerce_list("alternative_paths", max_items=3, item_cap=200)
+    raw_diag = parsed.get("specific_diagnosis")
+    specific_diagnosis = (
+        str(raw_diag).strip()[:400] if isinstance(raw_diag, str) else ""
+    )
+    if verdict == "success":
+        # Success collapses these — nothing failed, nothing alternative.
+        what_failed = []
+        alternative_paths = []
+        specific_diagnosis = ""
+
+    log_fn(
+        f"[judge] postjudge verdict={verdict} next_action={next_action} "
+        f"summary={summary[:160]}"
+    )
+    if next_action == "stop" and stop_reason:
+        log_fn(f"[judge] postjudge stop_reason={stop_reason[:200]}")
     if failure_code:
         log_fn(f"[judge] postjudge failure_code={failure_code}")
+    if specific_diagnosis:
+        log_fn(f"[judge] postjudge diagnosis={specific_diagnosis[:200]}")
     if retry_hint:
         log_fn(f"[judge] postjudge retry_hint={retry_hint[:200]}")
 
@@ -567,6 +673,12 @@ def postjudge_run(
         "verdict": verdict,
         "summary": summary,
         "retry_hint": retry_hint,
+        "next_action": next_action,
+        "stop_reason": stop_reason,
         "failure_code": failure_code,
+        "what_worked": what_worked,
+        "what_failed": what_failed,
+        "specific_diagnosis": specific_diagnosis,
+        "alternative_paths": alternative_paths,
         "raw": raw,
     }

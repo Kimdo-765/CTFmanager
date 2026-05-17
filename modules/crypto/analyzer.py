@@ -7,16 +7,23 @@ from typing import Optional
 import anyio
 
 from modules._common import (
+    cleanup_job_processes,
     collect_outputs,
     extract_cost,
     job_dir,
     log_line,
     make_main_session_options,
+    REPORT_SCHEMA_CRYPTO,
+    load_cached_pre_recon,
+    module_autoboot,
     prior_work_dirs,
     read_meta,
     run_main_agent_session,
+    run_pre_recon,
+    run_report_phase,
     scan_job_for_flags,
     soft_timeout_watchdog,
+    store_pre_recon_cache,
     write_meta,
 )
 from modules._runner import attempt_sandbox_run
@@ -35,6 +42,15 @@ async def _run_agent(
     work_dir = job_dir(job_id) / "work"
     work_dir.mkdir(exist_ok=True)
 
+    # Item 5 — autoboot breadcrumb for subagent baseline.
+    module_autoboot(
+        "crypto", work_dir, lambda s: log_line(job_id, s),
+        extras={
+            "src_root": src_root or "(remote-only)",
+            "target": target or "(none)",
+        },
+    )
+
     model = model_override or str(get_setting("claude_model") or "claude-opus-4-7")
     add_dirs = [src_root] if src_root else []
     resume_sid = read_meta(job_id).get("resume_session_id")
@@ -51,6 +67,68 @@ async def _run_agent(
     )
     user_prompt = build_user_prompt(src_root, target, description, auto_run)
 
+    # Auto-pre-recon — recon identifies the cipher + parameters before
+    # main's first turn so main starts with the math already framed.
+    if src_root and not resume_sid:
+        # See modules/pwn/analyzer.py for the carry_work=True rationale —
+        # web/crypto/rev share the same retry plumbing.
+        recon_reply = load_cached_pre_recon(
+            work_dir, lambda s: log_line(job_id, s),
+        )
+        if not recon_reply:
+            recon_question = (
+                "STATIC TRIAGE REQUEST (pre-flight for the main solver writer).\n\n"
+                f"CHALLENGE FILES: {src_root}   (read-only)\n"
+                + (f"REMOTE TARGET: {target}\n" if target else "")
+                + "\n"
+                "REPLY in ≤2 KB, as compact bullets, with these sections:\n"
+                "  SOURCE FILES — every script/source in src_root, one line "
+                "each (path · purpose). Ignore READMEs unless they carry "
+                "challenge specifics.\n"
+                "  CIPHER       — name the primitive (RSA / AES-CBC / "
+                "ChaCha20 / ECDSA / custom LFSR / etc.) and the public "
+                "parameters (modulus bit-size, key length, IV reuse?, "
+                "PRG seed?). cite source file:line.\n"
+                "  CIPHERTEXT   — exact path(s) + format (hex/b64/raw "
+                "bytes). Provide the length and first few bytes.\n"
+                "  KEY MATERIAL — what's known (public key, leaked nonce, "
+                "partial bits, oracle endpoint)? What's secret?\n"
+                "  CANDIDATES   — ranked HIGH/MED/LOW attack name with "
+                "rationale (`HIGH coppersmith — high bits of p leaked at "
+                "line 47`). Reference standard names: small-e, common "
+                "modulus, partial-key, padding oracle, lattice/LLL, "
+                "Coppersmith, NTRU, LWE.\n"
+                "  SOLVER NOTES — should the solver use SageMath? List the "
+                "libs needed (pycryptodome / gmpy2 / sympy / z3).\n\n"
+                "DO NOT propose solver code. Facts only. Cite file:line "
+                "for every claim."
+            )
+            log_line(job_id, "[pre-recon] spawning static-triage recon subagent")
+            recon_reply = await run_pre_recon(
+                job_id=job_id,
+                work_dir=work_dir,
+                model=model,
+                prompt=recon_question,
+                log_fn=lambda s: log_line(job_id, s),
+            )
+            store_pre_recon_cache(
+                work_dir, recon_reply, lambda s: log_line(job_id, s),
+            )
+        if recon_reply:
+            user_prompt = (
+                "PRE-RECON COMPLETED — the orchestrator already ran a "
+                "recon subagent on your behalf. Its 2 KB summary is "
+                "below. START from this; do not re-grep the source "
+                "yourself.\n\n"
+                "==== RECON REPLY ===="
+                f"\n{recon_reply}\n"
+                "==== END RECON ====\n\n"
+            ) + user_prompt
+            log_line(
+                job_id,
+                f"[pre-recon] reply ready ({len(recon_reply)} chars)",
+            )
+
     log_line(job_id, f"Launching Claude agent (model={model})")
     if resume_sid:
         log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")
@@ -64,6 +142,7 @@ async def _run_agent(
         return attempt_sandbox_run(
             job_id, script_name, target, lambda s: log_line(job_id, s),
             use_sage=script_name.endswith(".sage"),
+            prior_hints=list(summary.get("judge_hints", [])),
         )
 
     try:
@@ -80,8 +159,24 @@ async def _run_agent(
             sandbox_runner=_sandbox_for,
             log_fn=lambda s: log_line(job_id, s),
         )
+        # Terminal REPORT phase — see pwn analyzer for the rationale.
+        try:
+            await run_report_phase(
+                job_id=job_id,
+                work_dir=work_dir,
+                log_fn=lambda s: log_line(job_id, s),
+                schema_text=REPORT_SCHEMA_CRYPTO,
+            )
+        except Exception as e:
+            log_line(
+                job_id,
+                f"[report] phase raised {type(e).__name__}: {e} — "
+                f"continuing without findings.json",
+            )
     finally:
         watchdog.cancel()
+        # Kill leftover background processes from this job.
+        cleanup_job_processes(lambda s: log_line(job_id, s))
         if read_meta(job_id).get("awaiting_decision"):
             write_meta(job_id, awaiting_decision=False)
         # Carry artifacts up to the job dir. Runs in `finally` so any
@@ -93,7 +188,9 @@ async def _run_agent(
             jd = job_dir(job_id)
             fallback_dirs = prior_work_dirs(job_id)
             found = collect_outputs(
-                work_dir, ["solver.py", "solver.sage", "report.md"],
+                work_dir,
+                ["solver.py", "solver.sage", "report.md",
+                 "findings.json", "WHY_STOPPED.md"],
                 fallback_dirs=fallback_dirs,
             )
             for name in ("solver.py", "solver.sage", "report.md"):

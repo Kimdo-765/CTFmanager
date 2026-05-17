@@ -5,7 +5,7 @@ Forensic, Misc, Crypto, and Reversing — each combines automated tooling with a
 Claude Code agent that reads the challenge, identifies the vulnerability or
 flag, and generates a runnable exploit/solver script.
 
-Five Claude-driven roles split by responsibility:
+Seven Claude-driven roles split by responsibility:
 
 - **reviewer** — Opus 4.7, no tools. Lives in the api container. Reads
   the prior job's `run.log` / exploit / stdout-stderr / source on
@@ -17,31 +17,50 @@ Five Claude-driven roles split by responsibility:
   single `ClaudeSDKClient` session so postjudge feedback can flow
   back as a new user turn (see [auto-retry triangle](#auto-retry-triangle)).
 - **recon** — read-only static-investigation peer subagent. Returns
-  a ≤2 KB summary so heavy disasm / source greps / decomp triage
-  never pollute main.
+  a ≤2 KB summary (free-form text per question shape) so heavy disasm /
+  source greps / decomp triage never pollute main.
+- **triage** — read-only verifier peer subagent. Independent re-read
+  of recon's candidate vuln list; re-derives severity from reachability
+  + blast radius (cookbook "triage" phase: *"re-deriving them
+  independently is a cheap way to catch overconfidence"*). Returns
+  **strict JSON** `{verdicts:[{id, verdict, cite, severity, notes,
+  dup_of}], summary:{...}}` — main parses with `json.loads`.
 - **judge** — read-only quality-gate peer subagent. Two roles: (1) main
-  invokes it before finalizing for hang/parse review; (2) the
-  orchestrator wraps every `auto_run` execution in a 3-stage
-  pre/supervise/post lifecycle that emits a retry hint on failure.
+  invokes it before finalizing for hang/parse review (free-form text
+  reply); (2) the orchestrator wraps every `auto_run` execution in a
+  3-stage pre/supervise/post lifecycle that emits a retry hint on
+  failure.
 - **debugger** — dynamic-analysis peer subagent. Patchelfs the binary
   against the chal's bundled libc (auto-extracted from the Dockerfile's
   base image when needed), then runs gdb / strace / ltrace / qemu-user
-  and reports observed runtime state to main. See
+  and reports observed runtime state to main. Returns **strict JSON**
+  `{observed:{...}, trace:[...], conclusion, caveats:[...]}`. See
   [debugger](#debugger-modules_commonpy-debugger_agent_prompt).
+- **report phase** — terminal stateless `query()` (cookbook "report"
+  phase pattern). No tools, no MCP server, minimal system_prompt.
+  Converts main's `report.md` + `exploit.py`/`solver.py` prose into
+  the module-specific `findings.json` schema once at job end.
+  Defaulted to `claude-sonnet-4-6` for cost — pure JSON transformation
+  doesn't need opus reasoning.
 
-**Subagent isolation (default ON).** All three peer subagents
-(recon / judge / debugger) run in their **own** `claude` CLI subprocess
-via a custom MCP tool `mcp__team__spawn_subagent`. Each invocation
-forks a fresh `ClaudeSDKClient`, runs the subagent to completion, and
-discards the subprocess on return — main only ever sees the
-subagent's final-text reply as a tool result. The SDK's built-in
-`Agent`/`Task` tools are explicitly disallowed so the model can't
-fall back to the in-process path. See
+**Subagent isolation (default ON).** All four peer subagents
+(recon / triage / judge / debugger) run in their **own** `claude` CLI
+subprocess via a custom MCP tool `mcp__team__spawn_subagent`. Each
+invocation forks a fresh `ClaudeSDKClient`, runs the subagent to
+completion, and discards the subprocess on return — main only ever
+sees the subagent's final-text reply as a tool result. The SDK's
+built-in `Agent`/`Task` tools are explicitly disallowed so the model
+can't fall back to the in-process path. **Reply cache**: identical
+`(subagent_type, normalized_prompt)` pairs hit a per-job cache file
+(`<work>/.scratch/subagent_cache/<key>.json`) and return the prior
+reply instantly — kills the "recon#3 + recon#4 both re-derived libc
+symbol VMA→file mapping" waste documented in incident reports. Prefix
+prompt with `[NOCACHE]` to force a fresh spawn. See
 [Subagent isolation](#subagent-isolation-default-on).
 
 Sibling sandbox containers (decompiler / forensic / misc / runner /
 sage) are spawned per job and removed when done — orthogonal to the
-five Claude roles above.
+seven Claude roles above.
 
 See [Architecture](#architecture) and [Agent architecture](#agent-architecture).
 
@@ -69,15 +88,17 @@ target is given).
 
 ## Architecture
 
-Five Claude-driven roles, each with its own context window:
+Seven Claude-driven roles, each with its own context window:
 
 | Role | Where it runs | Tools | Purpose |
 |---|---|---|---|
 | **reviewer** | `api` container, inline in `/retry` & `/resume` handlers | none (diagnostic only) | Reads the failed prior job and writes a 1-paragraph hint, streamed to the browser |
 | **main worker** | `worker` container, one RQ process per concurrency slot | `Read` `Write` `Edit` `Bash` `Glob` `Grep` `mcp__team__spawn_subagent` | Runs the module pipeline; writes `exploit.py` / `solver.py` / `report.md` in a single `ClaudeSDKClient` session that auto-retries on postjudge feedback. Built-in `Agent` / `Task` tools are disallowed; delegation goes through the MCP tool only |
-| **recon** (peer subagent) | **own `claude` CLI subprocess** spawned via MCP, dies on return | `Read` `Bash` `Glob` `Grep` (read-only) | Static investigation: disasm walks, decomp triage, libc symbol lookup, ROPgadget / one_gadget filter, source-tree grep. Returns ≤2 KB summary |
+| **recon** (peer subagent) | **own `claude` CLI subprocess** spawned via MCP, dies on return | `Read` `Bash` `Glob` `Grep` `WebSearch` `WebFetch` (read-only) | Static investigation: disasm walks, decomp triage, libc symbol lookup, ROPgadget / one_gadget filter, source-tree grep, web research. Returns ≤2 KB free-form summary |
+| **triage** (peer subagent) | own `claude` CLI subprocess spawned via MCP | `Read` `Bash` `Glob` `Grep` (read-only, verdict-only) | Independent re-verification of recon's candidate list. Re-reads each cited file:line; emits **strict JSON** `{verdicts:[{verdict, cite, severity, dup_of}], summary:{}}`. Severity is RE-DERIVED, never inherited |
 | **judge** (peer subagent + lifecycle gate) | own subprocess when invoked by main · separate orchestrator-owned session around every `auto_run` execution | `Read` `Bash` `Glob` `Grep` (no Write) | Pre-finalize hang/parse review when invoked by main · pre/supervise/post lifecycle around the runner sandbox · pinned to latest model |
-| **debugger** (peer subagent) | own `claude` CLI subprocess spawned via MCP | `Read` `Write` `Edit` `Bash` `Glob` `Grep` | Dynamic analysis under gdb (GEF) / strace / ltrace / qemu-user. Auto-extracts the chal's libc + ld + NEEDED libs from the Dockerfile's base image via `chal-libc-fix`. Returns ≤2 KB OBSERVED/TRACE/CONCLUSION/CAVEATS shape |
+| **debugger** (peer subagent) | own `claude` CLI subprocess spawned via MCP | `Read` `Write` `Edit` `Bash` `Glob` `Grep` | Dynamic analysis under gdb (GEF) / strace / ltrace / qemu-user. Auto-extracts the chal's libc + ld + NEEDED libs from the Dockerfile's base image via `chal-libc-fix`. Returns **strict JSON** `{observed, trace, conclusion, caveats}` |
+| **report phase** | terminal stateless `query()` after main finishes (no MCP, no tools, no system_prompt bloat) | `allowed_tools=[]` (pure transformation) | Converts main's `report.md` + `exploit.py`/`solver.py` prose into module-specific `findings.json` (pwn / web / crypto / rev each have their own schema). Defaulted to sonnet for cost — rote pattern-matching doesn't need opus |
 
 ```
    browser :8000
@@ -98,16 +119,24 @@ Five Claude-driven roles, each with its own context window:
    │  ClaudeSDKClient session → deliverables             │
    │  + auto-retry on postjudge feedback                 │
    │  + heartbeat + token/cost meter                     │
-   │  + spawn-cap + compaction guards + fallback         │
+   │  + SOFT_EJECT/FINAL_DRAFT budget guard + fallback   │
    └─┬─────────────────────┬───────────┬─────────────────┘
      │ mcp__team__         │ docker.sock          
      │ spawn_subagent      │                       
      ▼                     ▼                       
    ┌─isolated subagents (each: own claude CLI subprocess)─┐
-   │ recon    static, read-only       (Node #2, dies)     │
-   │ judge    quality gate            (Node #3, dies)     │
-   │ debugger gdb/strace + chal-libc  (Node #4, dies)     │
+   │ recon    static, free-form text  (Node #2, dies)     │
+   │ triage   verdict JSON re-verify  (Node #3, dies)     │
+   │ judge    quality gate            (Node #4, dies)     │
+   │ debugger gdb/strace + chal-libc  (Node #5, dies)     │
    │ → only the final-text reply (~KB) returns to main    │
+   │ → reply cache by (sub_type, prompt) per job          │
+   └──────────────────────────────────────────────────────┘
+            │ after main exits
+            ▼
+   ┌─report phase (stateless query, sonnet, no tools)─────┐
+   │ report.md + exploit.py → strict findings.json schema │
+   │ (pwn / web / crypto / rev each have their own shape) │
    └──────────────────────────────────────────────────────┘
             ┌─sibling sandboxes─────────┐
             │ decompiler · forensic ·   │
@@ -145,36 +174,86 @@ text response as the MCP tool result; the subagent's intermediate
 tool calls, decomp reads, gdb sessions, etc. never touch main's
 conversation history.
 
-- **recon** — Read-only (`Read` / `Bash` / `Glob` / `Grep`); cannot
-  `Write` or `Edit`. Returns a ≤2 KB compact summary so heavy disasm /
-  source greps / ghiant decompilation never pollute main's history.
-  Decomp triage protocol returns FUNCTIONS inventory + ranked
-  CANDIDATES (HIGH/MED/LOW with bug class + file:line) so main only
-  reads the flagged files. See [Agent architecture](#agent-architecture).
+- **recon** — Read-only (`Read` / `Bash` / `Glob` / `Grep` /
+  `WebSearch` / `WebFetch`); cannot `Write` or `Edit`. Returns a ≤2 KB
+  free-form text summary (question shape varies — libc offsets vs
+  decomp triage vs rootfs unpack each need different output formats,
+  so JSON would over-constrain). Decomp triage protocol returns
+  FUNCTIONS inventory + ranked CANDIDATES (HIGH/MED/LOW with bug class
+  + file:line) so main only reads the flagged files. See [Agent
+  architecture](#agent-architecture).
+- **triage** — Independent verdict pass over recon's candidate list.
+  Read-only (`Read` / `Bash` / `Glob` / `Grep`); verdict-only — never
+  proposes a fix. Re-reads each cited file:line and emits **strict
+  JSON** with verdicts in `{real | duplicate | false_positive |
+  out_of_scope}` and a RE-DERIVED severity (cookbook pattern: do not
+  inherit the upstream severity guess). Main calls it when recon
+  returns >3 candidates or before committing to a primitive based on
+  recon's severity alone.
 - **judge** — Quality gate. Used by main pre-finalize for hang/parse
   review, by the orchestrator around every `auto_run` execution.
   Pinned to `LATEST_JUDGE_MODEL`. Read-only; cannot cascade-spawn
   further subagents in isolated mode (preserves the "ONE level deep"
-  invariant).
+  invariant). Free-form text reply.
 - **debugger** — Dynamic analysis. `gdb -batch` (GEF auto-loaded) /
   strace / ltrace / qemu-user gdbserver. Always patchelfs the binary
   against the chal's bundled libc first via `chal-libc-fix` so leaked
   addresses / heap layouts / one_gadget constraints match the remote.
   Falls back to extracting libc + ld + every `DT_NEEDED` .so directly
   from the Dockerfile's `FROM` image when no physical libs are bundled
-  (the common Dreamhack / HackTheBox case). See [debugger](#debugger-modules_commonpy-debugger_agent_prompt).
+  (the common Dreamhack / HackTheBox case). Returns **strict JSON**
+  `{observed:{...}, trace:[...], conclusion, caveats:[...]}` — set
+  `conclusion="BLOCKED: ..."` when the GOAL can't be answered. See
+  [debugger](#debugger-modules_commonpy-debugger_agent_prompt).
+
+**Reply cache**. `spawn_subagent` hashes `(subagent_type,
+normalized_prompt)` to a key under
+`<work_dir>/.scratch/subagent_cache/<key>.json`. A repeat of an
+identical question returns the prior reply instantly — saves the
+~$0.5–2 + 2-5 min that re-running a spawn for the same question
+costs. The "recon#3 + recon#4 both re-derived libc symbol VMA→file
+mapping" pattern from past jobs is exactly what this short-circuits.
+Cache scope is per-job (work_dir is per-job). Force a fresh spawn
+with `[NOCACHE]` prefix on the prompt; the sentinel is stripped
+before the subagent sees it. The cache also carries across retries
+via the same `work/` tree copy that brings forward decomp / chal-libs
+/ pre-recon reply.
+
+**JSON-typed replies** (triage + debugger only). The MCP wrapper runs
+the subagent's final text through a permissive JSON extractor (pure
+JSON / fenced JSON / brace-balanced span in prose). On success the
+reply is re-serialized as compact JSON before reaching main; on
+failure a warning is logged and main sees the raw text (graceful
+degradation). Recon and judge stay free-form because their output
+shape varies too much per call to fit one schema.
 
 ### Subagent isolation (default ON)
 
-Verified empirically (memory file `worker_fork_oom.md` and SDK
-source reading): the `claude-agent-sdk` runs ALL `AgentDefinition`
-contexts inside a **single** `claude` CLI Node.js subprocess.
-When main spawned via the legacy `Agent(subagent_type=...)` tool,
-the subagent's full conversation accumulated into main's Node.js
-heap — a few heap-pwn delegations easily pushed cache_read past
-5 M tokens and the V8 heap past the worker's cgroup `mem_limit`,
-SIGKILLing the CLI with `exit code -9`. Jobs 011a / 7c4a / ff82 /
-5c53 / c4f4 all died this way.
+The `claude-agent-sdk` runs ALL `AgentDefinition` contexts inside a
+**single** `claude` CLI Node.js subprocess. When main spawned via
+the legacy `Agent(subagent_type=...)` tool, the subagent's full
+conversation accumulated into main's Node.js heap — for long
+heap-pwn runs this means hundreds of KB per spawn lodge into the
+main session and inflate every subsequent prompt-cache hit.
+
+The MCP-based isolation path replaces that with per-spawn `claude`
+CLI subprocesses, so the heavy investigation lives in its own
+context and main only sees the final-text reply (typically a few KB).
+This keeps main's `cache_read` flat regardless of how many
+subagents you spawn, which is the whole point of the design.
+
+> History note: the codebase used to carry cgroup `mem_limit`s,
+> `CONTEXT_COMPACTION_THRESHOLD` / `HARD_CEILING` guards, and a
+> `SUBAGENT_SPAWN_CAP` hard-break. All three were defenses against
+> what looked like cumulative-heap OOM kills (`exit code -9`) on
+> long heap-pwn runs. Forensic investigation in May 2026 showed
+> every observed exit -9 was actually fratricide: the debugger
+> subagent's `pkill -9 -f "./prob"` matched its own claude CLI's
+> argv (the SDK passes the system_prompt via `--system-prompt`)
+> and SIGKILLed itself + sister subagents. The fix is comm-anchored
+> matching (`pkill -x prob`) in the debugger prompt; the OOM
+> defenses have been removed because they were responding to a
+> phantom failure mode.
 
 **How isolation works** (`make_spawn_subagent_mcp` +
 `make_standalone_options` in `modules/_common.py`):
@@ -185,8 +264,7 @@ SIGKILLing the CLI with `exit code -9`. Jobs 011a / 7c4a / ff82 /
    model cannot fall back to the in-process path even under
    `permission_mode=bypassPermissions`.
 2. Each `spawn_subagent(subagent_type, prompt)` call:
-   - increments `summary["subagent_spawns"]` (gated by
-     `SUBAGENT_SPAWN_CAP`),
+   - increments `summary["subagent_spawns"]`,
    - builds a standalone `ClaudeAgentOptions` with the requested
      agent's system prompt + tool list + model,
    - opens a fresh `ClaudeSDKClient` (= new `claude` CLI
@@ -198,32 +276,37 @@ SIGKILLing the CLI with `exit code -9`. Jobs 011a / 7c4a / ff82 /
    its in-process heap is fully released by the kernel.
 
 Main therefore only accumulates the subagent's final reply
-(typically a few KB) per delegation, not the subagent's whole
-investigation transcript (often hundreds of KB). On a job that
-runs 4 spawns the cumulative growth difference is ~1–2 MB of
-context (isolated) vs. ~1–2 MB **per spawn** (legacy in-process).
+(typically a few KB) per delegation. On a job that runs 4 spawns
+the cumulative growth difference is ~1–2 MB of context (isolated)
+vs. ~1–2 MB **per spawn** (legacy in-process).
 
-**Spawn cap**. `SUBAGENT_SPAWN_CAP` (default `4`) bounds the
-delegation count per run; the typical heap-pwn workflow is
-`recon × 2 + debugger × 1 + judge × 1`. At `count == cap` the
-orchestrator injects `SUBAGENT_CAP_USER_TURN` ("do the rest
-inline") into the next user turn; at `count > cap` it breaks
-the receive loop immediately, writes fallback artifacts, and
-dispatches the sandbox — main never gets to make a (cap+1)th
-spawn that would push it past safety.
+**Auto-pre-recon**. The orchestrator spawns a recon subagent BEFORE
+main's first turn (`run_pre_recon` in `modules/_common.py`) so main
+starts with a 2 KB triage summary already in its prompt instead of
+having to decide whether to delegate. Skipped for remote-only jobs
+and retries that fork a prior SDK session. See [Agent
+architecture](#agent-architecture).
 
-**Compaction guard**. `CONTEXT_COMPACTION_THRESHOLD` (SOFT, default
-6 M cache_read tokens) injects a "finalize now, no further
-subagent spawns" user turn. `CONTEXT_COMPACTION_HARD_CEILING`
-(default 10 M, well below the worker's 14g cgroup limit) cleanly
-aborts the main session, writes fallback artifacts, and runs the
-sandbox + judge cycle so the job ends as `no_flag` / `partial`
-rather than `failed` (= what the legacy single-Node.js-process
-sessions reached just before SIGKILL).
+**Pre-recon caching across retries**. The reply is persisted to
+`<work_dir>/pre_recon_reply.txt`; `/retry` and `/resume` carry the
+entire `work/` tree to the new job (see
+`api/routes/retry.py:_resubmit`, `carry_work=True`), so the next
+attempt hits the cache and skips the spawn entirely. For pwn,
+`_autobootstrap_libc` likewise skips the `chal-libc-fix` subprocess
+when `.chal-libs/libc_profile.json` + `prob` are already present
+from the prior run. Net effect on a retry without
+`resume_session_id`: ~5 min of recon + ~10 s of chal-libc-fix become
+~0 s, and main starts on the retry_hint immediately.
+
+**Spawn cap**. `SUBAGENT_SPAWN_CAP` (default `0` = unlimited) bounds
+the delegation count per run only as a runaway cost guard — not as
+an OOM defense. Set to a positive int (e.g. `30`) if you want to
+catch infinite-recursion model bugs; leave at 0 to allow free use,
+which is the recommended posture.
 
 **Rollback**. Set `USE_ISOLATED_SUBAGENTS=0` in `.env` to revert
-to the legacy `agents={}` in-process path. The cap + compaction
-guards still apply.
+to the legacy `agents={}` in-process path. The spawn cap still
+applies if you've set `SUBAGENT_SPAWN_CAP` to a positive int.
 
 ### sibling sandboxes — transient docker containers
 
@@ -242,27 +325,39 @@ tool set (`Read` / `Bash` / `Glob` / `Grep`) plus `Agent` so it can
 delegate heavy investigation to recon. **No `Write` / `Edit`** —
 judge cannot patch the script.
 
-**main ↔ peers** quartet (isolated subagent path, default ON):
+**main ↔ peers** quintet (isolated subagent path, default ON):
 
 ```
    ┌──────────────────── main (writer, Node #1) ─────────────────┐
    │  Read · Write · Edit · Bash · Glob · Grep                   │
    │  + mcp__team__spawn_subagent(subagent_type=…, prompt=…)     │
-   │  (Agent/Task: explicitly disallowed)                        │
-   └────┬───────────────┬─────────────────┬──────────────────────┘
-        │ spawn         │ spawn           │ spawn
-        ▼               ▼                 ▼
-   ┌── recon ─────┐  ┌── judge ──────┐  ┌── debugger ────────┐
-   │ Node #2,     │  │ Node #3,      │  │ Node #4,           │
-   │ dies on      │  │ dies on       │  │ dies on return     │
-   │ return       │  │ return        │  │                    │
-   │ read-only    │  │ read-only,    │  │ Read/Write/Bash    │
-   │ ≤2 KB reply  │  │ no cascade    │  │ chal-libc-fix +    │
-   └──────────────┘  │ pinned latest │  │ gdb (GEF) +        │
-                    └───────────────┘  │ strace/ltrace      │
-                                       └────────────────────┘
-       ↑ all three return ONLY the final-text reply to main ↑
+   │  (Agent/Task/WebSearch/WebFetch: explicitly disallowed)     │
+   └─┬───────────────┬──────────────┬──────────────┬─────────────┘
+     │ spawn         │ spawn        │ spawn        │ spawn
+     ▼               ▼              ▼              ▼
+   ┌── recon ────┐ ┌── triage ───┐ ┌── judge ───┐ ┌── debugger ──┐
+   │ Node #2,    │ │ Node #3,    │ │ Node #4,   │ │ Node #5,     │
+   │ dies on     │ │ dies on     │ │ dies on    │ │ dies on      │
+   │ return      │ │ return      │ │ return     │ │ return       │
+   │ read-only,  │ │ read-only,  │ │ read-only, │ │ Read/Write/  │
+   │ ≤2 KB       │ │ verdict     │ │ no cascade │ │ Bash         │
+   │ free-form   │ │ STRICT JSON │ │ free-form  │ │ STRICT JSON  │
+   │ + Web*      │ │             │ │ pinned     │ │ chal-libc +  │
+   └─────────────┘ └─────────────┘ │ latest     │ │ gdb (GEF) +  │
+                                   └────────────┘ │ strace etc.  │
+                                                  └──────────────┘
+       ↑ all four return ONLY the final-text reply to main ↑
+       ↑ reply cache: (sub_type, prompt) → prior reply        ↑
+   * recon owns WebSearch+WebFetch so heavy result bodies stay
+     in its subprocess and never inflate main's cache_read.
 ```
+
+After main exits its session, the orchestrator runs the **report
+phase** — a stateless `query()` with no tools and a minimal
+system_prompt that converts main's `report.md` + `exploit.py` (or
+`solver.py`) into a strict-schema `findings.json` for the module.
+Defaulted to sonnet for cost (rote pattern-matching). See
+[Architecture table](#architecture) for per-role tool sets.
 
 **Decision flow — main owns the gate, judge is the advisor**
 
@@ -338,17 +433,42 @@ and ends the turn again. Cache prefix preserved across the loop.
 
 Loop terminates on the FIRST hit among:
 - flag captured / postjudge `verdict == "success"`
+- judge emitted `next_action: "stop"` (explicit "this approach is
+  unrecoverable" verdict — final authority, overrides remaining budget)
 - postjudge produced no actionable retry_hint
 - main's SDK session errored / hit `INVESTIGATION_BUDGET`
 - `AUTO_RETRY_MAX` cap reached (when configured to a non-negative N)
 - user pressed Stop / soft / hard timeout
 
+### WHY_STOPPED.md — stop-decision explainer
+
+Any time the auto-retry loop exits **without** a flag, the
+orchestrator writes a human-readable `WHY_STOPPED.md` into the work
+tree (carried to the job dir alongside `report.md` / `findings.json`
+/ `THREAT_MODEL.md`). One of four reason classes is recorded — each
+maps to a different operator playbook the file spells out:
+
+| `stop_kind` | Trigger | Operator playbook the doc suggests |
+|---|---|---|
+| `judge_stop` | Judge's explicit `next_action="stop"` (unsolvable as approached) | `/retry` with manual hint steering to one of judge's `alternative_paths`, or `/resume` to let main re-think |
+| `budget_exhausted` | `AUTO_RETRY_MAX` cap hit; judge was still cooperative | `/retry` for another budget, or raise `AUTO_RETRY_MAX` if convergence looks plausible |
+| `no_hint` | Postjudge couldn't propose a concrete fix | `/retry` with manual hint, or run exploit.py against the live target outside the sandbox |
+| `agent_error` | Main's SDK session died (SIGKILL / timeout / transport) | `/retry` — the carried work tree + fresh session usually clears transient SDK issues |
+
+Each `WHY_STOPPED.md` consolidates the judge's structured fields —
+`stop_reason`, `failure_code`, `specific_diagnosis`, `what_worked`,
+`what_failed`, `alternative_paths`, and the verbatim `retry_hint` —
+plus the last sandbox `stdout`/`stderr` tail, so a human operator
+doesn't have to reconstruct the picture from `run.log` + `meta.json`.
+The `/retry` flow copies the file along with the rest of `work/`, so
+the next attempt's reviewer sees the prior diagnosis as context.
+
 ### Fallback artifact safety net
 
 When something stops main mid-run before it produced an artifact —
-budget exhausted, OOM/SIGKILL, soft-eject ignored, subagent cap
-exceeded, compaction ceiling crossed — the orchestrator does **not**
-abort the job. Instead `write_fallback_artifacts(work_dir, log_fn)`
+budget exhausted, SDK transport killed, soft timeout — the
+orchestrator does **not** abort the job. Instead
+`write_fallback_artifacts(work_dir, log_fn)`
 (in `modules/_common.py`) drops a probe-only `exploit.py` + a brief
 `report.md` into the work dir, then **continues into the sandbox +
 judge dispatch** as if main had finished normally. The job ends as
@@ -422,43 +542,65 @@ foreign-arch chals, `patchelf`, `strace`, `ltrace`.
 
 For web / pwn / crypto / rev jobs, the **main worker** spins up a
 multi-peer Claude agent team — main agent (writer) plus `recon` /
-`judge` / `debugger` subagents. Each peer runs in its own `claude`
-CLI subprocess (`Subagent isolation`, default ON):
+`triage` / `judge` / `debugger` subagents. Each peer runs in its own
+`claude` CLI subprocess (`Subagent isolation`, default ON), and the
+terminal `report phase` runs as a stateless `query()` once main
+finishes:
 
 ```
-   main agent (writer, Node #1)    recon (static, read-only, Node #2)
+   main agent (writer, Node #1)    recon (static, free-form, Node #2)
    ────────────────────────────    ──────────────────────────────────
    • drives reasoning              • libc symbol/offset lookup
    • writes exploit.py /           • decomp triage protocol
      solver.py / report.md           (FUNCTIONS + CANDIDATES)
    • Read/Write/Edit/Bash/         • ROPgadget / one_gadget filter
-     Glob/Grep                     • returns ≤2 KB summary
-   • + mcp__team__                 • subprocess dies on return
-     spawn_subagent
-   • single ClaudeSDKClient        judge (quality gate, Node #3)
-     session (auto-retries on     ─────────────────────────────────
-     postjudge feedback)          • pre-finalize hang/parse review
-              │                   • orchestrator pre/supervise/post
-              │ spawn               around the runner sandbox
-              │                   • emits retry_hint that loops back
-   mcp__team__spawn_subagent(       into main's session
-     subagent_type="recon"        • pinned to LATEST_JUDGE_MODEL
-     | "judge" | "debugger",      
-     prompt="<q>",                debugger (dynamic state, Node #4)
-   )                              ──────────────────────────────────
-              │                   • chal-libc-fix base-image extract
-              ▼                   • gdb (GEF) / strace / ltrace /
-        compact summary             qemu-user gdbserver
-                                  • OBSERVED/TRACE/CONCLUSION/CAVEATS
+     Glob/Grep                     • WebSearch / WebFetch routed here
+   • + mcp__team__                 • returns ≤2 KB free-form summary
+     spawn_subagent                • subprocess dies on return
+   • single ClaudeSDKClient
+     session (auto-retries on     triage (verdict JSON, Node #3)
+     postjudge feedback)          ─────────────────────────────────
+              │                   • re-reads recon's candidates
+              │ spawn               independently
+              ▼                   • re-derives severity
+   mcp__team__spawn_subagent(     • STRICT JSON reply
+     subagent_type="recon"          {verdicts:[...], summary:{...}}
+     | "triage" | "judge"         • subprocess dies on return
+     | "debugger",                
+     prompt="<q>",                judge (quality gate, Node #4)
+   )                              ─────────────────────────────────
+              │                   • pre-finalize hang/parse review
+              ▼                   • orchestrator pre/supervise/post
+        compact reply               around the runner sandbox
+        (cached by                • emits retry_hint that loops back
+         sub_type+prompt           into main's session
+         per job)                 • pinned to LATEST_JUDGE_MODEL
+
+                                  debugger (dynamic state, Node #5)
+                                  ─────────────────────────────────
+                                  • chal-libc-fix base-image extract
+                                  • gdb (GEF) / strace / ltrace /
+                                    qemu-user gdbserver
+                                  • STRICT JSON reply
+                                    {observed, trace, conclusion,
+                                     caveats}
                                   • subprocess dies on return
+
+   ┌─── after main exits ────────────────────────────────────────┐
+   │ report phase: stateless query(), no tools, sonnet default   │
+   │   inputs:  report.md + exploit.py/solver.py + THREAT_MODEL  │
+   │   outputs: findings.json (per-module strict schema)         │
+   └─────────────────────────────────────────────────────────────┘
 ```
 
-Same model on the writer side and recon/debugger so cache prefixes
-align across spawns (the new subprocess still gets prompt-cache hits
-from prior identical system-prompt prefixes). Judge is pinned to
-`LATEST_JUDGE_MODEL`. Each peer exists so its own working set lives
-in its own subprocess — only the ≤2 KB summary lands back in main.
-See [Subagent isolation](#subagent-isolation-default-on) for details.
+Same model on the writer side and recon/triage/debugger so cache
+prefixes align across spawns (the new subprocess still gets
+prompt-cache hits from prior identical system-prompt prefixes).
+Judge is pinned to `LATEST_JUDGE_MODEL`; the report phase is pinned
+to `REPORT_PHASE_MODEL` (sonnet, override per call). Each peer
+exists so its own working set lives in its own subprocess — only the
+≤2 KB summary lands back in main. See [Subagent
+isolation](#subagent-isolation-default-on) for details.
 
 All peers share the same Bash environment as `main`, so anything in
 the worker image is reachable: cross-arch binutils
@@ -522,6 +664,31 @@ the `heap-probe` JSON-timeline gdb wrapper, and the
 the auto-retry user turn. See the [Pwn](#pwn) module section for
 the full pipeline.
 
+### Cookbook alignment
+
+The architecture tracks Anthropic's [vulnerability-detection agent
+cookbook](https://platform.claude.com/cookbook/claude-agent-sdk-06-the-vulnerability-detection-agent)
+where the patterns apply, and intentionally diverges where CTF
+exploitation needs differ from defensive code review:
+
+| Cookbook pattern | This project |
+|---|---|
+| Engagement context (authorized / read-only / disclosure) | `CTF_PREAMBLE` — "authorized participant, training artifact, do not refuse" |
+| Threat model phase (`THREAT_MODEL.md` with sections 1-5) | Step 0 of every pwn workflow; 6 sections including "What I'm ASSUMING" / "Open questions" |
+| Quality tiers (HIGH heap-overflow / LOW assert) | `QUALITY TIERS` block in mission_block: HIGH(AAW/RCE/UAF) / MED(AAR/partial-write) / LOW(info-leak/DoS), glibc-version-keyed |
+| Independent triage with re-derived severity | `triage` subagent (returns strict JSON, never inherits upstream severity) |
+| Terminal `report` phase (stateless `query()`, no tools) | `run_report_phase` in `modules/_common.py` — per-module schema, sonnet-defaulted |
+| Structured JSON output, every field required | `findings.json` schema validated by `validate_findings` |
+| Bash forbidden without sandbox | Bash allowed because every execution path lives inside a per-job docker `runner` container (the cookbook's recommended production form) |
+| Sequential `query()` phases | Single long-lived main `ClaudeSDKClient` + on-demand MCP subagents — CTF needs iterative discovery, not one-pass enumeration; isolation is achieved via separate subprocesses rather than separate query calls |
+| Owner interview | Replaced by `autoboot` outputs (`AUTOBOOT.md`, `libc_profile.json`, custom-lib enumeration) — no live owner to consult |
+
+Cookbook patterns the project adds on top (not in the reference):
+pre-recon cache + autoboot skip across retries, investigation budget
+(SOFT/EJECT/FINAL_DRAFT), three-stage judge lifecycle around the
+sandbox, scaffold templates keyed by glibc version + how2heap corpus
+matrix, custom chal-author library auto-detection.
+
 ## Prerequisites
 
 - Docker Engine 24+ or Docker Desktop with WSL Integration enabled
@@ -562,8 +729,6 @@ All knobs live in two places:
    |---|---|---|
    | `HOST_DATA_DIR` | `./data` | absolute host path for sibling-container bind mounts |
    | `WORKER_CONCURRENCY` | `3` | parallel job slots |
-   | `WORKER_MEM_LIMIT` | `14g` | cgroup memory cap on the worker. Sized so the main `claude` CLI Node.js heap has room to grow under a heap-pwn run + the isolated subagent subprocesses share the same container. Set to `0` to disable, or lower if your host has less RAM. |
-   | `WORKER_MEMSWAP_LIMIT` | `18g` | total cgroup memory+swap. Default = `WORKER_MEM_LIMIT` + 4 GiB so the worker can spill to swap during transient context spikes without invoking the host OOM-killer. |
    | `JOB_TTL_DAYS` | `7` | auto-delete jobs older than N days (`0`=keep) |
    | `JOB_TIMEOUT` | `6000` | soft job timeout in seconds — see [Timeout & soft-deadline decision](#timeout--soft-deadline-decision) |
    | `WEB_PORT` | `8000` | host port |
@@ -576,9 +741,7 @@ All knobs live in two places:
    | `ENABLE_JUDGE` | `1` | wrap every `auto_run` runner execution with the 3-stage judge (pre / stall-supervise / post). Set to `0` to skip judge calls entirely. See [judge](#judge-modules_judgepy). |
    | `AUTO_RETRY_MAX` | `-1` | postjudge-driven inline retries within a single job. `0` disables the loop (legacy fire-and-forget). Positive int caps at exactly N retries on top of the initial run. `-1` / `inf` / `unlimited` lets the loop run until natural exit (success, no actionable hint, error, user Stop, timeout). See [auto-retry triangle](#auto-retry-triangle). |
    | `USE_ISOLATED_SUBAGENTS` | `1` | when `1` (default), main delegates via the MCP tool `mcp__team__spawn_subagent` — each subagent runs in its own `claude` CLI subprocess and only the final-text reply lands in main's history. Set to `0` for the legacy in-process `agents={}` path (kept as a fast rollback). See [Subagent isolation](#subagent-isolation-default-on). |
-   | `SUBAGENT_SPAWN_CAP` | `4` | hard cap on subagent delegations per run. Typical workflow uses `recon × 2 + debugger × 1 + judge × 1`. At `count == cap` a "no more spawns" user-turn is injected; at `count > cap` the receive loop breaks immediately and the fallback path runs. Set to `0` to disable. |
-   | `CONTEXT_COMPACTION_THRESHOLD` | `6000000` | SOFT cache_read ceiling. When main's accumulated `cache_read_input_tokens` crosses this, the orchestrator injects a "finalize now, no further subagent spawns" user-turn. `0` disables both compaction guards. |
-   | `CONTEXT_COMPACTION_HARD_CEILING` | `10000000` | HARD ceiling. Crossing this cleanly aborts main, writes fallback artifacts, runs sandbox + postjudge — designed to land below the worker `mem_limit` so OOM never fires inside the SDK. |
+   | `SUBAGENT_SPAWN_CAP` | `0` | runaway cost guard. `0` = unlimited (recommended — aggressive delegation is encouraged for context efficiency, and the orchestrator already auto-spawns a recon subagent before main's first turn). Set to a positive int to bound how many delegations one run can make. |
 
 2. **Settings tab** in the UI — writes to `/data/settings.json`, overrides `.env`
    without restart for: Anthropic API key, Claude model, Auth token, Job TTL,
@@ -806,13 +969,12 @@ HexTech_CTF_TOOL/
   Use `--build-arg INSTALL_PWNDBG=0` if you want a leaner image.
 - **`scaffold.aslr_retry` + `heap-probe` + spawn hygiene** —
   `DEBUGGER_AGENT_PROMPT` mandates AT MOST ONE inferior process
-  alive at a time (`pkill -9 -f ./prob; pkill -9 -f gdbserver`
-  before any new spawn). Combined with **subagent isolation** (each
-  delegation runs in its own `claude` CLI subprocess, see
-  [Subagent isolation](#subagent-isolation-default-on)) and the
-  worker's mem/memswap cgroup limits, this prevents the OOM-on-
-  delegation failure mode that historically killed long heap runs
-  with `exit code -9`.
+  alive at a time. Cleanup uses comm-anchored matching
+  (`pkill -9 -x prob`, `pkill -9 -x gdbserver`) — **never** `pkill -f`,
+  because the SDK passes `system_prompt` as a CLI argv and `-f` would
+  match the agent's own claude CLI process. That fratricide accounted
+  for every observed `exit code -9` in prior heap-pwn runs; the
+  comm-anchored fix eliminates it.
 - **Decompile-vs-assembly workflow** (WORKFLOW step 3.5 in
   `modules/pwn/prompts.py`): for heap / int-overflow / signedness
   / OOB-index chals, *primitive validation* is mandatory before
@@ -910,12 +1072,122 @@ docker compose down               # stop
 docker compose logs -f worker     # tail worker logs
 docker compose ps                 # status
 
-docker compose restart worker     # apply WORKER_CONCURRENCY changes
-docker compose build api          # rebuild after code changes in api/
+# Source-code changes — restart is enough (no rebuild) because api,
+# worker, and modules are all bind-mounted:
+docker compose restart api        # api/routes/*, api/main.py changes
+docker compose restart worker     # modules/*, worker/runner.py changes
+
+# Image rebuilds — needed only for Dockerfile, requirements.txt, or
+# tool-image (decompiler/forensic/misc/runner/sage) changes:
+docker compose build api worker
+docker compose --profile tools build  # tool images
 
 # Wipe all jobs (UI also has a Bulk Delete button)
 curl -X DELETE 'http://localhost:8000/api/jobs?all=true'
 ```
+
+### Full update (base images + source rebuild)
+
+Periodically (Python security patches, glibc / Ghidra major bumps,
+Sage updates, etc.) you'll want to refresh every layer from the
+internet AND rebuild every local image so the new base actually
+takes effect. Six commands, in order:
+
+```bash
+# 1. Pull the latest source from origin (so local Dockerfiles match)
+git pull --ff-only
+
+# 2. Pull all external base images that compose declares directly
+#    (redis:7-alpine, sagemath/sagemath:latest). Build images
+#    in this project are local-only and report "pull access denied"
+#    here — that is EXPECTED, not a failure.
+docker compose --profile tools --profile tools-sage pull
+
+# 3. Rebuild every local image with --pull so each Dockerfile's
+#    FROM directive also fetches the latest base (python:3.12-slim,
+#    ubuntu:22.04, etc.) instead of using the cached layer. This is
+#    the slow step — Ghidra alone re-downloads ~1.4 GB.
+docker compose --profile tools --profile tools-sage build --pull
+
+# 4. Recreate core services so they pick up the new images. The
+#    bind-mounted source (./api, ./worker, ./modules) stays in
+#    place — only the underlying image layer changes.
+docker compose up -d --force-recreate api worker redis
+
+# 5. Verify everything came back healthy.
+docker compose ps
+curl -sS -m 3 -o /dev/null -w "api: HTTP %{http_code}\n" http://localhost:8000/
+
+# 6. (optional) Reclaim disk space from the now-orphaned old image
+#    layers. Be deliberate — `prune` is destructive across ALL docker
+#    objects on the host, not just this project.
+docker image prune -f
+```
+
+Tool images (decompiler, forensic, misc, runner, sage) are spawned
+on-demand per job by the worker and removed when done — they are
+NOT long-running containers, so step 4 doesn't recreate them. The
+next job that needs e.g. `runner` will use the fresh image
+automatically. If you want to verify they boot at all without a
+real job: `docker compose --profile tools run --rm runner --version`.
+
+Storage footprint after a full rebuild: expect ~6 GB of new image
+layers (Ghidra is the bulk). The old layers stay reachable through
+the existing tag aliases until step 6's `prune` removes them.
+
+### Bind-mount layout
+
+| Container | Mounted from host | Purpose |
+|---|---|---|
+| `api` | `./api:/app/api:ro`, `./modules:/app/modules:ro`, `./web-ui:/app/web-ui:ro` | hot-reload source on `restart api` |
+| `worker` | `./worker:/app/worker:ro`, `./modules:/app/modules:ro` | hot-reload source on `restart worker` |
+| both | `./data:/data` (rw), `~/.claude:/root/.claude` (rw — session jsonl carry on /retry) | persistence |
+
+Without `./api:/app/api:ro` an `api/routes/*.py` edit silently has
+no effect until you `docker compose build api`. Concrete incident
+2026-05-17: a `_carry_work_ignore` fix in `api/routes/retry.py`
+took >1 hour to surface because the api container was running
+image-baked code from May 15.
+
+## Operational hygiene (boot + per-job)
+
+The worker container's `/tmp` is shared across every job + every
+subagent + every retry. Without housekeeping it accumulates dozens
+of stale `.py`/`.bin`/`.txt` files (gdb probe scripts, cpio extracts,
+ROPgadget dumps, …) and easily reaches 30+ MB; concurrent jobs also
+collide there. Two layers of defense:
+
+1. **Per-job isolation** — `make_standalone_options()` pre-sets
+   `$TMPDIR` to `./tmp/` (under the job's cwd) for every subagent's
+   env. Python `tempfile.*`, pwntools, etc. follow it. Each subagent
+   prompt (recon, debugger, judge, triage) has a "scratch path
+   discipline" section reminding the agent to write
+   `$TMPDIR/probe.py` in Bash rather than the absolute
+   `/tmp/probe.py`.
+2. **Boot sweep** — `worker/runner.py:_sweep_stale_tmp()` runs
+   once on every `docker compose restart worker` and removes files
+   in `/tmp` older than 24h. Skips dirs + symlinks +
+   `.X*`/`systemd-*`/`snap-*` patterns. Logs `[worker] swept N
+   stale /tmp file(s) (N.N KB freed)` on cleanup.
+
+When a job ends (success or failure), each analyzer's `finally`
+block calls `cleanup_job_processes()` which walks `/proc` and
+SIGTERM (then SIGKILL after 2s) any orphan `qemu-system-*`,
+`qemu-aarch64-*`, `qemu-arm-*`, or `gdbserver` left running. The
+matcher uses `/proc/<pid>/comm` substrings, not `pkill -f`, for two
+reasons:
+- Linux `comm` is capped at 15 chars so `pkill -x qemu-system-aarch64`
+  silently matches zero processes;
+- the SDK passes our system_prompt to the bundled `claude` CLI as
+  argv, so `pkill -f` regexes risk self-kill.
+Zombies (`State: Z`) are skipped — they're already dead and the
+container's init reaps them.
+
+Concrete incident 2026-05-17 on job 9a240a221f1b: the kernel-pwn
+debugger spawned `qemu-system-aarch64 ... -nographic &` for
+dynamic analysis and never reaped it. Without the cleanup hook,
+two jobs deep the worker container had TWO qemu instances both
+holding port forwards on `:18000` and ~512 MB combined.
 
 ## Timeout & soft-deadline decision
 
@@ -967,7 +1239,15 @@ fire while the job is still `queued` / `running`. Four buttons:
 
 - the previous job's `./work/` directory (partial `exploit.py` / `solver.py`
   / `report.md` / notes / decomp output) is copied into the new job, so
-  the new agent literally sees the files the prior agent wrote;
+  the new agent literally sees the files the prior agent wrote.
+  `_carry_work_ignore` in `api/routes/retry.py` skips `tmp/` and
+  `__pycache__/` at every depth; `symlinks=True` preserves symlinks
+  instead of dereferencing them. Without this filter, pwn jobs that
+  extracted a Linux rootfs (cpio) into `./tmp/rootfs/` would hang
+  copytree on the embedded `dev/console` character device or the
+  `dev/log` symlink to a host syslog socket — concrete incident
+  2026-05-17 on job 9f93bc8dcd0d left a half-copied work tree, no
+  meta.json, and no rq enqueue every time the user clicked retry;
 - the prior Claude SDK conversation: `meta.claude_session_id` is captured
   by `capture_session_id()` whenever the SDK emits an `init` SystemMessage,
   propagated to `meta.resume_session_id` of the new job, and the prior
