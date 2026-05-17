@@ -147,6 +147,10 @@ async def _claude_summary(
         },
     )
     prompt = build_user_prompt(target_os, kind, description)
+    from modules._common import build_exploit_library_hint
+    _lib_hint = build_exploit_library_hint("forensic")
+    if _lib_hint:
+        prompt = _lib_hint + "\n\n" + prompt
     _log(job_id, f"Launching Claude summary agent (model={model})")
     summary: dict = {"messages": 0, "tool_calls": 0}
 

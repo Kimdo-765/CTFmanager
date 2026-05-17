@@ -12,6 +12,7 @@ from api.routes import settings as settings_routes
 from api.routes import collector as collector_routes
 from api.routes import retry as retry_routes
 from api.routes import terminal as terminal_routes
+from api.routes import exploits as exploits_routes
 from api.routes import (
     crypto_module,
     forensic_module,
@@ -26,6 +27,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 (DATA_DIR / "uploads").mkdir(exist_ok=True)
 (DATA_DIR / "jobs").mkdir(exist_ok=True)
+(DATA_DIR / "exploits").mkdir(exist_ok=True)
 
 WEB_UI_DIR = Path("/app/web-ui")
 
@@ -50,6 +52,7 @@ app.include_router(settings_routes.router, prefix="/api/settings", tags=["settin
 app.include_router(terminal_routes.router, prefix="/api/terminal", tags=["terminal"])
 app.include_router(collector_routes.router, prefix="/api/collector", tags=["collector"])
 app.include_router(retry_routes.router, prefix="/api/jobs", tags=["jobs"])
+app.include_router(exploits_routes.router, prefix="/api/exploits", tags=["exploits"])
 
 
 @app.get("/api/health")

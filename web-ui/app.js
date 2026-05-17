@@ -410,6 +410,8 @@ async function loadSettings() {
   f.querySelector("[name=callback_url]").value = s.callback_url || "";
   // enable_judge default-True; only un-check when explicitly stored false
   f.querySelector("[name=enable_judge]").checked = s.enable_judge !== false;
+  // enable_exploit_library_hint default-False
+  f.querySelector("[name=enable_exploit_library_hint]").checked = !!s.enable_exploit_library_hint;
   document.getElementById("key-status").textContent = s.anthropic_api_key_set
     ? `set (${s.anthropic_api_key_masked}) — leave blank to keep, type new to replace`
     : (s.anthropic_api_key_env_set ? "using ANTHROPIC_API_KEY from env" : "not set");
@@ -437,6 +439,7 @@ document.getElementById("settings-form").addEventListener("submit", async (e) =>
       continue;
     }
     if (k === "enable_judge") continue;  // handled explicitly below
+    if (k === "enable_exploit_library_hint") continue;  // handled explicitly below
     if (v === "") {
       payload[k] = null;  // null = clear the override
       continue;
@@ -450,6 +453,7 @@ document.getElementById("settings-form").addEventListener("submit", async (e) =>
   // Checkboxes are absent from FormData when unchecked — read directly
   // so the OFF state is sent as `false`, not "clear the override".
   payload.enable_judge = !!e.target.querySelector("[name=enable_judge]").checked;
+  payload.enable_exploit_library_hint = !!e.target.querySelector("[name=enable_exploit_library_hint]").checked;
   const res = await fetch(`${API}/settings`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -470,6 +474,131 @@ document.getElementById("settings-reload").addEventListener("click", loadSetting
 
 // Load settings whenever the user clicks the Settings tab
 document.querySelector('.tab[data-tab="settings"]').addEventListener("click", loadSettings);
+
+// --- Exploit Library -------------------------------------------------------
+// Operator-curated library of past report.md + exploit.py pairs. Future
+// jobs consult /data/exploits/<id>/ via plain Bash when the Settings
+// toggle `enable_exploit_library_hint` is ON.
+
+async function loadExploits() {
+  const status = document.getElementById("exp-status");
+  const list = document.getElementById("exp-list");
+  if (!list) return;
+  const module = document.getElementById("exp-filter-module").value;
+  const search = document.getElementById("exp-filter-search").value.trim();
+  const params = new URLSearchParams();
+  if (module) params.set("module", module);
+  if (search) params.set("search", search);
+  status.textContent = "loading…";
+  list.innerHTML = "";
+  let data;
+  try {
+    const res = await fetch(`${API}/exploits?${params.toString()}`);
+    if (!res.ok) {
+      status.textContent = `error ${res.status}: ${await res.text()}`;
+      return;
+    }
+    data = await res.json();
+  } catch (e) {
+    status.textContent = "fetch failed: " + e;
+    return;
+  }
+  status.textContent = `${data.count} entr${data.count === 1 ? "y" : "ies"}`;
+  if (!data.items.length) {
+    list.innerHTML = `<li class="exp-empty">no saved exploits yet — save one via the 💾 button on any finished job's detail panel</li>`;
+    return;
+  }
+  list.innerHTML = data.items.map((m) => {
+    const id = m.id;
+    const tagsHtml = (m.tags || []).map(t => `<span class="exp-tag">${escapeHtml(t)}</span>`).join("");
+    const flagsHtml = (m.flags || []).map(f => `<code class="exp-flag">${escapeHtml(f)}</code>`).join(" ");
+    const bug = (m.bug_classes || []).join(",") || "";
+    const mit = m.mitigations ? Object.entries(m.mitigations).map(([k,v])=>`${k}=${v}`).join(" ") : "";
+    return `<li class="exp-card" data-id="${id}">
+      <div class="exp-card-head">
+        <span class="exp-id">${escapeHtml(id)}</span>
+        <span class="exp-module ${escapeHtml(m.module || "")}">${escapeHtml(m.module || "?")}</span>
+        <span class="exp-saved" title="${escapeHtml(m.saved_at || "")}">${escapeHtml((m.saved_at || "").slice(0,19).replace("T"," "))}</span>
+      </div>
+      <div class="exp-card-meta">
+        <div><b>chal:</b> ${escapeHtml(m.chal_filename || m.chal_name || "?")}${m.target_url ? ` <small>· target: ${escapeHtml(m.target_url)}</small>` : ""}</div>
+        ${m.technique_name ? `<div><b>technique:</b> <code>${escapeHtml(m.technique_name)}</code></div>` : ""}
+        ${(bug || m.arch || m.glibc_version) ? `<div><small>${[bug && `bug=${bug}`, m.arch && `arch=${m.arch}`, m.glibc_version && `glibc=${m.glibc_version}`].filter(Boolean).join(" · ")}</small></div>` : ""}
+        ${mit ? `<div><small>mit: ${escapeHtml(mit)}</small></div>` : ""}
+        ${flagsHtml ? `<div><small>🚩 ${flagsHtml}</small></div>` : ""}
+        ${m.notes ? `<div class="exp-notes">${escapeHtml(m.notes)}</div>` : ""}
+        ${tagsHtml ? `<div>${tagsHtml}</div>` : ""}
+      </div>
+      <div class="exp-card-actions">
+        <a class="file-preview-link" data-name="${escapeHtml(id)}/report.md" data-url="${API}/exploits/${id}/file/report.md" href="${API}/exploits/${id}/file/report.md">📄 report.md</a>
+        <a class="file-preview-link" data-name="${escapeHtml(id)}/${escapeHtml(m.script_filename || "exploit.py")}" data-url="${API}/exploits/${id}/file/${escapeHtml(m.script_filename || "exploit.py")}" href="${API}/exploits/${id}/file/${escapeHtml(m.script_filename || "exploit.py")}">🐍 ${escapeHtml(m.script_filename || "exploit.py")}</a>
+        ${m.source_job_id ? `<a href="#" class="exp-jump-job" data-job-id="${escapeHtml(m.source_job_id)}">↗ source job</a>` : ""}
+        <button class="exp-del-btn" data-id="${id}">🗑 delete</button>
+      </div>
+    </li>`;
+  }).join("");
+
+  for (const btn of list.querySelectorAll(".exp-del-btn")) {
+    btn.addEventListener("click", async () => {
+      const eid = btn.dataset.id;
+      if (!confirm(`Delete exploit ${eid}? This cannot be undone.`)) return;
+      btn.disabled = true;
+      const res = await fetch(`${API}/exploits/${eid}`, { method: "DELETE" });
+      if (!res.ok) {
+        alert(`delete failed: ${res.status} ${await res.text()}`);
+        btn.disabled = false;
+        return;
+      }
+      loadExploits();
+    });
+  }
+  for (const a of list.querySelectorAll(".exp-jump-job")) {
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      const jid = a.dataset.jobId;
+      // selectJob() opens the modal + scrolls. Works even when the
+      // row isn't currently rendered (e.g. filtered out / TTL'd).
+      try { selectJob(jid); }
+      catch (_) { alert(`Source job ${jid} is no longer available.`); }
+    });
+  }
+}
+
+document.getElementById("exp-refresh").addEventListener("click", loadExploits);
+document.getElementById("exp-filter-module").addEventListener("change", loadExploits);
+{
+  let _expSearchTimer = null;
+  document.getElementById("exp-filter-search").addEventListener("input", () => {
+    clearTimeout(_expSearchTimer);
+    _expSearchTimer = setTimeout(loadExploits, 250);
+  });
+}
+document.getElementById("exp-import-file").addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const mode = document.getElementById("exp-import-mode").value || "skip";
+  const fd = new FormData();
+  fd.set("file", file);
+  fd.set("mode", mode);
+  const status = document.getElementById("exp-status");
+  status.textContent = `importing ${file.name}…`;
+  const res = await fetch(`${API}/exploits/import`, { method: "POST", body: fd });
+  e.target.value = "";  // reset so re-selecting same file fires change
+  let data = {};
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) {
+    alert(`import failed: ${res.status} — ${data.detail || ""}`);
+    status.textContent = `import failed (${res.status})`;
+    return;
+  }
+  const c = data.counts || {};
+  status.textContent = `imported=${c.imported||0} · skipped=${c.skipped||0} · rejected=${c.rejected||0}`;
+  loadExploits();
+});
+
+// Load the library on first click of the Exploits tab + on every
+// click (cheap; the GET endpoint is just a directory walk).
+document.querySelector('.tab[data-tab="exploits"]').addEventListener("click", loadExploits);
 
 document.getElementById("refresh-jobs").addEventListener("click", () => {
   refreshJobs(); refreshStats();
@@ -1353,8 +1482,14 @@ async function renderJob(id, opts = {}) {
          <code id="flag-${id}-${i}">${escapeHtml(f)}</code>
          <button class="copy-btn" data-flag="${escapeHtml(f)}">Copy</button>
        </div>`).join("");
+    // Save-to-exploit-DB button. Only shown for terminal-success jobs
+    // (the API also rejects no-flag jobs with 400). The button calls
+    // POST /api/exploits/save with operator-supplied tags + notes.
+    const saveBtn = (job.status === "finished")
+      ? `<button class="exp-save-btn" data-job-id="${id}" title="Copy report.md + exploit.py into the Exploit Library (Phase: operator-curated)">💾 Save to exploit DB</button>`
+      : "";
     flagBlock = `<div class="flag-banner">
-        <h4>🚩 Flag${job.flags.length > 1 ? "s" : ""} found</h4>
+        <h4>🚩 Flag${job.flags.length > 1 ? "s" : ""} found ${saveBtn}</h4>
         ${rows}
       </div>`;
   }
@@ -1622,6 +1757,58 @@ async function renderJob(id, opts = {}) {
       const orig = btn.textContent;
       btn.textContent = "✓ Copied"; btn.classList.add("copied");
       setTimeout(() => { btn.textContent = orig; btn.classList.remove("copied"); }, 1500);
+    });
+  }
+
+  for (const btn of detail.querySelectorAll(".exp-save-btn")) {
+    btn.addEventListener("click", async () => {
+      if (btn.disabled) return;
+      const jid = btn.dataset.jobId;
+      const tags = prompt(
+        "Tags (comma-separated, optional)\n"
+        + "e.g. heap, fsop, glibc-2.35, large-bin",
+        ""
+      );
+      if (tags === null) return;  // cancelled
+      const notes = prompt(
+        "Notes (one line, optional)\n"
+        + "e.g. House of Apple 2 chain; one_gadget rejected — pivoted to _IO_str_jumps",
+        ""
+      );
+      if (notes === null) return;  // cancelled
+      const body = {
+        job_id: jid,
+        tags: tags.split(",").map(s => s.trim()).filter(Boolean),
+        notes: notes || "",
+        overwrite: true,
+      };
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = "saving…";
+      try {
+        const res = await fetch(`${API}/exploits/save`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          alert(`save failed: ${res.status} — ${data.detail || ""}`);
+          btn.textContent = orig;
+        } else {
+          btn.textContent = `✓ saved ${data.id || ""}`;
+          btn.classList.add("copied");
+          setTimeout(() => {
+            btn.textContent = orig;
+            btn.classList.remove("copied");
+            btn.disabled = false;
+          }, 2500);
+        }
+      } catch (e) {
+        alert(`save failed: ${e}`);
+        btn.textContent = orig;
+        btn.disabled = false;
+      }
     });
   }
   return job;

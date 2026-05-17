@@ -28,7 +28,8 @@
       <button class="tab" data-tab="misc">Misc</button>
       <button class="tab" data-tab="crypto">Crypto</button>
       <button class="tab" data-tab="rev">Rev</button>
-      <button class="tab" data-tab="settings" style="margin-left:auto">⚙ Settings</button>
+      <button class="tab" data-tab="exploits" style="margin-left:auto">📚 Exploits</button>
+      <button class="tab" data-tab="settings">⚙ Settings</button>
     </nav>
   </header>
 
@@ -261,6 +262,45 @@
       </form>
     </section>
 
+    <section id="panel-exploits" class="panel">
+      <h2>📚 Exploit Library</h2>
+      <p style="color:#8b949e;font-size:0.85rem">
+        Operator-curated past solutions stored under <code>/data/exploits/</code>.
+        Future jobs can <code>cat /data/exploits/&lt;id&gt;/report.md</code> for
+        insight on similar chals — gated by the <em>Use Exploit Library hints</em>
+        setting. Save entries from any finished job via the 💾 button on
+        its detail panel. Export/import as <code>.tar.gz</code> to move
+        the library between machines.
+      </p>
+      <div class="exp-toolbar">
+        <label style="display:flex;align-items:center;gap:0.4rem;margin:0">
+          module:
+          <select id="exp-filter-module">
+            <option value="">all</option>
+            <option value="pwn">pwn</option>
+            <option value="web">web</option>
+            <option value="crypto">crypto</option>
+            <option value="rev">rev</option>
+            <option value="forensic">forensic</option>
+            <option value="misc">misc</option>
+          </select>
+        </label>
+        <input id="exp-filter-search" type="search" placeholder="search chal / technique / notes…" style="flex:1;min-width:200px" />
+        <button id="exp-refresh" type="button">Refresh</button>
+        <a id="exp-export" href="/api/exploits/export" download style="background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:0.45rem 0.9rem;border-radius:6px;text-decoration:none">⬇ Export .tar.gz</a>
+        <label style="display:inline-flex;align-items:center;gap:0.3rem;margin:0;background:#21262d;border:1px solid #30363d;padding:0.35rem 0.7rem;border-radius:6px;cursor:pointer">
+          ⬆ Import .tar.gz
+          <input id="exp-import-file" type="file" accept=".tar.gz,.tgz,application/gzip" hidden />
+        </label>
+        <select id="exp-import-mode" title="behavior when an id already exists">
+          <option value="skip">on conflict: skip</option>
+          <option value="overwrite">on conflict: overwrite</option>
+        </select>
+      </div>
+      <div id="exp-status" style="color:#8b949e;font-size:0.85rem;margin:0.4rem 0"></div>
+      <ul id="exp-list" class="exp-list"></ul>
+    </section>
+
     <section id="panel-settings" class="panel">
       <h2>Settings</h2>
       <p style="color:#8b949e;font-size:0.85rem">
@@ -311,6 +351,11 @@
           <input type="checkbox" name="enable_judge" />
           Enable judge for auto-run (pre-flight script review · stall watchdog · post-mortem verdict)
           <small style="color:#8b949e">adds ~1 short Claude turn per stage on the latest model. Disable to run scripts with the plain runner (saves cost; no hang/parse-error detection).</small>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="enable_exploit_library_hint" />
+          Use Exploit Library hints (prepend same-module saved exploits to agent's user prompt)
+          <small style="color:#8b949e">when ON, the agent sees a short list of operator-saved exploits at the top of its first prompt and can <code>cat /data/exploits/&lt;id&gt;/report.md</code> for insight. OFF by default — turn on once the library has trusted entries.</small>
         </label>
         <div style="display:flex;gap:0.5rem">
           <button type="submit">Save</button>

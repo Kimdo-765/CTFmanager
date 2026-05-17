@@ -961,3 +961,102 @@ body.modal-open { overflow: hidden; }
   padding: 0.9rem 1rem;
   background: #0d1117;
 }
+
+/* --- Exploit Library tab ---------------------------------------------- */
+.exp-toolbar {
+  display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
+  padding: 0.5rem 0;
+}
+.exp-toolbar input[type="search"],
+.exp-toolbar select {
+  background: #0d1117; border: 1px solid #30363d; color: #c9d1d9;
+  padding: 0.35rem 0.6rem; border-radius: 5px; font-size: 0.85rem;
+}
+.exp-toolbar button,
+.exp-toolbar a {
+  background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+  padding: 0.45rem 0.9rem; border-radius: 6px; cursor: pointer;
+  font-size: 0.85rem;
+}
+.exp-toolbar button:hover,
+.exp-toolbar a:hover { background: #30363d; }
+.exp-list {
+  list-style: none; padding: 0; margin: 0;
+  display: grid; gap: 0.6rem;
+}
+.exp-card {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+}
+.exp-card-head {
+  display: flex; align-items: center; gap: 0.6rem;
+  margin-bottom: 0.35rem; font-size: 0.85rem;
+}
+.exp-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #58a6ff; font-weight: 600;
+}
+.exp-module {
+  background: #1f6feb22; color: #58a6ff;
+  border: 1px solid #1f6feb55; padding: 0.05rem 0.45rem;
+  border-radius: 4px; font-size: 0.75rem; text-transform: uppercase;
+}
+.exp-module.pwn      { color: #f85149; border-color: #f8514955; background: #f8514922; }
+.exp-module.crypto   { color: #d2a8ff; border-color: #d2a8ff55; background: #d2a8ff22; }
+.exp-module.web      { color: #7ee787; border-color: #7ee78755; background: #7ee78722; }
+.exp-module.rev      { color: #ffa657; border-color: #ffa65755; background: #ffa65722; }
+.exp-module.forensic { color: #79c0ff; border-color: #79c0ff55; background: #79c0ff22; }
+.exp-module.misc     { color: #8b949e; border-color: #8b949e55; background: #8b949e22; }
+.exp-saved {
+  margin-left: auto; color: #8b949e;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+}
+.exp-card-meta { font-size: 0.82rem; line-height: 1.55; color: #c9d1d9; }
+.exp-card-meta b { color: #e6edf3; }
+.exp-card-meta code { font-size: 0.78rem; }
+.exp-tag {
+  display: inline-block;
+  background: #21262d; color: #8b949e;
+  border: 1px solid #30363d; border-radius: 4px;
+  padding: 0.05rem 0.45rem; font-size: 0.72rem; margin-right: 0.25rem;
+}
+.exp-flag {
+  background: #21262d; color: #7ee787;
+  padding: 0.05rem 0.35rem; border-radius: 3px;
+  font-size: 0.75rem;
+}
+.exp-notes {
+  background: #161b22; border-left: 2px solid #30363d;
+  padding: 0.3rem 0.55rem; margin-top: 0.3rem;
+  color: #c9d1d9; font-size: 0.8rem; white-space: pre-wrap;
+}
+.exp-card-actions {
+  display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.55rem;
+}
+.exp-card-actions a,
+.exp-card-actions button {
+  background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+  padding: 0.3rem 0.65rem; border-radius: 5px;
+  font-size: 0.78rem; cursor: pointer; text-decoration: none;
+}
+.exp-card-actions a:hover,
+.exp-card-actions button:hover { background: #30363d; color: #e6edf3; }
+.exp-del-btn:hover { background: #6e1e1e !important; border-color: #f85149 !important; }
+.exp-empty {
+  color: #8b949e; padding: 1rem; text-align: center;
+  border: 1px dashed #30363d; border-radius: 6px;
+}
+/* Save-to-DB button inside the job detail flag banner */
+.exp-save-btn {
+  margin-left: 0.6rem; vertical-align: middle;
+  background: #1f6feb22; color: #58a6ff;
+  border: 1px solid #1f6feb55;
+  padding: 0.25rem 0.7rem; border-radius: 5px;
+  font-size: 0.78rem; cursor: pointer;
+}
+.exp-save-btn:hover { background: #1f6feb44; }
+.exp-save-btn:disabled { opacity: 0.6; cursor: wait; }
+.exp-save-btn.copied {
+  background: #2ea04322; color: #7ee787; border-color: #2ea04355;
+}

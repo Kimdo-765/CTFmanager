@@ -135,6 +135,10 @@ async def _claude_summary(
         },
     )
     prompt = build_user_prompt(filename, description)
+    from modules._common import build_exploit_library_hint
+    _lib_hint = build_exploit_library_hint("misc")
+    if _lib_hint:
+        prompt = _lib_hint + "\n\n" + prompt
     summary: dict = {"messages": 0, "tool_calls": 0}
 
     soft_timeout = int(read_meta(job_id).get("job_timeout") or 0)

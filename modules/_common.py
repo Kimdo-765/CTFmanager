@@ -21,6 +21,10 @@ LIBERAL_FLAG_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_]{1,16}\{[!-~]{2,200}\}")
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 JOBS_DIR = DATA_DIR / "jobs"
+# Operator-curated exploit library; mounted into worker via the
+# existing ./data:/data bind-mount. Agents browse via plain Bash:
+# `ls /data/exploits/`, `cat /data/exploits/<id>/report.md`.
+EXPLOITS_DIR = DATA_DIR / "exploits"
 
 # Single source of truth for the latest Claude model used by ad-hoc
 # Claude calls (retry reviewer, exploit/solver judge). Bump here and
@@ -222,42 +226,154 @@ def extract_flags_from_text(text: str, liberal: bool = False) -> list[str]:
     return sorted(f for f in found if not _is_placeholder_flag(f))
 
 
-def scan_job_for_flags(job_id: str, extra_files: list[str] | None = None) -> list[str]:
-    """Scan known job artifacts for flag candidates.
+# Files produced by the actual sandbox runner / OOB collector — these
+# prove the exploit/solver REALLY captured a flag from the target.
+_TRUSTED_FLAG_SOURCES = (
+    "exploit.py.stdout",
+    "exploit.py.stderr",
+    "solver.py.stdout",
+    "solver.py.stderr",
+    "callbacks.jsonl",
+    "summary.json",          # forensic — no exploit.py; flag comes from artifact analysis
+    "result.json",           # api/jobs.py:_manual_run dumps sandbox stdout into this
+)
 
-    Default scan set: report.md, exploit.py.stdout, solver.py.stdout,
-    summary.json (forensic), findings.json (misc), callbacks.jsonl, and
-    the run.log. `extra_files` can supply additional filenames to scan
-    (relative to the job dir).
+# Narrative artifacts the agent itself authored or that derive from
+# its prose. These regularly contain chal-author placeholders quoted
+# from `chal/run.sh` (e.g. `DH{this_is_a_flag}`) — only consult them
+# as a LAST RESORT when no trusted source produced anything.
+_NARRATIVE_FLAG_SOURCES = (
+    "report.md",
+    "run.log",
+    "findings.json",         # auto-generated from report.md by REPORT phase
+    "log_findings.json",
+)
+
+
+def scan_job_for_flags(job_id: str, extra_files: list[str] | None = None) -> list[str]:
+    """Return real captured flags for a job.
+
+    Two-tier scan to keep test/placeholder flags out of `meta.flags`:
+
+      1. TRUSTED tier — files produced by the actual runner / OOB
+         collector (exploit/solver stdout/stderr, callbacks.jsonl,
+         summary.json, result.json). If ANY non-placeholder flag
+         appears here, return ONLY those — they prove the exploit
+         really retrieved the flag from the target.
+      2. NARRATIVE tier — report.md, run.log, findings.json. Consulted
+         only when the trusted tier is empty. These regularly contain
+         chal-author placeholders quoted from `chal/run.sh` (e.g. the
+         job 9a240a221f1b incident: `DH{this_is_a_flag}` got pulled
+         into FLAGS FOUND alongside the real flag).
+
+    `extra_files` are treated as TRUSTED — callers who add them are
+    asserting the file is runner output.
     """
     jd = job_dir(job_id)
-    candidates = [
-        "report.md",
-        "exploit.py.stdout",
-        "exploit.py.stderr",
-        "solver.py.stdout",
-        "solver.py.stderr",
-        "summary.json",
-        "findings.json",
-        "log_findings.json",
-        "result.json",
-        "run.log",
-        "callbacks.jsonl",
-    ]
-    if extra_files:
-        candidates.extend(extra_files)
 
-    flags: set[str] = set()
-    for name in candidates:
-        p = jd / name
-        if not p.is_file():
+    def _scan(names) -> set[str]:
+        out: set[str] = set()
+        for name in names:
+            p = jd / name
+            if not p.is_file():
+                continue
+            try:
+                text = p.read_text(errors="replace")
+            except Exception:
+                continue
+            out.update(FLAG_RE.findall(text))
+        return out
+
+    trusted_set = list(_TRUSTED_FLAG_SOURCES)
+    if extra_files:
+        trusted_set.extend(extra_files)
+
+    trusted = {f for f in _scan(trusted_set) if not _is_placeholder_flag(f)}
+    if trusted:
+        return sorted(trusted)
+
+    narrative = {f for f in _scan(_NARRATIVE_FLAG_SOURCES) if not _is_placeholder_flag(f)}
+    return sorted(narrative)
+
+
+def build_exploit_library_hint(module: str, *, max_entries: int = 12) -> str:
+    """Return a short paragraph nudging the agent to consult
+    `/data/exploits/` when stuck on technique / leak-vector choice, or
+    `""` when the library is empty or the operator has turned the hint
+    off via `enable_exploit_library_hint`.
+
+    Filtering: same-module entries only (a pwn chal sees only pwn
+    exploits, etc.). Cap at `max_entries` newest entries so the prompt
+    doesn't blow up on large libraries. The agent is expected to `ls
+    /data/exploits/` + `cat` the relevant report.md itself — we just
+    surface what's available and what each one solved.
+    """
+    try:
+        from modules.settings_io import get_setting
+    except Exception:
+        return ""
+
+    if not get_setting("enable_exploit_library_hint"):
+        return ""
+
+    if not EXPLOITS_DIR.is_dir():
+        return ""
+
+    mod_norm = (module or "").lower().strip()
+    entries: list[dict] = []
+    for d in sorted(EXPLOITS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        mp = d / "meta.json"
+        if not mp.is_file():
             continue
         try:
-            text = p.read_text(errors="replace")
+            meta = json.loads(mp.read_text(errors="replace"))
         except Exception:
             continue
-        flags.update(FLAG_RE.findall(text))
-    return sorted(f for f in flags if not _is_placeholder_flag(f))
+        if (meta.get("module") or "").lower() != mod_norm:
+            continue
+        entries.append(meta)
+
+    if not entries:
+        return ""
+
+    entries.sort(key=lambda m: m.get("saved_at") or "", reverse=True)
+    entries = entries[:max_entries]
+
+    lines = [
+        "PRIOR-EXPLOIT LIBRARY (operator-curated) — available at "
+        "`/data/exploits/` (read-only). When stuck on technique / "
+        "leak-vector / chain choice, browse these and extract the "
+        "PRIMITIVE NAME + version-specific gotcha. Do NOT blindly "
+        "copy — re-derive that primitive in YOUR chal's context.",
+        "",
+        f"Entries for module `{mod_norm}` (newest first, "
+        f"{len(entries)} shown):",
+    ]
+    for m in entries:
+        eid = m.get("id") or "?"
+        chal = m.get("chal_filename") or m.get("chal_name") or "?"
+        arch = m.get("arch") or "?"
+        glibc = m.get("glibc_version") or "?"
+        technique = m.get("technique_name") or "?"
+        bug = ",".join(m.get("bug_classes") or []) or "?"
+        tags = ",".join(m.get("tags") or [])
+        notes = (m.get("notes") or "").replace("\n", " ").strip()
+        if len(notes) > 120:
+            notes = notes[:117] + "..."
+        tags_part = f" tags=[{tags}]" if tags else ""
+        notes_part = f" — {notes}" if notes else ""
+        lines.append(
+            f"  • {eid}  chal={chal}  arch={arch}  glibc={glibc}  "
+            f"bug={bug}  technique={technique}{tags_part}{notes_part}"
+        )
+    lines.append("")
+    lines.append(
+        "To consult: `ls /data/exploits/` + `cat "
+        "/data/exploits/<id>/report.md` (or `exploit.py` / `solver.py`)."
+    )
+    return "\n".join(lines)
 
 
 _PLACEHOLDER_INNERS = {
@@ -268,6 +384,16 @@ _PLACEHOLDER_INNERS = {
     "real_flag", "real_flag_here", "flag", "flag_here",
     "flag_goes_here", "fill_in_the_blank", "...the actual flag...",
     "actual_flag", "captured_flag",
+    # Common chal-author local-test placeholders that the agent's
+    # recon often copies verbatim from `chal/run.sh` into report.md.
+    # Concrete incident 2026-05-17 job 9a240a221f1b: both real flag
+    # and `DH{this_is_a_flag}` appeared in FLAGS FOUND because the
+    # chal's local-test runner literally exports
+    # FLAG="DH{this_is_a_flag}" as a default.
+    "this_is_a_flag", "this_is_the_flag", "this_is_flag",
+    "here_is_the_flag", "here_is_a_flag", "here_is_flag",
+    "insert_flag_here", "insert_flag", "fake_flag", "dummy_flag",
+    "local_test_flag", "test_flag", "default_flag",
 }
 
 

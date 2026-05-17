@@ -629,6 +629,11 @@ async def _run_agent(
             "==== END RECON ====\n\n"
         ) + user_prompt
 
+    from modules._common import build_exploit_library_hint
+    _lib_hint = build_exploit_library_hint("pwn")
+    if _lib_hint:
+        user_prompt = _lib_hint + "\n\n" + user_prompt
+
     log_line(job_id, f"Launching Claude agent (model={model})")
     if resume_sid:
         log_line(job_id, f"Forking prior Claude session {resume_sid[:8]}…")

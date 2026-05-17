@@ -10,6 +10,15 @@ from typing import Any, Optional
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 JOBS_DIR = DATA_DIR / "jobs"
 UPLOADS_DIR = DATA_DIR / "uploads"
+# Operator-curated library of past exploits/solvers a future job can
+# consult when stuck on technique / leak-vector choice. Filesystem-
+# backed (no SQLite) so `tar -czf - data/exploits/` is a complete
+# portable dump — see api/routes/exploits.py for export/import.
+EXPLOITS_DIR = DATA_DIR / "exploits"
+
+
+def exploit_dir(exploit_id: str) -> Path:
+    return EXPLOITS_DIR / exploit_id
 
 
 def new_job_id() -> str:

@@ -32,6 +32,15 @@ SCHEMA: list[tuple[str, str | None, type, Any]] = [
     # script with the plain runner (saves ~3 Claude turns per auto_run
     # job at the cost of losing hang/parse-error detection).
     ("enable_judge", "ENABLE_JUDGE", bool, True),
+    # When True, every job's user_prompt is prepended with a short
+    # paragraph listing same-module entries from the exploit library
+    # (`/data/exploits/`, populated via POST /api/exploits/save) so
+    # the agent can `cat /data/exploits/<id>/report.md` for insight on
+    # similar chals (leak vector / FSOP variant / technique pick).
+    # Default OFF — `heap_state_evolution_gap` memory warns against
+    # broad prompt nudges from small libraries; only flip on after the
+    # library has several curated entries the operator trusts.
+    ("enable_exploit_library_hint", "ENABLE_EXPLOIT_LIBRARY_HINT", bool, False),
 ]
 _SECRET_KEYS = {"anthropic_api_key", "auth_token"}
 

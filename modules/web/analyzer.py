@@ -132,6 +132,11 @@ async def _run_agent(
                 f"[pre-recon] reply ready ({len(recon_reply)} chars)",
             )
 
+    from modules._common import build_exploit_library_hint
+    _lib_hint = build_exploit_library_hint("web")
+    if _lib_hint:
+        user_prompt = _lib_hint + "\n\n" + user_prompt
+
     log_line(job_id, f"Launching Claude agent (model={model})")
     log_line(job_id, f"Source root: {src_root or '(remote-only)'}")
 

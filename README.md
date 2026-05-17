@@ -150,6 +150,7 @@ Seven Claude-driven roles, each with its own context window:
 - Triggered by `/retry/stream` and `/resume/stream` when no manual hint is supplied.
 - `_gather_context()` bundles the prior job's `meta.json`, `run.log`, `report.md`, `exploit.py` / `solver.py`, std{out,err}, `callbacks.jsonl`, and 2–3 entry-point source files.
 - Replies with ONE ≤1500-char paragraph diagnosing the failure. Streams to the browser over SSE, then is hoisted into the next job's prompt as `⚠ PRIORITY GUIDANCE`.
+- **Max extended-thinking budget** (`MAX_THINKING_TOKENS=31999`) is pinned on every reviewer call — the hint is the only steering signal a `/retry` gets, so depth-of-reasoning matters more than the latency. Final output is still capped at ~1500 chars by the prompt, but the thinking trace is not.
 - Auth / rate / credit / policy errors surface in the panel and **block** the new job from being enqueued.
 
 ### main worker (`worker/runner.py`)
@@ -742,10 +743,11 @@ All knobs live in two places:
    | `AUTO_RETRY_MAX` | `-1` | postjudge-driven inline retries within a single job. `0` disables the loop (legacy fire-and-forget). Positive int caps at exactly N retries on top of the initial run. `-1` / `inf` / `unlimited` lets the loop run until natural exit (success, no actionable hint, error, user Stop, timeout). See [auto-retry triangle](#auto-retry-triangle). |
    | `USE_ISOLATED_SUBAGENTS` | `1` | when `1` (default), main delegates via the MCP tool `mcp__team__spawn_subagent` — each subagent runs in its own `claude` CLI subprocess and only the final-text reply lands in main's history. Set to `0` for the legacy in-process `agents={}` path (kept as a fast rollback). See [Subagent isolation](#subagent-isolation-default-on). |
    | `SUBAGENT_SPAWN_CAP` | `0` | runaway cost guard. `0` = unlimited (recommended — aggressive delegation is encouraged for context efficiency, and the orchestrator already auto-spawns a recon subagent before main's first turn). Set to a positive int to bound how many delegations one run can make. |
+   | `ENABLE_EXPLOIT_LIBRARY_HINT` | `0` | when `1`, every job's user prompt is prepended with a short paragraph listing same-module entries from the operator-curated [Exploit Library](#exploit-library) at `/data/exploits/`. OFF by default — flip on once the library has curated entries you trust. |
 
 2. **Settings tab** in the UI — writes to `/data/settings.json`, overrides `.env`
    without restart for: Anthropic API key, Claude model, Auth token, Job TTL,
-   Job timeout, Worker concurrency, Callback URL, **Enable judge**.
+   Job timeout, Worker concurrency, Callback URL, **Enable judge**, **Use Exploit Library hints**.
    (Concurrency change requires `docker compose restart worker`.)
 
 Precedence: `settings.json` > `.env` > defaults.
@@ -828,6 +830,13 @@ upload ──► /data/jobs/<id>/         ─► RQ enqueue
 | POST | `/api/jobs/{id}/resume/stream` | SSE-streamed resume. With `{"hint":"…"}` works exactly like `/resume`. With an empty body, calls the reviewer to write the hint first. Both modes carry `./work/`, fork the prior session, and prepend the `[RESUMING]` preamble. |
 | POST | `/api/jobs/{id}/timeout/continue` | acknowledge the soft timeout — let the agent keep running |
 | POST | `/api/jobs/{id}/timeout/kill` | acknowledge the soft timeout — hard-stop the job |
+| POST | `/api/exploits/save` | copy a finished job's `report.md` + `exploit.py`/`solver.py` into the operator-curated library. Body `{"job_id": "...", "tags": [...], "notes": "...", "overwrite": true}`. Refuses jobs with no captured flag |
+| GET | `/api/exploits[?module=&tag=&search=]` | list library entries (filterable by module / tag / chal-substring / technique-substring / notes-substring) |
+| GET | `/api/exploits/{id}` | one entry's meta + file list |
+| GET | `/api/exploits/{id}/file/{name}` | download `report.md` / `exploit.py` / `solver.py` / `solver.sage` |
+| DELETE | `/api/exploits/{id}` | remove an entry |
+| GET | `/api/exploits/export` | stream the entire library as a single `.tar.gz` for cross-machine transport |
+| POST | `/api/exploits/import` | restore entries from a `.tar.gz` produced by `/export`. Multipart: `file=<archive>`, `mode=skip\|overwrite` (default `skip`). Returns per-entry imported/skipped/rejected counts |
 
 ## File layout
 
@@ -862,16 +871,20 @@ HexTech_CTF_TOOL/
 ├── web-ui/              # static HTML/CSS/JS
 ├── scripts/             # one-off operator tools (e.g. job-status.sh)
 └── data/                # job uploads + outputs (gitignored)
-    └── jobs/<id>/
-        ├── meta.json    # status + tokens + cost
-        ├── run.log      # timestamped agent transcript
-        ├── result.json  # final summary (post-judge)
-        ├── bin/ src/    # upload (per module — zips auto-extracted)
-        └── work/        # agent cwd — exploit.py, report.md, …
-            └── tmp/     # per-job TMPDIR — `TMPDIR`/`TMP`/`TEMP`
-                        #   are injected into every agent + sandbox
-                        #   subprocess so concurrent jobs never share
-                        #   `/tmp/*`. Auto-cleaned on `DELETE /api/jobs/<id>`.
+    ├── jobs/<id>/
+    │   ├── meta.json    # status + tokens + cost
+    │   ├── run.log      # timestamped agent transcript
+    │   ├── result.json  # final summary (post-judge)
+    │   ├── bin/ src/    # upload (per module — zips auto-extracted)
+    │   └── work/        # agent cwd — exploit.py, report.md, …
+    │       └── tmp/     # per-job TMPDIR — `TMPDIR`/`TMP`/`TEMP`
+    │                    #   are injected into every agent + sandbox
+    │                    #   subprocess so concurrent jobs never share
+    │                    #   `/tmp/*`. Auto-cleaned on `DELETE /api/jobs/<id>`.
+    └── exploits/<id>/   # operator-curated exploit library (see § below)
+        ├── meta.json    # module · tags · arch · glibc · technique · …
+        ├── report.md    # copied verbatim from the source job
+        └── exploit.py   # or solver.py / solver.sage
 ```
 
 ## Module-specific notes
@@ -1289,6 +1302,118 @@ Errors from the reviewer (Claude API auth/rate-limit/credit failures,
 policy refusals, empty responses) are surfaced in the panel with a red
 "no new job created" header and the error body. The new job is **not**
 enqueued in that case.
+
+## Exploit Library
+
+Operator-curated repository of past `report.md` + `exploit.py` /
+`solver.py` pairs, stored under `data/exploits/<id>/` and surfaced via
+the **📚 Exploits** tab in the UI. Designed for the "I just solved a
+similar chal — I wish the agent could look at that prior solution"
+case: leak-vector picks, FSOP variants, technique aliasing, etc.
+
+### Saving from a job
+
+Every finished job that has at least one captured flag gets a
+**💾 Save to exploit DB** button next to the flag banner in its detail
+panel. Clicking it prompts for tags (comma-separated) + a one-line note,
+then `POST /api/exploits/save` copies:
+
+- `report.md` (verbatim from the job dir)
+- `exploit.py` (or whichever of `exploit.py` / `solver.py` /
+  `solver.sage` exists — first hit wins)
+- A `meta.json` with:
+  - `id` — `<module>-<uuid12>`, used as the URL slug + filesystem dir
+  - `source_job_id`, `chal_filename`, `target_url`, `script_filename`,
+    `binary_sha256` (when a binary exists in the source job)
+  - Auto-extracted from the job's `findings.json`: `arch`,
+    `glibc_version`, `mitigations`, `bug_classes`, `technique_name`
+  - Operator-supplied: `tags`, `notes`
+  - `flags` — the captured flag list (see § *Flag-scan trusted sources*
+    below for why this is reliable)
+  - `saved_at`
+
+Re-saving the same `source_job_id` updates the existing entry in-place
+(preserves the id / URL) by default. Pass `overwrite=false` to refuse
+duplicates.
+
+### Browsing / managing
+
+The **📚 Exploits** tab lists every entry as a card with module
+color-pill, technique, bug class, arch/glibc, mitigations, captured
+flags, notes, tags. Per-card actions: view `report.md` / view script
+(both open in the existing file modal with syntax highlighting), jump
+to the source job, delete.
+
+Filters: module dropdown + free-text search across
+`chal_filename` / `technique_name` / `bug_classes` / `notes`
+(debounced 250 ms).
+
+### Export / import (cross-machine portability)
+
+The library is filesystem-backed (no SQLite), so a single
+`.tar.gz` of `data/exploits/` is a complete portable dump.
+
+- **Export** — `⬇ Export .tar.gz` button on the Exploits tab (also
+  `GET /api/exploits/export`) streams the entire library as
+  `exploits-YYYYMMDD-HHMMSS.tar.gz`.
+- **Import** — `⬆ Import .tar.gz` file picker (also
+  `POST /api/exploits/import` with `mode=skip|overwrite`). The server
+  validates each tar member against a strict allow-list
+  (`<id>/{meta.json,report.md,exploit.py,solver.py,solver.sage}`,
+  no path traversal, no nested dirs) before committing.
+
+### Agent activation — `enable_exploit_library_hint` setting
+
+OFF by default. When toggled ON in Settings (or set as the env var
+`ENABLE_EXPLOIT_LIBRARY_HINT=1`), every job's user prompt is prepended
+with a short paragraph listing same-module library entries
+(`module` filter, newest first, capped at 12) — each row shows
+`id · chal · arch · glibc · bug · technique · tags · notes`. The agent
+then has plain Bash access to the library at `/data/exploits/` and is
+told to `cat /data/exploits/<id>/report.md` (or the script) when
+stuck on technique / leak-vector / chain choice.
+
+The activation hint:
+
+- Filters to **same-module** entries only (a pwn chal sees only pwn
+  exploits). Cross-module borrowing isn't useful and would just
+  inflate the prompt.
+- Returns the **empty string** when the toggle is off OR when the
+  library has no entries for this module — no prompt change at all.
+- Lives in `modules/_common.py:build_exploit_library_hint(module)` and
+  is wired into every module orchestrator
+  (`pwn` / `web` / `crypto` / `rev` / `misc` / `forensic`) immediately
+  before the agent launch, right after the recon-reply prepend.
+- Doesn't change the system prompt — only the user message. Toggling
+  the setting OFF takes effect on the next job (no restart needed).
+
+Default OFF is deliberate: encoding a single-chal pattern as a broad
+prompt nudge over-fits the system (cf. the `heap_state_evolution_gap`
+incident). Curate the library first, flip the toggle once entries are
+trusted.
+
+### Flag-scan trusted sources
+
+`scan_job_for_flags` in `modules/_common.py` is now two-tier:
+
+1. **Trusted tier** — files produced by the actual runner / OOB
+   collector: `exploit.py.stdout`, `solver.py.stdout`,
+   `callbacks.jsonl`, `summary.json`, `result.json`. If ANY
+   non-placeholder flag appears here, return ONLY those.
+2. **Narrative tier** — `report.md`, `run.log`, `findings.json`.
+   Consulted ONLY when the trusted tier is empty.
+
+Previously, a chal-author's local-test default like
+`FLAG="DH{this_is_a_flag}"` in `chal/run.sh` got copied into
+`report.md` by the agent's recon, and the old single-tier scan picked
+both the real flag and the placeholder. The trusted-tier scan
+ignores the narrative copy when a real flag exists, and the placeholder
+list (`this_is_a_flag`, `here_is_the_flag`, `fake_flag`, `dummy_flag`,
+…) catches the case where the narrative tier is the only source.
+
+This is what makes the Save button trustworthy: the API refuses to
+save into the library unless `scan_job_for_flags` returns at least one
+real flag, so placeholder-only jobs never enter the curated set.
 
 ## UI niceties
 
