@@ -94,6 +94,13 @@ router = APIRouter()
 # lockstep. Single source of truth lives in modules._common.
 LATEST_REVIEWER_MODEL = LATEST_JUDGE_MODEL
 
+# Always burn max extended-thinking budget on the reviewer. The hint is
+# the only steering signal a /retry gets, so we want the strongest
+# diagnosis the model can produce — final output is still capped at
+# ~1500 chars by the prompt, but the reasoning depth is not. 31999 is
+# the documented Opus 4.7 extended-thinking ceiling (32K - 1).
+_REVIEWER_MAX_THINKING_TOKENS = "31999"
+
 _REVIEWER_PROMPT = """\
 You are reviewing a previous CTF-solving attempt that did NOT recover the
 flag. The original challenge artifacts are below. Produce ONE concise
@@ -170,6 +177,7 @@ async def _ask_reviewer(context: str) -> str:
         cwd=str(work_dir),
         allowed_tools=[],
         permission_mode="bypassPermissions",
+        env={"MAX_THINKING_TOKENS": _REVIEWER_MAX_THINKING_TOKENS},
     )
     hint_parts: list[str] = []
     try:
@@ -221,6 +229,7 @@ async def _ask_reviewer_streaming(context: str) -> AsyncIterator[tuple[str, dict
         cwd=str(work_dir),
         allowed_tools=[],
         permission_mode="bypassPermissions",
+        env={"MAX_THINKING_TOKENS": _REVIEWER_MAX_THINKING_TOKENS},
     )
     accumulated: list[str] = []
     last_emitted = 0
