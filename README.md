@@ -1072,12 +1072,73 @@ docker compose down               # stop
 docker compose logs -f worker     # tail worker logs
 docker compose ps                 # status
 
-docker compose restart worker     # apply WORKER_CONCURRENCY changes
-docker compose build api          # rebuild after code changes in api/
+# Source-code changes — restart is enough (no rebuild) because api,
+# worker, and modules are all bind-mounted:
+docker compose restart api        # api/routes/*, api/main.py changes
+docker compose restart worker     # modules/*, worker/runner.py changes
+
+# Image rebuilds — needed only for Dockerfile, requirements.txt, or
+# tool-image (decompiler/forensic/misc/runner/sage) changes:
+docker compose build api worker
+docker compose --profile tools build  # tool images
 
 # Wipe all jobs (UI also has a Bulk Delete button)
 curl -X DELETE 'http://localhost:8000/api/jobs?all=true'
 ```
+
+### Bind-mount layout
+
+| Container | Mounted from host | Purpose |
+|---|---|---|
+| `api` | `./api:/app/api:ro`, `./modules:/app/modules:ro`, `./web-ui:/app/web-ui:ro` | hot-reload source on `restart api` |
+| `worker` | `./worker:/app/worker:ro`, `./modules:/app/modules:ro` | hot-reload source on `restart worker` |
+| both | `./data:/data` (rw), `~/.claude:/root/.claude` (rw — session jsonl carry on /retry) | persistence |
+
+Without `./api:/app/api:ro` an `api/routes/*.py` edit silently has
+no effect until you `docker compose build api`. Concrete incident
+2026-05-17: a `_carry_work_ignore` fix in `api/routes/retry.py`
+took >1 hour to surface because the api container was running
+image-baked code from May 15.
+
+## Operational hygiene (boot + per-job)
+
+The worker container's `/tmp` is shared across every job + every
+subagent + every retry. Without housekeeping it accumulates dozens
+of stale `.py`/`.bin`/`.txt` files (gdb probe scripts, cpio extracts,
+ROPgadget dumps, …) and easily reaches 30+ MB; concurrent jobs also
+collide there. Two layers of defense:
+
+1. **Per-job isolation** — `make_standalone_options()` pre-sets
+   `$TMPDIR` to `./tmp/` (under the job's cwd) for every subagent's
+   env. Python `tempfile.*`, pwntools, etc. follow it. Each subagent
+   prompt (recon, debugger, judge, triage) has a "scratch path
+   discipline" section reminding the agent to write
+   `$TMPDIR/probe.py` in Bash rather than the absolute
+   `/tmp/probe.py`.
+2. **Boot sweep** — `worker/runner.py:_sweep_stale_tmp()` runs
+   once on every `docker compose restart worker` and removes files
+   in `/tmp` older than 24h. Skips dirs + symlinks +
+   `.X*`/`systemd-*`/`snap-*` patterns. Logs `[worker] swept N
+   stale /tmp file(s) (N.N KB freed)` on cleanup.
+
+When a job ends (success or failure), each analyzer's `finally`
+block calls `cleanup_job_processes()` which walks `/proc` and
+SIGTERM (then SIGKILL after 2s) any orphan `qemu-system-*`,
+`qemu-aarch64-*`, `qemu-arm-*`, or `gdbserver` left running. The
+matcher uses `/proc/<pid>/comm` substrings, not `pkill -f`, for two
+reasons:
+- Linux `comm` is capped at 15 chars so `pkill -x qemu-system-aarch64`
+  silently matches zero processes;
+- the SDK passes our system_prompt to the bundled `claude` CLI as
+  argv, so `pkill -f` regexes risk self-kill.
+Zombies (`State: Z`) are skipped — they're already dead and the
+container's init reaps them.
+
+Concrete incident 2026-05-17 on job 9a240a221f1b: the kernel-pwn
+debugger spawned `qemu-system-aarch64 ... -nographic &` for
+dynamic analysis and never reaped it. Without the cleanup hook,
+two jobs deep the worker container had TWO qemu instances both
+holding port forwards on `:18000` and ~512 MB combined.
 
 ## Timeout & soft-deadline decision
 
@@ -1129,7 +1190,15 @@ fire while the job is still `queued` / `running`. Four buttons:
 
 - the previous job's `./work/` directory (partial `exploit.py` / `solver.py`
   / `report.md` / notes / decomp output) is copied into the new job, so
-  the new agent literally sees the files the prior agent wrote;
+  the new agent literally sees the files the prior agent wrote.
+  `_carry_work_ignore` in `api/routes/retry.py` skips `tmp/` and
+  `__pycache__/` at every depth; `symlinks=True` preserves symlinks
+  instead of dereferencing them. Without this filter, pwn jobs that
+  extracted a Linux rootfs (cpio) into `./tmp/rootfs/` would hang
+  copytree on the embedded `dev/console` character device or the
+  `dev/log` symlink to a host syslog socket — concrete incident
+  2026-05-17 on job 9f93bc8dcd0d left a half-copied work tree, no
+  meta.json, and no rq enqueue every time the user clicked retry;
 - the prior Claude SDK conversation: `meta.claude_session_id` is captured
   by `capture_session_id()` whenever the SDK emits an `init` SystemMessage,
   propagated to `meta.resume_session_id` of the new job, and the prior
