@@ -1086,6 +1086,55 @@ docker compose --profile tools build  # tool images
 curl -X DELETE 'http://localhost:8000/api/jobs?all=true'
 ```
 
+### Full update (base images + source rebuild)
+
+Periodically (Python security patches, glibc / Ghidra major bumps,
+Sage updates, etc.) you'll want to refresh every layer from the
+internet AND rebuild every local image so the new base actually
+takes effect. Six commands, in order:
+
+```bash
+# 1. Pull the latest source from origin (so local Dockerfiles match)
+git pull --ff-only
+
+# 2. Pull all external base images that compose declares directly
+#    (redis:7-alpine, sagemath/sagemath:latest). Build images
+#    in this project are local-only and report "pull access denied"
+#    here — that is EXPECTED, not a failure.
+docker compose --profile tools --profile tools-sage pull
+
+# 3. Rebuild every local image with --pull so each Dockerfile's
+#    FROM directive also fetches the latest base (python:3.12-slim,
+#    ubuntu:22.04, etc.) instead of using the cached layer. This is
+#    the slow step — Ghidra alone re-downloads ~1.4 GB.
+docker compose --profile tools --profile tools-sage build --pull
+
+# 4. Recreate core services so they pick up the new images. The
+#    bind-mounted source (./api, ./worker, ./modules) stays in
+#    place — only the underlying image layer changes.
+docker compose up -d --force-recreate api worker redis
+
+# 5. Verify everything came back healthy.
+docker compose ps
+curl -sS -m 3 -o /dev/null -w "api: HTTP %{http_code}\n" http://localhost:8000/
+
+# 6. (optional) Reclaim disk space from the now-orphaned old image
+#    layers. Be deliberate — `prune` is destructive across ALL docker
+#    objects on the host, not just this project.
+docker image prune -f
+```
+
+Tool images (decompiler, forensic, misc, runner, sage) are spawned
+on-demand per job by the worker and removed when done — they are
+NOT long-running containers, so step 4 doesn't recreate them. The
+next job that needs e.g. `runner` will use the fresh image
+automatically. If you want to verify they boot at all without a
+real job: `docker compose --profile tools run --rm runner --version`.
+
+Storage footprint after a full rebuild: expect ~6 GB of new image
+layers (Ghidra is the bulk). The old layers stay reachable through
+the existing tag aliases until step 6's `prune` removes them.
+
 ### Bind-mount layout
 
 | Container | Mounted from host | Purpose |
