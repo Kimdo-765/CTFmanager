@@ -10,6 +10,7 @@ from typing import Optional
 import anyio
 
 from modules._common import (
+    cleanup_job_processes,
     collect_outputs,
     extract_cost,
     job_dir,
@@ -683,6 +684,15 @@ async def _run_agent(
             )
     finally:
         watchdog.cancel()
+        # Kill leftover qemu / gdbserver background processes the
+        # debugger subagent backgrounded with `& ; sleep ...`. Without
+        # this they live forever in the worker container, leaking
+        # ~300 MB RSS per qemu kernel-pwn run + holding port forwards
+        # (e.g. :18000 from a prior chal) that the NEXT job needs.
+        # Comm-anchored matching (`pkill -x`) is required: the SDK
+        # passes our system_prompt to the bundled claude CLI as argv,
+        # so `pkill -f` would self-kill the agent.
+        cleanup_job_processes(lambda s: log_line(job_id, s))
         if read_meta(job_id).get("awaiting_decision"):
             write_meta(job_id, awaiting_decision=False)
         # Carry artifacts up to the job dir. Runs in `finally` so any

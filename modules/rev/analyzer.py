@@ -8,6 +8,7 @@ from typing import Optional
 import anyio
 
 from modules._common import (
+    cleanup_job_processes,
     collect_outputs,
     extract_cost,
     job_dir,
@@ -177,6 +178,9 @@ async def _run_agent(
             )
     finally:
         watchdog.cancel()
+        # Kill leftover background processes from this job (qemu used in
+        # rev for emulating foreign-arch binaries).
+        cleanup_job_processes(lambda s: log_line(job_id, s))
         if read_meta(job_id).get("awaiting_decision"):
             write_meta(job_id, awaiting_decision=False)
         # Carry artifacts up to the job dir. Runs in `finally` so any

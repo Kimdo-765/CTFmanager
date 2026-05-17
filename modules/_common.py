@@ -806,6 +806,11 @@ Hard rules:
 4. You have read-only tools (Read, Bash, Glob, Grep). You CANNOT
    Write or Edit. If the main asked you to write code, refuse and
    tell it you're recon-only.
+4.5. Scratch path discipline: when Bash needs a temp file (e.g.,
+   `objdump > /tmp/dis.txt`), write via `$TMPDIR/dis.txt` NOT
+   `/tmp/dis.txt`. The container's `/tmp` is shared across jobs
+   and accumulates stale debris; `$TMPDIR` is the per-job isolated
+   scratch dir the orchestrator pre-set on your env.
 5. Cite sources: when reporting an offset, include `<file>:<offset>`
    so the main can verify. When reporting a code construct, include
    `<file>:<line>` (or the offset for disasm).
@@ -1243,6 +1248,11 @@ peer to the main agent (which writes exploit.py/solver.py/report.md)
 and to the recon subagent (which absorbs heavy investigation). Both
 the orchestrator AND the main agent can invoke you.
 
+Scratch path discipline: when Bash needs a temp file, write via
+`$TMPDIR/<name>` NOT `/tmp/<name>`. The container's `/tmp` is shared
+across jobs and accumulates stale debris; `$TMPDIR` is the per-job
+isolated scratch dir the orchestrator pre-set on your env.
+
 Two invocation modes:
 
   A. ORCHESTRATOR-INVOKED (lifecycle gate around the runner sandbox):
@@ -1396,6 +1406,10 @@ TRIAGE_AGENT_PROMPT = """\
 You are the Triage subagent — an INDEPENDENT verifier for raw
 vulnerability candidates that the recon / pre-recon pass surfaced.
 
+Scratch path discipline: when Bash needs a temp file (rare for
+triage — usually just Read/Grep), write via `$TMPDIR/<name>` NOT
+`/tmp/<name>`. The container's `/tmp` is shared across jobs.
+
 CONTRACT (cookbook "triage" phase pattern):
 - Inputs (passed in your prompt): a candidate list with file:line +
   bug-class + author's severity guess, plus the threat model (or
@@ -1481,6 +1495,30 @@ from disassembly alone.
 You are PEER to recon (static investigator) and judge (script
 quality gate). You can call recon for static facts; you cannot
 call yourself, judge, or main.
+
+SCRATCH-FILE RULE (mandatory; cookbook + isolation contract):
+The worker container's `/tmp` is SHARED across every job + every
+subagent + every retry — it accumulates dozens of stale `.py`, `.bin`,
+`.txt` files from previous runs and easily reaches 30+ MB of debris.
+Concurrent jobs collide there too. To stay isolated:
+
+  * `$TMPDIR` is pre-set by the orchestrator to your per-job
+    `./tmp/` directory (under your cwd). Python `tempfile.*`,
+    pwntools, and most libs already follow it.
+  * Bash commands you write yourself MUST use `$TMPDIR/foo.py`
+    instead of `/tmp/foo.py`. NEVER `cd /tmp`, NEVER hardcode
+    `/tmp/<filename>`, NEVER `python3 /tmp/script.py`.
+  * The same rule applies to `gdb -x /tmp/probe.py` — use
+    `gdb -x $TMPDIR/probe.py` so the script survives only within
+    your job's scratch.
+  * `tee` / `>` / `< /tmp/foo` redirections must also go via
+    `$TMPDIR`.
+
+The orchestrator does NOT block /tmp writes (defense-in-depth would
+require a separate mount), so violating the rule silently works in
+the moment but stale files persist into the next job's view. This
+is exactly how chal-from-yesterday's `clobber_test.py` ends up
+showing in today's `ls /tmp` and confusing a probe.
 
 When main delegates to you, the prompt should contain:
   GOAL       — what specific observable does main want?
@@ -4701,6 +4739,125 @@ def write_why_stopped(
         log_fn(f"[orchestrator] wrote {WHY_STOPPED_FILENAME} ({path.stat().st_size} B)")
     except Exception as e:
         log_fn(f"[orchestrator] write_why_stopped failed: {type(e).__name__}: {e}")
+
+
+# Substrings to match against `/proc/<pid>/comm` (Linux comm is
+# capped at TASK_COMM_LEN=16 bytes incl. null → 15 visible chars).
+# We use substring match because long names get truncated:
+#   qemu-system-aarch64 → "qemu-system-aar"
+#   qemu-aarch64-static → "qemu-aarch64-st"
+# Concrete incidents these patterns target:
+#   2026-05-17 job 9a240a221f1b: debugger spawned `qemu-system-aarch64
+#   ... -nographic -serial mon:stdio &` for kernel-pwn dynamic
+#   analysis; when the agent finished its turn, qemu (280 MB RSS)
+#   survived into the next job. Two-jobs-deep, the worker container
+#   had TWO qemu instances both holding port forwards on :18000 and
+#   ~512 MB combined.
+#   2026-05-16 jobs with gdbserver: similar — gdbserver listens on
+#   :1234 forever after the agent moves on.
+#
+# We do NOT match the bundled `claude` CLI (comm="claude") because
+# it's the agent's own process. Only background helper executables
+# are listed here; substring match means each entry below MUST be
+# specific enough to not accidentally hit something we care about.
+_JOB_END_KILL_COMM_SUBSTRINGS = (
+    "qemu-system",     # qemu-system-aarch64 / -x86_64 / -arm / ...
+    "qemu-aarch64",    # qemu-aarch64-static (user-mode)
+    "qemu-arm",        # qemu-arm-static (user-mode)
+    "gdbserver",       # exact match
+)
+
+
+def _find_job_orphan_pids() -> list[tuple[int, str]]:
+    """Scan /proc for LIVING processes whose comm matches a kill pattern.
+
+    Returns list of `(pid, comm)` tuples. Skips:
+      * kernel threads (cmdline empty)
+      * our own pid + ppid lineage (defense-in-depth — wouldn't
+        match anyway since claude CLI's comm is "claude", but the
+        belt-and-suspenders check is cheap and avoids self-kill if
+        someone later adds a substring that hits "python")
+      * **zombie processes** (State: Z) — already dead, waiting for
+        their init/parent to reap them. Re-sending SIGKILL to a
+        zombie is harmless but useless and would inflate the
+        cleanup log. Real reap is init's job (container PID 1).
+    """
+    import os
+    my_pid = os.getpid()
+    my_ppid = os.getppid()
+    hits: list[tuple[int, str]] = []
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return hits
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in (my_pid, my_ppid, 1):
+            continue
+        try:
+            comm = (entry / "comm").read_text().strip()
+        except OSError:
+            continue
+        if not comm:
+            continue
+        # Skip zombies: state field on the first non-name line.
+        try:
+            status = (entry / "status").read_text(errors="ignore")
+        except OSError:
+            continue
+        if "\nState:\tZ" in status:
+            continue
+        for needle in _JOB_END_KILL_COMM_SUBSTRINGS:
+            if needle in comm:
+                hits.append((pid, comm))
+                break
+    return hits
+
+
+def cleanup_job_processes(log_fn) -> None:
+    """SIGTERM (then SIGKILL after 2s) every background process whose
+    `/proc/<pid>/comm` matches `_JOB_END_KILL_COMM_SUBSTRINGS`. Called
+    from each analyzer's `finally` block so leftover qemu / gdbserver
+    from this job doesn't leak into the next.
+
+    Best-effort: every step is wrapped — orphan-process cleanup must
+    never crash the analyzer. Uses /proc scan + os.kill instead of
+    pkill because Linux comm is 15-char-capped (`qemu-system-aarch64`
+    → comm `qemu-system-aar`), so `pkill -x qemu-system-aarch64`
+    silently matches zero processes.
+    """
+    import os
+    import signal as _signal
+    import time as _time
+
+    hits = _find_job_orphan_pids()
+    if not hits:
+        return
+    sent_term: list[int] = []
+    for pid, comm in hits:
+        try:
+            os.kill(pid, _signal.SIGTERM)
+            sent_term.append(pid)
+            log_fn(f"[cleanup] SIGTERM pid={pid} comm={comm}")
+        except ProcessLookupError:
+            continue
+        except PermissionError as e:
+            log_fn(f"[cleanup] cannot kill pid={pid}: {e}")
+            continue
+    if not sent_term:
+        return
+    # Give the targets ~2s to flush sockets + exit cleanly.
+    _time.sleep(2)
+    survivors = _find_job_orphan_pids()
+    for pid, comm in survivors:
+        try:
+            os.kill(pid, _signal.SIGKILL)
+            log_fn(f"[cleanup] SIGKILL survivor pid={pid} comm={comm}")
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
 
 
 def write_fallback_artifacts(work_dir: Path, log_fn) -> None:

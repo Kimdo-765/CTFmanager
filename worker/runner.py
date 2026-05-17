@@ -102,6 +102,64 @@ def _sweep_stale_workers() -> None:
         print(f"[worker] sweep failed (non-fatal): {e}", flush=True)
 
 
+def _sweep_stale_tmp(max_age_h: int = 24) -> None:
+    """Best-effort: rm files in `/tmp` older than `max_age_h` hours
+    that the worker container itself wrote.
+
+    The agent + every subagent share `/tmp`, and despite the
+    `$TMPDIR=./tmp/` env hint in prompts they still routinely
+    drop `/tmp/probe.py`, `/tmp/dis.txt`, `cpio` extracts, gdb
+    init scripts, etc. directly via Bash. Over days the dir hits
+    30+ MB of stale files; concrete incident 2026-05-17 in job
+    9a240a221f1b showed a fresh debugger spawn listing `clobber.py`
+    + `debug_leak.py` from yesterday's run, which could
+    accidentally feed into a new probe.
+
+    We DO NOT touch:
+      * directories (`/tmp/initrd_extract`, gdb temp roots) — those
+        often hold the *current* job's working state
+      * files newer than `max_age_h` hours (default 24)
+      * `.X11*` / `systemd-private-*` / `snap-*` / standard daemon
+        socket dirs (none expected in our base image, but exclude
+        defensively)
+    Failures are logged and swallowed — `/tmp` cleanup must never
+    block worker boot.
+    """
+    tmp_root = Path("/tmp")
+    if not tmp_root.is_dir():
+        return
+    cutoff = time.time() - max_age_h * 3600
+    removed = 0
+    bytes_freed = 0
+    skip_prefixes = (".X1", "systemd-", "snap-", ".font-", ".ICE-")
+    try:
+        for entry in tmp_root.iterdir():
+            try:
+                name = entry.name
+                if any(name.startswith(p) for p in skip_prefixes):
+                    continue
+                if entry.is_dir() or entry.is_symlink():
+                    continue
+                st = entry.stat()
+                if st.st_mtime >= cutoff:
+                    continue
+                size = st.st_size
+                entry.unlink()
+                removed += 1
+                bytes_freed += size
+            except OSError:
+                continue
+    except OSError as e:
+        print(f"[worker] /tmp sweep failed (non-fatal): {e}", flush=True)
+        return
+    if removed:
+        print(
+            f"[worker] swept {removed} stale /tmp file(s) "
+            f"({bytes_freed / 1024:.1f} KB freed)",
+            flush=True,
+        )
+
+
 def main() -> int:
     n = _resolve_concurrency()
     print(f"[worker] launching {n} worker process(es)", flush=True)
@@ -111,6 +169,10 @@ def main() -> int:
     # "There exists an active worker named ... already" and the parent
     # respawns forever.
     _sweep_stale_workers()
+    # Clean leftover /tmp debris from previous container lives. Empty
+    # on a freshly-built image; only matters after `docker compose
+    # restart worker` on a long-running deployment.
+    _sweep_stale_tmp()
 
     # Cleanup thread runs in the parent only.
     threading.Thread(target=cleanup_loop, daemon=True).start()

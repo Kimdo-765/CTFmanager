@@ -7,6 +7,7 @@ from typing import Optional
 import anyio
 
 from modules._common import (
+    cleanup_job_processes,
     collect_outputs,
     extract_cost,
     job_dir,
@@ -175,6 +176,9 @@ async def _run_agent(
             )
     finally:
         watchdog.cancel()
+        # Kill leftover background processes (qemu/gdbserver) from this job
+        # so they don't leak into the next. See modules/_common.py.
+        cleanup_job_processes(lambda s: log_line(job_id, s))
         # Clear the awaiting_decision flag if the watchdog already fired —
         # the job has finished and the user no longer needs to decide.
         if read_meta(job_id).get("awaiting_decision"):

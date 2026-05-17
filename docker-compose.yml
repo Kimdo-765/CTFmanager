@@ -25,6 +25,13 @@ services:
       - ./data:/data
       - ./modules:/app/modules:ro
       - ./web-ui:/app/web-ui:ro
+      # Mount the api source so code changes (especially api/routes/*) take
+      # effect on `docker compose restart api` without rebuilding the image.
+      # Worker already mounts ./modules the same way. Concrete incident
+      # 2026-05-17: `_carry_work_ignore` patch in api/routes/retry.py did
+      # NOT propagate because api was image-baked; retries that copied a
+      # rootfs (with dev/console chr device) hung copytree indefinitely.
+      - ./api:/app/api:ro
       # rw (not ro) so /retry and /resume can copy the previous SDK
       # session's transcript jsonl into the new job's project-key
       # directory under ~/.claude/projects/. Without this the SDK
@@ -89,6 +96,11 @@ services:
     volumes:
       - ./data:/data
       - ./modules:/app/modules:ro
+      # Mount the worker source so changes to worker/runner.py
+      # (e.g. _sweep_stale_tmp, RQ wiring) take effect on `restart
+      # worker` without rebuilding. Same rationale as api's
+      # ./api:/app/api:ro mount.
+      - ./worker:/app/worker:ro
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount the host's Claude Code config so the bundled `claude` CLI in the
       # worker uses your existing claude.ai OAuth token (no API key needed).
